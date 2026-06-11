@@ -101,11 +101,15 @@ def _make_cache_entry(
     cache_salt: Any | None = None,
     mm_features: Any | None = None,
     prompt_embeds: Any | None = None,
-) -> tuple[Any, list[int]]:
+    all_token_ids: list[int] | None = None,
+    runtime_state: dict[str, Any] | None = None,
+    kv_state: dict[str, Any] | None = None,
+) -> tuple[Any, list[int], dict[str, Any], dict[str, Any] | None]:
     """Create a ``(request_like, block_hashes)`` beam cache entry."""
     return (
         SimpleNamespace(
             prompt_token_ids=token_ids or [10, 20, 30],
+            _all_token_ids=all_token_ids or (token_ids or [10, 20, 30]),
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             cache_salt=cache_salt,
@@ -113,6 +117,13 @@ def _make_cache_entry(
             prompt_embeds=prompt_embeds,
         ),
         list(block_hashes or []),
+        runtime_state
+        or {
+            "num_computed_tokens": 0,
+            "num_cached_tokens": -1,
+            "num_external_computed_tokens": 0,
+        },
+        kv_state,
     )
 
 
@@ -589,6 +600,34 @@ class TestBeamCache:
 
         # block_hasher=None always passed to skip O(N) hash in constructor.
         assert MockReq.call_args.kwargs["block_hasher"] is None
+
+    def test_handle_beam_fork_inherits_parent_all_tokens_as_decode_prefix(self) -> None:
+        eng = _make_engine_self(
+            beam_cache={
+                "p0": _make_cache_entry(
+                    token_ids=[10, 20],
+                    all_token_ids=[10, 20, 30],
+                    runtime_state={
+                        "num_computed_tokens": 0,
+                        "num_cached_tokens": -1,
+                        "num_external_computed_tokens": 0,
+                    },
+                    kv_state={"blocks": ([MagicMock()],), "num_cached_blocks": (1,)},
+                ),
+            }
+        )
+        fork = _make_fork_request(
+            parent_ids=["p0"],
+            child_ids=["c0"],
+            token_ids=[30],
+        )
+
+        _handle_beam_fork(eng, fork)
+
+        item = eng.input_queue.get_nowait()
+        req = item[1][0]
+        assert req.prompt_token_ids == [10, 20, 30]
+        assert req.num_computed_tokens == 2
 
 
 # ---------------------------------------------------------------------------

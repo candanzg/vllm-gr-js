@@ -196,6 +196,16 @@ def _handle_beam_fork(self, fork_req) -> None:
         req.num_external_computed_tokens = cached_runtime_state[
             "num_external_computed_tokens"
         ]
+        parent_all_token_ids = getattr(cached_req, "_all_token_ids", None)
+        if cached_kv_state is not None and parent_all_token_ids is not None:
+            # A beam child's prompt is exactly the parent's fully materialized
+            # token sequence. In vLLM semantics, we still need to recompute the
+            # final token to obtain the next-step logits, so inherit the whole
+            # prefix except the last token.
+            req.num_computed_tokens = max(
+                req.num_computed_tokens,
+                max(min(len(parent_all_token_ids), len(child_token_ids)) - 1, 0),
+            )
         req._beam_parent_request_id = parent_id
         req._beam_cached_runtime_state = dict(cached_runtime_state)
         req._beam_cached_kv_state = cached_kv_state
