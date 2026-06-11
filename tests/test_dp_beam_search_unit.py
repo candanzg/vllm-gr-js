@@ -731,7 +731,40 @@ class TestStepFunctionsPassRank:
 
 
 # ---------------------------------------------------------------------------
-# 10. ensure_stats_update_task called for DP
+# 10. NPU PIECEWISE priority shaping
+# ---------------------------------------------------------------------------
+
+
+class TestNpuPiecewisePriority:
+    def test_step_priority_only_changes_on_npu_piecewise(self) -> None:
+        from vllm_gr.entrypoints.openai.serving_engine import _get_beam_step_priority
+
+        engine_client = MagicMock()
+        engine_client.vllm_config.compilation_config.cudagraph_mode = "PIECEWISE"
+        engine_client.vllm_config.device_config.device_type = "npu"
+
+        base = 1_000_000
+        assert _get_beam_step_priority(engine_client, base, 0) == base
+        assert _get_beam_step_priority(engine_client, base, 1) < base
+        assert _get_beam_step_priority(engine_client, base, 8) < _get_beam_step_priority(
+            engine_client, base, 1
+        )
+
+    def test_step_priority_unchanged_outside_npu_piecewise(self) -> None:
+        from vllm_gr.entrypoints.openai.serving_engine import _get_beam_step_priority
+
+        engine_client = MagicMock()
+        engine_client.vllm_config.compilation_config.cudagraph_mode = "FULL"
+        engine_client.vllm_config.device_config.device_type = "npu"
+        assert _get_beam_step_priority(engine_client, 1234, 3) == 1234
+
+        engine_client.vllm_config.compilation_config.cudagraph_mode = "PIECEWISE"
+        engine_client.vllm_config.device_config.device_type = "cuda"
+        assert _get_beam_step_priority(engine_client, 1234, 3) == 1234
+
+
+# ---------------------------------------------------------------------------
+# 11. ensure_stats_update_task called for DP
 # ---------------------------------------------------------------------------
 
 

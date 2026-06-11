@@ -52,6 +52,46 @@ async def _gather_beam_results(queues):
     return list(await asyncio.gather(*tasks))
 
 
+def _current_platform_device_type() -> str | None:
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return None
+    device_type = getattr(current_platform, "device_type", None)
+    return None if device_type is None else str(device_type)
+
+
+def _is_npu_piecewise_runtime(engine_client) -> bool:
+    vllm_config = getattr(engine_client, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    cudagraph_mode = str(getattr(compilation_config, "cudagraph_mode", "")).upper()
+    if cudagraph_mode != "PIECEWISE":
+        return False
+
+    device_config = getattr(vllm_config, "device_config", None)
+    device_type = getattr(device_config, "device_type", None)
+    if device_type is None:
+        device_type = _current_platform_device_type()
+    return str(device_type).lower() == "npu"
+
+
+def _get_beam_step_priority(engine_client, base_priority: int, step_index: int) -> int:
+    """Separate long prefill and short decode beam steps on NPU PIECEWISE mode.
+
+    vLLM priority scheduling treats smaller integers as higher priority.  We
+    keep step 0 unchanged, then gradually raise the priority of later beam
+    decode steps so they are less likely to be mixed with lingering long-query
+    requests in the same runtime batch.
+    """
+    if step_index <= 0 or not _is_npu_piecewise_runtime(engine_client):
+        return base_priority
+
+    phase_stride_us = 1024
+    max_offset_steps = 64
+    offset = min(step_index, max_offset_steps) * phase_stride_us
+    return max(0, base_priority - offset)
+
+
 async def _beam_fork_step(
     engine_client,
     fork_info,
@@ -319,6 +359,7 @@ async def beam_search(
     for token in range(max_tokens - pre_calc):
         if token == 1:
             beam_search_start = time.perf_counter()
+        step_priority = _get_beam_step_priority(self.engine_client, priority, token)
 
         prompts_batch, lora_req_batch = zip(
             *[
@@ -365,7 +406,7 @@ async def beam_search(
                 eos_token_id,
                 lora_request,
                 trace_headers,
-                priority=priority,
+                priority=step_priority,
                 data_parallel_rank=rank,
             )
         elif use_batch:
@@ -377,7 +418,7 @@ async def beam_search(
                 beam_search_params,
                 use_beam_fork,
                 trace_headers,
-                priority=priority,
+                priority=step_priority,
                 data_parallel_rank=rank,
             )
             if new_ids:
