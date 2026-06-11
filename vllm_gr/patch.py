@@ -312,6 +312,34 @@ def _apply_yuanrong_npu_patch(force: bool = False) -> int:
 
 _KV_MERGE_PATCHES_APPLIED = False
 _GR_BEAM_PATCHES_APPLIED = False
+_NPU_PROFILE_PATCH_APPLIED = False
+
+
+def _apply_npu_profile_patch(force: bool = False) -> int:
+    """Patch standard vLLM-Ascend NPUModelRunner with GR profile logging."""
+    global _NPU_PROFILE_PATCH_APPLIED
+
+    if _NPU_PROFILE_PATCH_APPLIED and not force:
+        return 0
+
+    try:
+        from vllm_gr.worker.npu_profile_patch import patch_npu_model_runner_profile
+
+        patched = patch_npu_model_runner_profile()
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping NPUModelRunner profile patch: %s", exc)
+        return 0
+
+    if not patched:
+        try:
+            from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+            patched = bool(getattr(NPUModelRunner, "_vllm_gr_npu_profile_patched", False))
+        except (ImportError, ModuleNotFoundError):
+            patched = False
+
+    _NPU_PROFILE_PATCH_APPLIED = patched
+    return 1 if patched else 0
 
 
 def _apply_gr_beam_patches(force: bool = False) -> int:
@@ -709,8 +737,9 @@ def _apply_patches(force: bool = False) -> int:
     core_count = _apply_gr_core_patches(force=force)
     yuanrong_count = _apply_yuanrong_npu_patch(force=force)
     kv_merge_count = _apply_kv_merge_patch(force=force)
+    npu_profile_count = _apply_npu_profile_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
-    return core_count + yuanrong_count + kv_merge_count + beam_count
+    return core_count + yuanrong_count + kv_merge_count + npu_profile_count + beam_count
 
 
 def verify_patches() -> list[str]:
