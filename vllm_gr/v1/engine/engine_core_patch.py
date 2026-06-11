@@ -6,75 +6,11 @@ ADD_BATCH and BEAM_FORK."""
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 
 logger = init_logger(__name__)
-
-
-def _snapshot_scheduler_kv_state(scheduler, request_id: str) -> dict[str, Any] | None:
-    kv_cache_manager = getattr(scheduler, "kv_cache_manager", None)
-    coordinator = getattr(kv_cache_manager, "coordinator", None)
-    if kv_cache_manager is None or coordinator is None:
-        return None
-
-    blocks = tuple(list(group) for group in coordinator.get_blocks(request_id))
-    if not any(blocks):
-        return None
-
-    single_type_managers = getattr(coordinator, "single_type_managers", ())
-    num_cached_blocks = tuple(
-        manager.num_cached_block.get(request_id) for manager in single_type_managers
-    )
-    return {
-        "blocks": blocks,
-        "num_cached_blocks": num_cached_blocks,
-    }
-
-
-def _restore_beam_kv_state(engine_core, request) -> None:
-    kv_state = getattr(request, "_beam_cached_kv_state", None)
-    if not kv_state:
-        return
-
-    kv_cache_manager = getattr(engine_core.scheduler, "kv_cache_manager", None)
-    coordinator = getattr(kv_cache_manager, "coordinator", None)
-    if kv_cache_manager is None or coordinator is None:
-        return
-
-    blocks_by_group = tuple(kv_state.get("blocks") or ())
-    if not blocks_by_group:
-        return
-
-    for group in blocks_by_group:
-        touch_blocks = [block for block in group if not getattr(block, "is_null", False)]
-        if touch_blocks:
-            kv_cache_manager.block_pool.touch(touch_blocks)
-
-    num_cached_blocks = kv_state.get("num_cached_blocks")
-    for idx, manager in enumerate(getattr(coordinator, "single_type_managers", ())):
-        blocks = list(blocks_by_group[idx]) if idx < len(blocks_by_group) else []
-        manager.req_to_blocks[request.request_id] = blocks
-
-        cached_count = (
-            num_cached_blocks[idx]
-            if num_cached_blocks is not None and idx < len(num_cached_blocks)
-            else None
-        )
-        if cached_count is None:
-            if blocks:
-                manager.num_cached_block[request.request_id] = len(blocks)
-        else:
-            manager.num_cached_block[request.request_id] = cached_count
-
-    if hasattr(request, "_beam_cached_kv_state"):
-        delattr(request, "_beam_cached_kv_state")
-    if hasattr(request, "_beam_cached_runtime_state"):
-        delattr(request, "_beam_cached_runtime_state")
-    if hasattr(request, "_beam_parent_request_id"):
-        delattr(request, "_beam_parent_request_id")
 
 # ---------------------------------------------------------------------------
 # Helper: Pre-compute shared prefix groups for attention beam routing
@@ -180,19 +116,8 @@ def make_patched_engine_core_init(original_init):
         original_init(self, *args, **kwargs)
         self.beam_cache: dict[str, dict] = {}
         self.beam_cache_lock = threading.Lock()
-        if getattr(self, "scheduler", None) is not None:
-            self.scheduler._gr_beam_cache = self.beam_cache
-            self.scheduler._gr_beam_cache_lock = self.beam_cache_lock
 
     return patched_init
-
-
-def make_patched_engine_add_request(original_add_request):
-    def patched_add_request(self, request, request_wave: int = 0):
-        _restore_beam_kv_state(self, request)
-        return original_add_request(self, request, request_wave)
-
-    return patched_add_request
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +229,6 @@ def apply_engine_core_child_patches(vllm_config=None):
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
-    EngineCore.add_request = make_patched_engine_add_request(EngineCore.add_request)
 
     # Bind _cache_beam_request and _handle_beam_fork on both classes
     EngineCore._cache_beam_request = _cache_beam_request
@@ -430,10 +354,7 @@ def apply_scheduler_patch():
     if getattr(Scheduler, "_patched_for_cache_computed_blocks", False):
         return
 
-    from vllm_gr.v1.engine.core import _snapshot_request_runtime_state
-
     _original_schedule = Scheduler.schedule
-    _original_free_request = Scheduler._free_request
 
     @wraps(_original_schedule)
     def patched_schedule(self):
@@ -503,26 +424,7 @@ def apply_scheduler_patch():
             )
         return output
 
-    @wraps(_original_free_request)
-    def patched_free_request(self, request):
-        beam_cache = getattr(self, "_gr_beam_cache", None)
-        beam_cache_lock = getattr(self, "_gr_beam_cache_lock", None)
-        if beam_cache is not None and beam_cache_lock is not None:
-            with beam_cache_lock:
-                cached = beam_cache.get(request.request_id)
-                if cached is not None:
-                    request_obj = cached[0]
-                    beam_cache[request.request_id] = (
-                        request_obj,
-                        list(request.block_hashes),
-                        _snapshot_request_runtime_state(request),
-                        _snapshot_scheduler_kv_state(self, request.request_id),
-                    )
-
-        return _original_free_request(self, request)
-
     Scheduler.schedule = patched_schedule
-    Scheduler._free_request = patched_free_request
     setattr(Scheduler, "_patched_for_cache_computed_blocks", True)
     logger.debug("Scheduler.schedule patched for cache computed blocks.")
 

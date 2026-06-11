@@ -102,9 +102,7 @@ def _make_cache_entry(
     mm_features: Any | None = None,
     prompt_embeds: Any | None = None,
     all_token_ids: list[int] | None = None,
-    runtime_state: dict[str, Any] | None = None,
-    kv_state: dict[str, Any] | None = None,
-) -> tuple[Any, list[int], dict[str, Any], dict[str, Any] | None]:
+) -> tuple[Any, list[int]]:
     """Create a ``(request_like, block_hashes)`` beam cache entry."""
     return (
         SimpleNamespace(
@@ -117,13 +115,6 @@ def _make_cache_entry(
             prompt_embeds=prompt_embeds,
         ),
         list(block_hashes or []),
-        runtime_state
-        or {
-            "num_computed_tokens": 0,
-            "num_cached_tokens": -1,
-            "num_external_computed_tokens": 0,
-        },
-        kv_state,
     )
 
 
@@ -316,15 +307,9 @@ class TestBeamCache:
         )
         _cache_beam_request(eng, req)
 
-        cached_req, cached_hashes, cached_runtime_state, cached_kv_state = eng.beam_cache[
-            "r0"
-        ]
+        cached_req, cached_hashes = eng.beam_cache["r0"]
         assert cached_req is req
         assert cached_hashes == [111, 222]
-        assert cached_runtime_state["num_computed_tokens"] == 0
-        assert cached_runtime_state["num_cached_tokens"] == -1
-        assert cached_runtime_state["num_external_computed_tokens"] == 0
-        assert cached_kv_state is None
         # block_hashes snapshot is independent of the original
         assert cached_hashes is not req.block_hashes
 
@@ -333,12 +318,12 @@ class TestBeamCache:
         eng = _make_engine_self()
         req1 = _make_mock_request(request_id="r0", token_ids=[1, 2])
         _cache_beam_request(eng, req1)
-        cached_req1 = eng.beam_cache["r0"][0]
+        cached_req1, _ = eng.beam_cache["r0"]
         assert cached_req1 is req1
 
         req2 = _make_mock_request(request_id="r0", token_ids=[3, 4, 5])
         _cache_beam_request(eng, req2)
-        cached_req2 = eng.beam_cache["r0"][0]
+        cached_req2, _ = eng.beam_cache["r0"]
         assert cached_req2 is req2
 
     # 3.3
@@ -601,33 +586,6 @@ class TestBeamCache:
         # block_hasher=None always passed to skip O(N) hash in constructor.
         assert MockReq.call_args.kwargs["block_hasher"] is None
 
-    def test_handle_beam_fork_inherits_parent_all_tokens_as_decode_prefix(self) -> None:
-        eng = _make_engine_self(
-            beam_cache={
-                "p0": _make_cache_entry(
-                    token_ids=[10, 20],
-                    all_token_ids=[10, 20, 30],
-                    runtime_state={
-                        "num_computed_tokens": 0,
-                        "num_cached_tokens": -1,
-                        "num_external_computed_tokens": 0,
-                    },
-                    kv_state={"blocks": ([MagicMock()],), "num_cached_blocks": (1,)},
-                ),
-            }
-        )
-        fork = _make_fork_request(
-            parent_ids=["p0"],
-            child_ids=["c0"],
-            token_ids=[30],
-        )
-
-        _handle_beam_fork(eng, fork)
-
-        item = eng.input_queue.get_nowait()
-        req = item[1][0]
-        assert req.prompt_token_ids == [10, 20, 30]
-        assert req.num_computed_tokens == 2
 
 
 # ---------------------------------------------------------------------------
