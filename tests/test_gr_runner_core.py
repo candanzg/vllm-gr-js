@@ -92,6 +92,11 @@ def _load_gr_runner_module() -> None:
     sequence_module.IntermediateTensors = object
     outputs_module = types.ModuleType("vllm.v1.outputs")
     outputs_module.ModelRunnerOutput = _FakeModelRunnerOutput
+    gr_engine_module = types.ModuleType("vllm_gr.engine")
+    gr_features_codec_module = types.ModuleType("vllm_gr.engine.gr_features_codec")
+    gr_features_codec_module.decode_gr_features_payload = lambda payload, _payload_type: payload
+    gr_logger_module = types.ModuleType("vllm_gr.logger")
+    gr_logger_module.init_logger = logging.getLogger
 
     torchrec_pkg = types.ModuleType("torchrec")
     torchrec_sparse_pkg = types.ModuleType("torchrec.sparse")
@@ -102,6 +107,9 @@ def _load_gr_runner_module() -> None:
     _install_stub_module("vllm.logger", logger_module)
     _install_stub_module("vllm.sequence", sequence_module)
     _install_stub_module("vllm.v1.outputs", outputs_module)
+    _install_stub_module("vllm_gr.engine", gr_engine_module)
+    _install_stub_module("vllm_gr.engine.gr_features_codec", gr_features_codec_module)
+    _install_stub_module("vllm_gr.logger", gr_logger_module)
     _install_stub_module("torchrec", torchrec_pkg)
     _install_stub_module("torchrec.sparse", torchrec_sparse_pkg)
     _install_stub_module("torchrec.sparse.jagged_tensor", torchrec_jt_module)
@@ -121,6 +129,10 @@ class _BaseRunner:
     def _update_states(self, scheduler_output) -> None:
         self.seen_scheduler_output = scheduler_output
 
+    def _prepare_inputs(self, scheduler_output) -> tuple:
+        self.seen_scheduler_output = scheduler_output
+        return ({}, np.array([1], dtype=np.int32), 12, None, None, None, 1)
+
 
 class TestGRRunnerCore(unittest.TestCase):
     @classmethod
@@ -132,6 +144,9 @@ class TestGRRunnerCore(unittest.TestCase):
                 "vllm.logger",
                 "vllm.sequence",
                 "vllm.v1.outputs",
+                "vllm_gr.engine",
+                "vllm_gr.engine.gr_features_codec",
+                "vllm_gr.logger",
                 "torchrec",
                 "torchrec.sparse",
                 "torchrec.sparse.jagged_tensor",
@@ -489,6 +504,54 @@ class TestGRRunnerCore(unittest.TestCase):
         self.assertNotIn("done", runner._gr_features_cache)
         self.assertNotIn("done", runner._gr_feature_errors)
         self.assertIs(runner.seen_scheduler_output, scheduler_output)
+
+    def test_prepare_inputs_logs_npu_profile_when_enabled(self) -> None:
+        runner = self._make_runner(req_ids=["r1", "r2", "r3"])
+        runner.device = "npu:0"
+        runner.use_aclgraph = True
+        runner.uniform_decode_query_len = 1
+        runner.compilation_config = SimpleNamespace(cudagraph_mode="FULL")
+        runner.input_batch = SimpleNamespace(
+            req_ids=["r1", "r2", "r3"],
+            num_reqs=3,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            beam_prefix_groups=[(4, ["r1", "r2"]), (2, ["r3"])],
+        )
+
+        with (
+            unittest.mock.patch.dict("os.environ", {"VLLM_GR_NPU_PROFILE": "1"}),
+            unittest.mock.patch.object(runner, "_prepare_hstu_attention_builders"),
+            unittest.mock.patch.object(self.runner_module.logger, "info") as mock_info,
+        ):
+            result = runner._prepare_inputs(scheduler_output)
+
+        self.assertEqual(result[2], 12)
+        mock_info.assert_called_once()
+        message, *args = mock_info.call_args[0]
+        rendered = message % tuple(args)
+        self.assertIn("[GR-NPU-PROFILE]", rendered)
+        self.assertIn("scheduled_tokens=3", rendered)
+        self.assertIn("num_input_tokens=12", rendered)
+        self.assertIn("padding_ratio=4.0000", rendered)
+        self.assertIn("beam_group_count=2", rendered)
+        self.assertIn("beam_group_reqs=3", rendered)
+
+    def test_prepare_inputs_skips_profile_when_disabled(self) -> None:
+        runner = self._make_runner(req_ids=["r1"])
+        runner.device = "npu:0"
+        runner.input_batch = SimpleNamespace(req_ids=["r1"], num_reqs=1)
+        scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+
+        with (
+            unittest.mock.patch.object(runner, "_prepare_hstu_attention_builders"),
+            unittest.mock.patch.object(self.runner_module.logger, "info") as mock_info,
+        ):
+            result = runner._prepare_inputs(scheduler_output)
+
+        self.assertEqual(result[2], 12)
+        mock_info.assert_not_called()
 
 
 if __name__ == "__main__":

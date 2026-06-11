@@ -9,6 +9,7 @@ spec fallback, attention builder preparation) remains here as it is tied to
 the HSTU model's execution lifecycle.
 """
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -215,7 +216,101 @@ class GRFeatureRunnerMixin:
         # metadata from inside `_prepare_inputs`, so inject HSTU request-length
         # state here to keep the builder path shared across backends.
         self._prepare_hstu_attention_builders()
-        return super()._prepare_inputs(*args, **kwargs)
+        result = super()._prepare_inputs(*args, **kwargs)
+        self._maybe_log_npu_prepare_inputs_profile(args, result)
+        return result
+
+    def _is_npu_profile_enabled(self) -> bool:
+        flag = os.getenv("VLLM_GR_NPU_PROFILE", "")
+        return flag.lower() in {"1", "true", "yes", "y", "on", "debug"}
+
+    def _is_npu_runtime(self) -> bool:
+        device = getattr(self, "device", None)
+        if device is not None and str(device).lower().startswith("npu"):
+            return True
+        cls_name = self.__class__.__name__.lower()
+        return "npu" in cls_name
+
+    def _maybe_log_npu_prepare_inputs_profile(self, args: tuple[Any, ...], result: Any) -> None:
+        if not self._is_npu_profile_enabled() or not self._is_npu_runtime():
+            return
+
+        scheduler_output = args[0] if args else None
+        if not isinstance(result, tuple) or len(result) < 7:
+            return
+
+        try:
+            num_input_tokens = int(result[2])
+            max_query_len = int(result[6])
+        except (TypeError, ValueError):
+            return
+
+        total_num_scheduled_tokens = None
+        if scheduler_output is not None:
+            total_num_scheduled_tokens = getattr(
+                scheduler_output,
+                "total_num_scheduled_tokens",
+                None,
+            )
+            if total_num_scheduled_tokens is None:
+                scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
+                if isinstance(scheduled, dict):
+                    total_num_scheduled_tokens = int(sum(scheduled.values()))
+
+        if total_num_scheduled_tokens is None:
+            return
+
+        input_batch = getattr(self, "input_batch", None)
+        num_reqs = getattr(input_batch, "num_reqs", None)
+        if num_reqs is None:
+            req_ids = getattr(input_batch, "req_ids", None)
+            if req_ids is not None:
+                num_reqs = len(req_ids)
+        if num_reqs is None:
+            num_reqs = 0
+
+        uniform_decode_query_len = getattr(self, "uniform_decode_query_len", None)
+        uniform_decode = bool(
+            uniform_decode_query_len is not None
+            and max_query_len == uniform_decode_query_len
+            and num_reqs > 0
+            and total_num_scheduled_tokens == num_reqs * max_query_len
+        )
+
+        beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
+        beam_group_count = len(beam_groups) if isinstance(beam_groups, list) else 0
+        beam_group_reqs = 0
+        if isinstance(beam_groups, list):
+            beam_group_reqs = sum(len(req_ids) for _, req_ids in beam_groups)
+
+        padding_ratio = (
+            float(num_input_tokens) / float(total_num_scheduled_tokens)
+            if total_num_scheduled_tokens > 0
+            else 0.0
+        )
+
+        compilation_config = getattr(
+            self,
+            "compilation_config",
+            getattr(getattr(self, "vllm_config", None), "compilation_config", None),
+        )
+        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+
+        logger.info(
+            "[GR-NPU-PROFILE] scheduled_tokens=%d num_input_tokens=%d padding_ratio=%.4f "
+            "num_reqs=%d max_query_len=%d uniform_decode=%s use_aclgraph=%s cudagraph_mode=%s "
+            "beam_group_count=%d beam_group_reqs=%d",
+            total_num_scheduled_tokens,
+            num_input_tokens,
+            padding_ratio,
+            int(num_reqs),
+            max_query_len,
+            uniform_decode,
+            getattr(self, "use_aclgraph", None),
+            cudagraph_mode,
+            beam_group_count,
+            beam_group_reqs,
+        )
 
     def _get_hstu_kv_cache_spec_fallback(self) -> dict[str, Any]:
         self._sync_hstu_static_forward_context()
