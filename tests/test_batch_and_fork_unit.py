@@ -16,6 +16,7 @@ Covers all 7 sections of the test plan:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import multiprocessing
 import queue
 from types import SimpleNamespace
@@ -37,7 +38,11 @@ from vllm_gr.v1.engine.core_client_patch import (
     prepare_request_fn,
     register_beam_output_fn,
 )
-from vllm_gr.v1.engine.engine_core_patch import _add_enum_member, run_engine_core
+from vllm_gr.v1.engine.engine_core_patch import (
+    _add_enum_member,
+    _patch_runner_for_beam_groups,
+    run_engine_core,
+)
 from vllm_gr.v1.engine.types import BeamForkRequest
 
 # ---------------------------------------------------------------------------
@@ -1325,6 +1330,41 @@ class TestPatchWiring:
     # 6.4
     def test_run_engine_core_applies_child_patches(self) -> None:
         _run_process(_run_engine_core_applies_child_patches_target)
+
+    # 6.5
+    def test_runner_patch_translates_beam_groups_to_batch_indices(self) -> None:
+        beam_groups_var = contextvars.ContextVar("test_beam_groups", default=None)
+
+        class FakeNPUModelRunner:
+            def __init__(self) -> None:
+                self.input_batch = SimpleNamespace(req_ids=["req-a", "req-b", "req-c"])
+
+            def execute_model(self, scheduler_output, intermediate_tensors=None):
+                return self._build_attention_metadata()
+
+            def _build_attention_metadata(self):
+                return beam_groups_var.get()
+
+        assert _patch_runner_for_beam_groups(
+            FakeNPUModelRunner,
+            "FakeNPUModelRunner",
+            beam_groups_var,
+        )
+
+        runner = FakeNPUModelRunner()
+        scheduler_output = SimpleNamespace(
+            beam_prefix_groups=[
+                (8, ["req-b", "missing", "req-a"]),
+                (0, ["req-c"]),
+            ]
+        )
+
+        assert runner.execute_model(scheduler_output) == [
+            (8, [1, 0]),
+            (0, [2]),
+        ]
+        assert runner._current_beam_prefix_groups is None
+        assert beam_groups_var.get() is None
 
 
 # ---------------------------------------------------------------------------

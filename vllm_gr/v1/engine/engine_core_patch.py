@@ -429,8 +429,56 @@ def apply_scheduler_patch():
     logger.debug("Scheduler.schedule patched for cache computed blocks.")
 
 
+def _patch_runner_for_beam_groups(runner_cls, runner_name: str, beam_prefix_groups_var) -> bool:
+    if getattr(runner_cls, "_patched_for_beam_groups", False):
+        return False
+
+    original_execute_model = getattr(runner_cls, "execute_model", None)
+    original_build_attention_metadata = getattr(runner_cls, "_build_attention_metadata", None)
+    if original_execute_model is None or original_build_attention_metadata is None:
+        return False
+
+    def patched_execute_model(self, scheduler_output, intermediate_tensors=None):
+        beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
+        self._current_beam_prefix_groups_str = beam_groups
+
+        try:
+            return original_execute_model(self, scheduler_output, intermediate_tensors)
+        finally:
+            self._current_beam_prefix_groups_str = None
+            self._current_beam_prefix_groups = None
+
+    def patched_build_attention_metadata(self, *args, **kwargs):
+        beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
+        if beam_groups_str is None:
+            self._current_beam_prefix_groups = None
+            return original_build_attention_metadata(self, *args, **kwargs)
+
+        req_id_to_idx = {
+            r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
+        }
+        translated_groups = []
+        for depth, group_req_ids in beam_groups_str:
+            indices = [req_id_to_idx[r] for r in group_req_ids if r in req_id_to_idx]
+            if indices:
+                translated_groups.append((depth, indices))
+
+        self._current_beam_prefix_groups = translated_groups
+        token = beam_prefix_groups_var.set(translated_groups)
+        try:
+            return original_build_attention_metadata(self, *args, **kwargs)
+        finally:
+            beam_prefix_groups_var.reset(token)
+
+    runner_cls.execute_model = patched_execute_model
+    runner_cls._build_attention_metadata = patched_build_attention_metadata
+    runner_cls._patched_for_beam_groups = True
+    logger.debug("%s patched for beam groups via ContextVar.", runner_name)
+    return True
+
+
 def apply_worker_patches():
-    """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
+    """Monkey-patch model runners to inject beam_prefix_groups into attention builders."""
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -438,42 +486,26 @@ def apply_worker_patches():
     except ImportError:
         return
 
-    if getattr(GPUModelRunner, "_patched_for_beam_groups", False):
-        return
+    patched = _patch_runner_for_beam_groups(
+        GPUModelRunner,
+        "GPUModelRunner",
+        BEAM_PREFIX_GROUPS_VAR,
+    )
 
-    _original_execute_model = GPUModelRunner.execute_model
-    _original_build_attention_metadata = GPUModelRunner._build_attention_metadata
+    try:
+        from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    except (ImportError, ModuleNotFoundError):
+        NPUModelRunner = None
 
-    def patched_execute_model(self, scheduler_output, intermediate_tensors=None):
-        beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
-        self._current_beam_prefix_groups_str = beam_groups
+    if NPUModelRunner is not None and NPUModelRunner is not GPUModelRunner:
+        patched = (
+            _patch_runner_for_beam_groups(
+                NPUModelRunner,
+                "NPUModelRunner",
+                BEAM_PREFIX_GROUPS_VAR,
+            )
+            or patched
+        )
 
-        try:
-            return _original_execute_model(self, scheduler_output, intermediate_tensors)
-        finally:
-            self._current_beam_prefix_groups_str = None
-
-    def patched_build_attention_metadata(self, *args, **kwargs):
-        beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
-        if beam_groups_str is not None:
-            req_id_to_idx = {
-                r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
-            }
-            translated_groups = []
-            for depth, group_req_ids in beam_groups_str:
-                indices = [req_id_to_idx[r] for r in group_req_ids if r in req_id_to_idx]
-                if indices:
-                    translated_groups.append((depth, indices))
-
-            token = BEAM_PREFIX_GROUPS_VAR.set(translated_groups)
-            try:
-                return _original_build_attention_metadata(self, *args, **kwargs)
-            finally:
-                BEAM_PREFIX_GROUPS_VAR.reset(token)
-        else:
-            return _original_build_attention_metadata(self, *args, **kwargs)
-
-    GPUModelRunner.execute_model = patched_execute_model
-    GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
-    GPUModelRunner._patched_for_beam_groups = True
-    logger.debug("GPUModelRunner patched for beam groups via ContextVar.")
+    if patched:
+        logger.info("vllm_gr: model runner beam-prefix injection patch installed.")

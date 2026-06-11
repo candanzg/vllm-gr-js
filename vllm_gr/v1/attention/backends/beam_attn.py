@@ -5,7 +5,6 @@
 import contextvars
 import copy
 from dataclasses import dataclass
-from itertools import compress
 from typing import ClassVar
 
 import torch
@@ -59,6 +58,9 @@ from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm_gr.v1.attention.backends.beam_group_policy import (
+    filter_shared_groups_by_runtime_policy,
+)
 
 logger = init_logger(__name__)
 BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
@@ -435,37 +437,20 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     def _filter_groups_by_query_len(
         self, shared_groups: list, query_start_loc_cpu: torch.Tensor
     ) -> list:
-        """Filters requests/groups based on valid query lengths."""
-        # Flatten to get all req_ids
-        flat_req_ids = [req_id for _, req_ids in shared_groups for req_id in req_ids]
-        if not flat_req_ids:
-            return []
+        """Filter and bucket shared-prefix groups for the active runtime.
 
-        # Vectorized length calculation on CPU
-        flat_req_ids_tensor = torch.tensor(flat_req_ids, dtype=torch.long)
-        starts = query_start_loc_cpu[flat_req_ids_tensor]
-        ends = query_start_loc_cpu[flat_req_ids_tensor + 1]
-        lengths = ends - starts
-
-        # Create mask: valid length and not too long (heuristic for beam optimization)
-        mask = (lengths > 0) & (lengths <= self.block_size * 2)
-        mask_np = mask.numpy()
-
-        # Reconstruct groups efficiently
-        new_groups = []
-        curr_idx = 0
-        for depth, req_ids in shared_groups:
-            group_len = len(req_ids)
-            group_mask = mask_np[curr_idx : curr_idx + group_len]
-            curr_idx += group_len
-
-            # Filter req_ids using the mask
-            filtered_ids = list(compress(req_ids, group_mask))
-
-            if filtered_ids:
-                new_groups.append((depth, filtered_ids))
-
-        return new_groups
+        CUDA BeamAttention keeps the original short-query heuristic, while
+        NPU/PIECEWISE mode relaxes the query-length cap and buckets requests by
+        query length to keep runtime shapes more graph-friendly.
+        """
+        return filter_shared_groups_by_runtime_policy(
+            shared_groups,
+            query_start_loc_cpu,
+            block_size=self.block_size,
+            device_type=getattr(self.device, "type", self.device),
+            cudagraph_mode=getattr(self.compilation_config, "cudagraph_mode", None),
+            min_shared_token_savings=self.min_tokens_for_sharing,
+        )
 
     def _build_standard_metadata(
         self, common_meta: CommonAttentionMetadata, max_num_splits: int
