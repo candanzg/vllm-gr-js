@@ -78,18 +78,26 @@ def _is_npu_piecewise_runtime(engine_client) -> bool:
 def _get_beam_step_priority(engine_client, base_priority: int, step_index: int) -> int:
     """Separate long prefill and short decode beam steps on NPU PIECEWISE mode.
 
-    vLLM priority scheduling treats smaller integers as higher priority.  We
-    keep step 0 unchanged, then gradually raise the priority of later beam
-    decode steps so they are less likely to be mixed with lingering long-query
-    requests in the same runtime batch.
+    vLLM priority scheduling treats smaller integers as higher priority.  On
+    NPU PIECEWISE mode, we want decode-heavy beam waves to outrank newly
+    arriving long-prefill waves globally, not just by a tiny delta, so we
+    encode the phase in the high-order portion of the integer.
     """
     if step_index <= 0 or not _is_npu_piecewise_runtime(engine_client):
         return base_priority
 
-    phase_stride_us = 1024
-    max_offset_steps = 64
-    offset = min(step_index, max_offset_steps) * phase_stride_us
-    return max(0, base_priority - offset)
+    phase_window = 1 << 60
+    decode_timestamp = min(base_priority, phase_window - 1)
+    return decode_timestamp
+
+
+def _get_initial_beam_priority(engine_client, base_priority: int) -> int:
+    if not _is_npu_piecewise_runtime(engine_client):
+        return base_priority
+
+    phase_window = 1 << 60
+    prefill_timestamp = min(base_priority, phase_window - 1)
+    return phase_window + prefill_timestamp
 
 
 async def _beam_fork_step(
@@ -213,7 +221,10 @@ async def beam_search(
     # All beams from the same logical beam search will share the same priority value
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
     MICROSECONDS = 1000000
-    priority = int(time.perf_counter() * MICROSECONDS)  # us granularity
+    priority = _get_initial_beam_priority(
+        self.engine_client,
+        int(time.perf_counter() * MICROSECONDS),
+    )
     rank = None
     if (
         hasattr(self.engine_client, "vllm_config")

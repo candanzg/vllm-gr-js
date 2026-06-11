@@ -737,7 +737,10 @@ class TestStepFunctionsPassRank:
 
 class TestNpuPiecewisePriority:
     def test_step_priority_only_changes_on_npu_piecewise(self) -> None:
-        from vllm_gr.entrypoints.openai.serving_engine import _get_beam_step_priority
+        from vllm_gr.entrypoints.openai.serving_engine import (
+            _get_beam_step_priority,
+            _get_initial_beam_priority,
+        )
 
         engine_client = MagicMock()
         engine_client.vllm_config.compilation_config.cudagraph_mode = "PIECEWISE"
@@ -745,22 +748,27 @@ class TestNpuPiecewisePriority:
 
         base = 1_000_000
         assert _get_beam_step_priority(engine_client, base, 0) == base
-        assert _get_beam_step_priority(engine_client, base, 1) < base
-        assert _get_beam_step_priority(engine_client, base, 8) < _get_beam_step_priority(
-            engine_client, base, 1
-        )
+        initial_priority = _get_initial_beam_priority(engine_client, base)
+        decode_priority = _get_beam_step_priority(engine_client, initial_priority, 1)
+        assert decode_priority < initial_priority
+        assert decode_priority == _get_beam_step_priority(engine_client, initial_priority, 8)
 
     def test_step_priority_unchanged_outside_npu_piecewise(self) -> None:
-        from vllm_gr.entrypoints.openai.serving_engine import _get_beam_step_priority
+        from vllm_gr.entrypoints.openai.serving_engine import (
+            _get_beam_step_priority,
+            _get_initial_beam_priority,
+        )
 
         engine_client = MagicMock()
         engine_client.vllm_config.compilation_config.cudagraph_mode = "FULL"
         engine_client.vllm_config.device_config.device_type = "npu"
         assert _get_beam_step_priority(engine_client, 1234, 3) == 1234
+        assert _get_initial_beam_priority(engine_client, 1234) == 1234
 
         engine_client.vllm_config.compilation_config.cudagraph_mode = "PIECEWISE"
         engine_client.vllm_config.device_config.device_type = "cuda"
         assert _get_beam_step_priority(engine_client, 1234, 3) == 1234
+        assert _get_initial_beam_priority(engine_client, 1234) == 1234
 
 
 # ---------------------------------------------------------------------------
