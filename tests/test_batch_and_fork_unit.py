@@ -305,9 +305,15 @@ class TestBeamCache:
         )
         _cache_beam_request(eng, req)
 
-        cached_req, cached_hashes = eng.beam_cache["r0"]
+        cached_req, cached_hashes, cached_runtime_state, cached_kv_state = eng.beam_cache[
+            "r0"
+        ]
         assert cached_req is req
         assert cached_hashes == [111, 222]
+        assert cached_runtime_state["num_computed_tokens"] == 0
+        assert cached_runtime_state["num_cached_tokens"] == -1
+        assert cached_runtime_state["num_external_computed_tokens"] == 0
+        assert cached_kv_state is None
         # block_hashes snapshot is independent of the original
         assert cached_hashes is not req.block_hashes
 
@@ -316,12 +322,12 @@ class TestBeamCache:
         eng = _make_engine_self()
         req1 = _make_mock_request(request_id="r0", token_ids=[1, 2])
         _cache_beam_request(eng, req1)
-        cached_req1, _ = eng.beam_cache["r0"]
+        cached_req1 = eng.beam_cache["r0"][0]
         assert cached_req1 is req1
 
         req2 = _make_mock_request(request_id="r0", token_ids=[3, 4, 5])
         _cache_beam_request(eng, req2)
-        cached_req2, _ = eng.beam_cache["r0"]
+        cached_req2 = eng.beam_cache["r0"][0]
         assert cached_req2 is req2
 
     # 3.3

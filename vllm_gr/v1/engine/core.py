@@ -20,6 +20,16 @@ from vllm.v1.engine import (
 logger = init_logger(__name__)
 
 
+def _snapshot_request_runtime_state(request) -> dict[str, Any]:
+    return {
+        "num_computed_tokens": getattr(request, "num_computed_tokens", 0),
+        "num_cached_tokens": getattr(request, "num_cached_tokens", -1),
+        "num_external_computed_tokens": getattr(
+            request, "num_external_computed_tokens", 0
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # _cache_beam_request / _handle_beam_fork  (ported from source core.py)
 # ---------------------------------------------------------------------------
@@ -28,9 +38,8 @@ logger = init_logger(__name__)
 def _cache_beam_request(self, request) -> None:
     """Cache Request state for later beam forking.
 
-    Stores ``(request, block_hashes_snapshot)`` — the Request object itself
-    (immutable fields read via attribute access) plus a snapshot of its
-    ``block_hashes`` (the only scheduler-mutated list we need).
+    Stores the Request object itself plus snapshots of the mutable scheduler /
+    runtime state that beam children need to inherit efficiently.
 
     Thread-safe: uses beam_cache_lock to prevent data races.
     """
@@ -38,6 +47,8 @@ def _cache_beam_request(self, request) -> None:
         self.beam_cache[request.request_id] = (
             request,
             list(request.block_hashes),
+            _snapshot_request_runtime_state(request),
+            None,
         )
 
 
@@ -110,7 +121,12 @@ def _handle_beam_fork(self, fork_req) -> None:
             )
             continue
 
-        cached_req, cached_block_hashes = cached
+        cached_req = cached[0]
+        cached_block_hashes = cached[1]
+        cached_runtime_state = (
+            cached[2] if len(cached) >= 3 else _snapshot_request_runtime_state(cached_req)
+        )
+        cached_kv_state = cached[3] if len(cached) >= 4 else None
         child_token_ids = cached_req.prompt_token_ids + [token_id]
 
         if shared_fields is None:
@@ -172,6 +188,17 @@ def _handle_beam_fork(self, fork_req) -> None:
             req.block_hashes.extend(req.get_hash_new_full_blocks())
         else:
             req.get_hash_new_full_blocks = None
+
+        # Carry parent prefix-progress forward so scheduler can treat beam
+        # children closer to incremental decode instead of repeated long prefill.
+        req.num_computed_tokens = cached_runtime_state["num_computed_tokens"]
+        req.num_cached_tokens = cached_runtime_state["num_cached_tokens"]
+        req.num_external_computed_tokens = cached_runtime_state[
+            "num_external_computed_tokens"
+        ]
+        req._beam_parent_request_id = parent_id
+        req._beam_cached_runtime_state = dict(cached_runtime_state)
+        req._beam_cached_kv_state = cached_kv_state
 
         self._cache_beam_request(req)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, fork_req.current_wave)))
