@@ -220,6 +220,13 @@ async def patched_async_request_openai_chat_completions(
                                     generated_text += content
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                stage_timings_ms = data.get("vllm_stage_timings_ms")
+                                if isinstance(stage_timings_ms, dict):
+                                    output.stage_timings_ms = {
+                                        str(k): float(v)
+                                        for k, v in stage_timings_ms.items()
+                                        if isinstance(v, (int, float))
+                                    }
 
                             most_recent_timestamp = timestamp
 
