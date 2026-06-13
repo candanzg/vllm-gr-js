@@ -52,6 +52,81 @@ async def _gather_beam_results(queues):
     return list(await asyncio.gather(*tasks))
 
 
+def _update_beam_engine_metrics(
+    aggregate: dict[str, float],
+    outputs: list[RequestOutput],
+) -> None:
+    for output in outputs:
+        metrics = getattr(output, "metrics", None)
+        if metrics is None:
+            continue
+
+        arrival_time = float(getattr(metrics, "arrival_time", 0.0) or 0.0)
+        queued_ts = float(getattr(metrics, "queued_ts", 0.0) or 0.0)
+        scheduled_ts = float(getattr(metrics, "scheduled_ts", 0.0) or 0.0)
+        first_token_ts = float(getattr(metrics, "first_token_ts", 0.0) or 0.0)
+        last_token_ts = float(getattr(metrics, "last_token_ts", 0.0) or 0.0)
+        first_token_latency = float(
+            getattr(metrics, "first_token_latency", 0.0) or 0.0
+        )
+
+        if arrival_time > 0.0:
+            current = aggregate.get("arrival_time", 0.0)
+            aggregate["arrival_time"] = arrival_time if current == 0.0 else min(current, arrival_time)
+        if queued_ts > 0.0:
+            current = aggregate.get("queued_ts", 0.0)
+            aggregate["queued_ts"] = queued_ts if current == 0.0 else min(current, queued_ts)
+        if scheduled_ts > 0.0:
+            current = aggregate.get("scheduled_ts", 0.0)
+            aggregate["scheduled_ts"] = (
+                scheduled_ts if current == 0.0 else min(current, scheduled_ts)
+            )
+        if first_token_ts > 0.0:
+            current = aggregate.get("first_token_ts", 0.0)
+            aggregate["first_token_ts"] = (
+                first_token_ts if current == 0.0 else min(current, first_token_ts)
+            )
+        if last_token_ts > 0.0:
+            aggregate["last_token_ts"] = max(aggregate.get("last_token_ts", 0.0), last_token_ts)
+        if first_token_latency > 0.0:
+            current = aggregate.get("first_token_latency", 0.0)
+            aggregate["first_token_latency"] = (
+                first_token_latency
+                if current == 0.0
+                else min(current, first_token_latency)
+            )
+
+
+def _finalize_beam_engine_metrics(
+    metrics: RequestStateStats,
+    aggregate: dict[str, float],
+    request_wall_start_time: float,
+) -> None:
+    metrics.arrival_time = aggregate.get("arrival_time", request_wall_start_time)
+    metrics.queued_ts = aggregate.get("queued_ts", 0.0)
+    metrics.scheduled_ts = aggregate.get("scheduled_ts", 0.0)
+    metrics.first_token_ts = aggregate.get("first_token_ts", 0.0)
+    metrics.last_token_ts = aggregate.get("last_token_ts", 0.0)
+    metrics.first_token_latency = aggregate.get("first_token_latency", 0.0)
+
+    if metrics.queued_ts > 0.0 and metrics.scheduled_ts >= metrics.queued_ts:
+        metrics.beam_engine_queue_ms = (
+            metrics.scheduled_ts - metrics.queued_ts
+        ) * 1000.0
+    if metrics.scheduled_ts > 0.0 and metrics.first_token_ts >= metrics.scheduled_ts:
+        metrics.beam_engine_prefill_ms = (
+            metrics.first_token_ts - metrics.scheduled_ts
+        ) * 1000.0
+    if metrics.first_token_ts > 0.0 and metrics.last_token_ts >= metrics.first_token_ts:
+        metrics.beam_engine_decode_ms = (
+            metrics.last_token_ts - metrics.first_token_ts
+        ) * 1000.0
+    if metrics.scheduled_ts > 0.0 and metrics.last_token_ts >= metrics.scheduled_ts:
+        metrics.beam_engine_inference_ms = (
+            metrics.last_token_ts - metrics.scheduled_ts
+        ) * 1000.0
+
+
 def _current_platform_device_type() -> str | None:
     try:
         from vllm.platforms import current_platform
@@ -209,8 +284,28 @@ async def beam_search(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
+    request_wall_start_time = time.time()
     generation_time: float = 0.0
     num_generation_tokens: int = 0
+    beam_engine_metrics_aggregate: dict[str, float] = {}
+    stage_breakdown_s: dict[str, float] = {
+        "beam_first_step_total_s": 0.0,
+        "beam_first_step_engine_s": 0.0,
+        "beam_first_step_catalog_wait_s": 0.0,
+        "beam_first_step_logprob_process_s": 0.0,
+        "beam_first_step_topn_select_s": 0.0,
+        "beam_later_steps_total_s": 0.0,
+        "beam_later_steps_engine_s": 0.0,
+        "beam_later_steps_catalog_wait_s": 0.0,
+        "beam_later_steps_logprob_process_s": 0.0,
+        "beam_later_steps_topn_select_s": 0.0,
+        "beam_catalog_launch_s": 0.0,
+        "beam_catalog_wait_s": 0.0,
+        "beam_result_postprocess_s": 0.0,
+        "beam_reconstruct_s": 0.0,
+        "beam_decode_text_s": 0.0,
+        "beam_cleanup_s": 0.0,
+    }
     beam_width = params.beam_width
     max_tokens = params.max_tokens
     ignore_eos = params.ignore_eos
@@ -370,6 +465,7 @@ async def beam_search(
     for token in range(max_tokens - pre_calc):
         if token == 1:
             beam_search_start = time.perf_counter()
+        step_total_start = time.perf_counter()
         step_priority = _get_beam_step_priority(self.engine_client, priority, token)
 
         prompts_batch, lora_req_batch = zip(
@@ -392,6 +488,7 @@ async def beam_search(
         # Launch catalog filtering in parallel with the engine step.
         catalog_task = None
         if self.models.catalog is not None:
+            catalog_launch_start = time.perf_counter()
 
             def get_valid_tokens_set(beam) -> set[int]:
                 generated_tokens = beam.tokens[len(prompt_token_ids) :]
@@ -403,8 +500,11 @@ async def beam_search(
             catalog_task = asyncio.create_task(
                 _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
             )
+            stage_breakdown_s["beam_catalog_launch_s"] += (
+                time.perf_counter() - catalog_launch_start
+            )
 
-        gen_start = time.perf_counter()
+        engine_start = time.perf_counter()
 
         if use_beam_fork and fork_info is not None:
             output, prev_beam_internal_ids = await _beam_fork_step(
@@ -440,12 +540,19 @@ async def beam_search(
                 parameter="use_batch",
                 value=use_batch,
             )
+        engine_elapsed = time.perf_counter() - engine_start
+        _update_beam_engine_metrics(beam_engine_metrics_aggregate, output)
 
         valid_tokens_sets = None
         if catalog_task is not None:
+            catalog_wait_start = time.perf_counter()
             valid_tokens_sets = await catalog_task
+            catalog_wait_elapsed = time.perf_counter() - catalog_wait_start
+            stage_breakdown_s["beam_catalog_wait_s"] += catalog_wait_elapsed
+        else:
+            catalog_wait_elapsed = 0.0
         if token > 0:
-            generation_time += time.perf_counter() - gen_start
+            generation_time += engine_elapsed
         new_beams = []
         # Store all new tokens generated by beam
         all_beams_token_id = []
@@ -455,6 +562,7 @@ async def beam_search(
         # Per-beam flat data cache: (token_ids, logprobs, ranks, decoded_tokens)
         # Used to build logprobs_entry dicts without calling FlatLogprobs.__getitem__
         beam_flat_cache: list[tuple | None] = []
+        logprob_process_start = time.perf_counter()
         # Iterate through all beam inference results
         for i, result in enumerate(output):
             current_beam = all_beams[i]
@@ -509,6 +617,7 @@ async def beam_search(
                 all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
             else:
                 beam_flat_cache.append(None)
+        logprob_process_elapsed = time.perf_counter() - logprob_process_start
 
         # Handle the token for the end of sentence (EOS)
         all_beams_token_id = np.array(all_beams_token_id)
@@ -539,10 +648,12 @@ async def beam_search(
 
         # Processing non-EOS tokens
         # Get indices of the top beam_width probabilities
+        topn_select_start = time.perf_counter()
         if all_beams_logprob.size > beam_width:
             topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[:beam_width]
         else:
             topn_idx = np.arange(all_beams_logprob.size)
+        topn_select_elapsed = time.perf_counter() - topn_select_start
 
         for idx in topn_idx:
             current_beam = all_beams[idx // logprobs_num]
@@ -566,9 +677,24 @@ async def beam_search(
             fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
         all_beams = new_beams
+        step_total_elapsed = time.perf_counter() - step_total_start
+        step_prefix = "beam_first_step" if token == 0 else "beam_later_steps"
+        stage_breakdown_s[f"{step_prefix}_total_s"] += step_total_elapsed
+        stage_breakdown_s[f"{step_prefix}_engine_s"] += engine_elapsed
+        stage_breakdown_s[f"{step_prefix}_catalog_wait_s"] += catalog_wait_elapsed
+        stage_breakdown_s[f"{step_prefix}_logprob_process_s"] += logprob_process_elapsed
+        stage_breakdown_s[f"{step_prefix}_topn_select_s"] += topn_select_elapsed
+        stage_breakdown_s["beam_result_postprocess_s"] += max(
+            0.0,
+            step_total_elapsed
+            - engine_elapsed
+            - catalog_wait_elapsed
+            - topn_select_elapsed,
+        )
 
     # Cleanup: remove remaining beam cache entries.
     if use_beam_fork and prev_beam_internal_ids:
+        cleanup_start = time.perf_counter()
         await self.engine_client.beam_fork(
             BeamForkRequest(
                 parent_ids=[],
@@ -579,6 +705,7 @@ async def beam_search(
                 data_parallel_rank=rank,
             )
         )
+        stage_breakdown_s["beam_cleanup_s"] += time.perf_counter() - cleanup_start
 
     if sid_end_token_id is not None:
         for beam in all_beams:
@@ -590,9 +717,12 @@ async def beam_search(
     # Reconstruct full logprobs only for the final best beams by walking
     # the parent-pointer tree.  This replaces the O(beams * steps^2)
     # per-step copying with a single O(beams * steps) pass at the end.
+    reconstruct_start = time.perf_counter()
     for beam in best_beams:
         reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+    stage_breakdown_s["beam_reconstruct_s"] += time.perf_counter() - reconstruct_start
 
+    decode_text_start = time.perf_counter()
     for beam in best_beams:
         if beam.tokens[-1] == eos_token_id and not ignore_eos:
             # Skip the eos token in the text.
@@ -600,6 +730,7 @@ async def beam_search(
         else:
             tokens = beam.tokens[tokenized_length:]
         beam.text = tokenizer.decode(tokens)
+    stage_breakdown_s["beam_decode_text_s"] += time.perf_counter() - decode_text_start
 
     beam_search_decode_time = time.perf_counter() - beam_search_start
     beam_search_overhead = beam_search_decode_time - generation_time
@@ -607,7 +738,15 @@ async def beam_search(
         beam_search_overhead=beam_search_overhead,
         beam_search_decode_time=beam_search_decode_time,
         num_generation_tokens=num_generation_tokens,
+        stage_breakdown_ms={
+            key.removesuffix("_s") + "_ms": value * 1000.0
+            for key, value in stage_breakdown_s.items()
+        },
     )
+    _finalize_beam_engine_metrics(
+        metrics, beam_engine_metrics_aggregate, request_wall_start_time
+    )
+    metrics.beam_engine_e2e_ms = (time.time() - request_wall_start_time) * 1000.0
 
     out = RequestOutput(
         request_id=request_id,
