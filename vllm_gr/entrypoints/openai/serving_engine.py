@@ -288,6 +288,24 @@ async def beam_search(
     generation_time: float = 0.0
     num_generation_tokens: int = 0
     beam_engine_metrics_aggregate: dict[str, float] = {}
+    beam_stats: dict[str, float] = {
+        "beam_step_count": 0.0,
+        "beam_first_step_active_beams": 0.0,
+        "beam_first_step_num_requests": 0.0,
+        "beam_first_step_output_count": 0.0,
+        "beam_first_step_logprob_candidates": 0.0,
+        "beam_later_steps_count": 0.0,
+        "beam_later_steps_total_active_beams": 0.0,
+        "beam_later_steps_max_active_beams": 0.0,
+        "beam_later_steps_total_num_requests": 0.0,
+        "beam_later_steps_max_num_requests": 0.0,
+        "beam_later_steps_total_output_count": 0.0,
+        "beam_later_steps_total_logprob_candidates": 0.0,
+        "beam_completed_beams_count": 0.0,
+        "beam_final_live_beams_count": 0.0,
+        "beam_eos_hit_count": 0.0,
+        "beam_max_logprobs_num": 0.0,
+    }
     stage_breakdown_s: dict[str, float] = {
         "beam_first_step_total_s": 0.0,
         "beam_first_step_engine_s": 0.0,
@@ -396,6 +414,7 @@ async def beam_search(
     tokenized_length = len(prompt_token_ids)
 
     logprobs_num = beam_width
+    beam_stats["beam_max_logprobs_num"] = float(logprobs_num)
     beam_search_params = SamplingParams(
         logprobs=logprobs_num,
         max_tokens=1,
@@ -463,10 +482,13 @@ async def beam_search(
     fork_info: list[tuple[int, int]] | None = None
 
     for token in range(max_tokens - pre_calc):
+        beam_stats["beam_step_count"] += 1.0
         if token == 1:
             beam_search_start = time.perf_counter()
         step_total_start = time.perf_counter()
         step_priority = _get_beam_step_priority(self.engine_client, priority, token)
+        active_beams = len(all_beams)
+        num_requests_in_step = active_beams
 
         prompts_batch, lora_req_batch = zip(
             *[
@@ -484,6 +506,20 @@ async def beam_search(
         if token > 0:
             num_generation_tokens += len(all_beams)
         request_id_batch = f"{request_id}-{random_uuid()}"
+        if token == 0:
+            beam_stats["beam_first_step_active_beams"] = float(active_beams)
+            beam_stats["beam_first_step_num_requests"] = float(num_requests_in_step)
+        else:
+            beam_stats["beam_later_steps_count"] += 1.0
+            beam_stats["beam_later_steps_total_active_beams"] += float(active_beams)
+            beam_stats["beam_later_steps_max_active_beams"] = max(
+                beam_stats["beam_later_steps_max_active_beams"], float(active_beams)
+            )
+            beam_stats["beam_later_steps_total_num_requests"] += float(num_requests_in_step)
+            beam_stats["beam_later_steps_max_num_requests"] = max(
+                beam_stats["beam_later_steps_max_num_requests"],
+                float(num_requests_in_step),
+            )
 
         # Launch catalog filtering in parallel with the engine step.
         catalog_task = None
@@ -563,6 +599,7 @@ async def beam_search(
         # Used to build logprobs_entry dicts without calling FlatLogprobs.__getitem__
         beam_flat_cache: list[tuple | None] = []
         logprob_process_start = time.perf_counter()
+        step_logprob_candidates = 0
         # Iterate through all beam inference results
         for i, result in enumerate(output):
             current_beam = all_beams[i]
@@ -612,6 +649,7 @@ async def beam_search(
                         lp if tid in valid_tokens_set else -float("inf")
                         for tid, lp in zip(token_ids_pos, logprobs_pos)
                     ]
+                step_logprob_candidates += len(token_ids_pos)
                 beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
                 all_beams_token_id.extend(token_ids_pos)
                 all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
@@ -626,6 +664,7 @@ async def beam_search(
         if not ignore_eos:
             # Get the index position of eos token in all generated results
             eos_idx = np.where(all_beams_token_id == eos_token_id)[0]
+            beam_stats["beam_eos_hit_count"] += float(len(eos_idx))
             for idx in eos_idx:
                 current_beam = all_beams[idx // logprobs_num]
                 cached = beam_flat_cache[idx // logprobs_num]
@@ -642,6 +681,7 @@ async def beam_search(
                 eos_beam._lp_parent = current_beam
                 eos_beam._lp_step_data = cached
                 completed.append(eos_beam)
+                beam_stats["beam_completed_beams_count"] += 1.0
             # After processing, set the log probability of the eos condition
             # to negative infinity.
             all_beams_logprob[eos_idx] = -np.inf
@@ -677,6 +717,17 @@ async def beam_search(
             fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
         all_beams = new_beams
+        step_output_count = len(output)
+        if token == 0:
+            beam_stats["beam_first_step_output_count"] = float(step_output_count)
+            beam_stats["beam_first_step_logprob_candidates"] = float(
+                step_logprob_candidates
+            )
+        else:
+            beam_stats["beam_later_steps_total_output_count"] += float(step_output_count)
+            beam_stats["beam_later_steps_total_logprob_candidates"] += float(
+                step_logprob_candidates
+            )
         step_total_elapsed = time.perf_counter() - step_total_start
         step_prefix = "beam_first_step" if token == 0 else "beam_later_steps"
         stage_breakdown_s[f"{step_prefix}_total_s"] += step_total_elapsed
@@ -711,6 +762,7 @@ async def beam_search(
         for beam in all_beams:
             beam.tokens.append(sid_end_token_id)
     completed.extend(all_beams)
+    beam_stats["beam_final_live_beams_count"] = float(len(all_beams))
     sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
     best_beams = sorted_completed[:beam_width]
 
@@ -738,6 +790,7 @@ async def beam_search(
         beam_search_overhead=beam_search_overhead,
         beam_search_decode_time=beam_search_decode_time,
         num_generation_tokens=num_generation_tokens,
+        beam_stats=beam_stats,
         stage_breakdown_ms={
             key.removesuffix("_s") + "_ms": value * 1000.0
             for key, value in stage_breakdown_s.items()

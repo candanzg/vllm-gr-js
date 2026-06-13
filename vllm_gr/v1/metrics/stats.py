@@ -20,3 +20,4 @@ class RequestStateStats(BaseRequestStateStats):
     beam_engine_decode_ms: float = 0.0
     beam_engine_inference_ms: float = 0.0
     beam_engine_e2e_ms: float = 0.0
+    beam_stats: dict[str, float] = field(default_factory=dict)
