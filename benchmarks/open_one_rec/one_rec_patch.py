@@ -172,6 +172,7 @@ async def patched_async_request_openai_chat_completions(
 
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
+    output.num_cached_tokens = 0
 
     generated_text = ""
     ttft = 0.0
@@ -220,6 +221,11 @@ async def patched_async_request_openai_chat_completions(
                                     generated_text += content
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                prompt_tokens_details = usage.get("prompt_tokens_details")
+                                if isinstance(prompt_tokens_details, dict):
+                                    output.num_cached_tokens = int(
+                                        prompt_tokens_details.get("cached_tokens", 0) or 0
+                                    )
                                 stage_timings_ms = data.get("vllm_stage_timings_ms")
                                 if isinstance(stage_timings_ms, dict):
                                     output.stage_timings_ms = {
