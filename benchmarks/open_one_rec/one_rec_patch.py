@@ -288,6 +288,17 @@ def _add_onerec_arguments(parser):
             default=None,
             help="Target prompt token length; prompts are trimmed or repeated to match.",
         )
+    if not _has_option("--repeat-first-n-prompts"):
+        onerec_group.add_argument(
+            "--repeat-first-n-prompts",
+            type=int,
+            default=None,
+            help=(
+                "Repeat only the first N dataset prompts to build all requests. "
+                "For example, 1 means all requests reuse the first prompt; "
+                "2 means requests alternate between the first two prompts."
+            ),
+        )
 
 
 def _add_beams_arguments(parser):
@@ -325,6 +336,7 @@ def patched_get_samples(args, tokenizer):
             tokenizer=tokenizer,
             custom_input_len=getattr(args, "custom_input_len", None),
             sample_size=args.num_prompts,
+            repeat_first_n_prompts=getattr(args, "repeat_first_n_prompts", None),
         )
         return dataset.sample(
             num_requests=args.num_prompts,
@@ -364,6 +376,7 @@ def patched_get_requests(args, tokenizer):
             custom_input_len=getattr(args, "custom_input_len", None),
             sample_size=args.num_prompts,
             disable_shuffle=getattr(args, "disable_shuffle", False),
+            repeat_first_n_prompts=getattr(args, "repeat_first_n_prompts", None),
         )
         return dataset.sample(
             num_requests=args.num_prompts,
@@ -421,6 +434,7 @@ def _run_offline_beam_search_benchmark(args):
         tokenizer=tokenizer,
         custom_input_len=getattr(args, "custom_input_len", None),
         sample_size=args.num_prompts,
+        repeat_first_n_prompts=getattr(args, "repeat_first_n_prompts", None),
     )
 
     # Sample requests

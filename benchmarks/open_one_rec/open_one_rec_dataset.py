@@ -21,6 +21,7 @@ class OneRecDataset(BenchmarkDataset):
         model_path: str = None,
         custom_input_len: int | None = None,
         sample_size: int | None = None,
+        repeat_first_n_prompts: int | None = None,
         **kwargs,
     ) -> None:
         self.task_types = task_types or [
@@ -37,6 +38,7 @@ class OneRecDataset(BenchmarkDataset):
         self.tokenizer = kwargs.get("tokenizer")
         self.custom_input_len = custom_input_len
         self.sample_size = sample_size
+        self.repeat_first_n_prompts = repeat_first_n_prompts
 
         super().__init__(**kwargs)
 
@@ -84,7 +86,20 @@ class OneRecDataset(BenchmarkDataset):
 
     def sample(self, tokenizer: TokenizerLike, num_requests: int, **kwargs) -> list:
         sampled_requests = []
-        for i, item in enumerate(self.data[:num_requests]):
+        if self.repeat_first_n_prompts is not None:
+            repeat_count = int(self.repeat_first_n_prompts)
+            if repeat_count <= 0:
+                raise ValueError("repeat_first_n_prompts must be a positive integer")
+            base_items = self.data[: min(repeat_count, len(self.data))]
+            if not base_items:
+                return sampled_requests
+            source_items = [
+                base_items[i % len(base_items)] for i in range(num_requests)
+            ]
+        else:
+            source_items = self.data[:num_requests]
+
+        for i, item in enumerate(source_items):
             prompt = item["prompt"]
             prompt_len = len(tokenizer(prompt).input_ids)
             expected_output_len = item["expected_output_len"]
@@ -93,7 +108,7 @@ class OneRecDataset(BenchmarkDataset):
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=expected_output_len,
-                    request_id=f"{item['task_type']}_{item['id']}",
+                    request_id=f"{item['task_type']}_{item['id']}_req{i}",
                 )
             )
         return sampled_requests
