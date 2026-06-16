@@ -3,7 +3,6 @@
 
 
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
-import contextvars
 import importlib
 import importlib.machinery
 import sys
@@ -1108,7 +1107,7 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
             compilation_config=SimpleNamespace(static_forward_context={}),
         )
         beam_groups = [(7, ["req-b", "missing", "req-a"])]
-        fake_beam_module = types.ModuleType("vllm_gr.v1.attention.backends.beam_attn")
+        fake_context_module = types.ModuleType("vllm_gr.v1.attention.beam_context")
 
         class _FakeBeamPrefixGroupsVar:
             def __init__(self) -> None:
@@ -1124,7 +1123,7 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
             def reset(self, token) -> None:
                 self.value = token
 
-        fake_beam_module.BEAM_PREFIX_GROUPS_VAR = _FakeBeamPrefixGroupsVar()
+        fake_context_module.BEAM_PREFIX_GROUPS_VAR = _FakeBeamPrefixGroupsVar()
 
         with _patched_gr_npu_model_runner() as gr_npu_model_runner_cls:
             runner = gr_npu_model_runner_cls(vllm_config, torch.device("cpu"))
@@ -1132,15 +1131,19 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
 
             with mock.patch.dict(
                 sys.modules,
-                {"vllm_gr.v1.attention.backends.beam_attn": fake_beam_module},
+                {"vllm_gr.v1.attention.beam_context": fake_context_module},
             ):
-                result = runner.execute_model(
-                    SimpleNamespace(beam_prefix_groups=beam_groups),
-                )
+                with mock.patch(
+                    "vllm_gr.worker.gr_runner_mixin.BEAM_PREFIX_GROUPS_VAR",
+                    fake_context_module.BEAM_PREFIX_GROUPS_VAR,
+                ):
+                    result = runner.execute_model(
+                        SimpleNamespace(beam_prefix_groups=beam_groups),
+                    )
 
         self.assertEqual(result, {"base_called": True})
         self.assertEqual(
-            fake_beam_module.BEAM_PREFIX_GROUPS_VAR.last_set,
+            fake_context_module.BEAM_PREFIX_GROUPS_VAR.last_set,
             [(7, [1, 0])],
         )
 

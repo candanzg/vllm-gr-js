@@ -433,8 +433,7 @@ def apply_worker_patches():
     """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-        from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR
+        from vllm_gr.v1.attention.beam_context import BEAM_PREFIX_GROUPS_VAR
     except ImportError:
         return
 

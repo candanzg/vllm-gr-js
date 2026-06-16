@@ -18,6 +18,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_gr.engine.gr_features_codec import decode_gr_features_payload
 from vllm_gr.logger import init_logger
+from vllm_gr.v1.attention.beam_context import BEAM_PREFIX_GROUPS_VAR
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -229,7 +230,7 @@ class GRFeatureRunnerMixin:
             None,
         )
         if self._current_beam_prefix_groups:
-            logger.debug(
+            logger.info(
                 "Runner %s received %d beam prefix group(s) for %d scheduled request(s).",
                 self.__class__.__name__,
                 len(self._current_beam_prefix_groups),
@@ -256,7 +257,7 @@ class GRFeatureRunnerMixin:
             if indices:
                 translated_groups.append((depth, indices))
         if beam_groups and not translated_groups:
-            logger.debug(
+            logger.info(
                 "Runner %s could not translate any beam prefix groups into active batch indices.",
                 self.__class__.__name__,
             )
@@ -267,12 +268,7 @@ class GRFeatureRunnerMixin:
         if translated_groups is None:
             return super()._build_attention_metadata(*args, **kwargs)
 
-        try:
-            from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR
-        except ImportError:
-            return super()._build_attention_metadata(*args, **kwargs)
-
-        logger.debug(
+        logger.info(
             "Injecting %d translated beam prefix group(s) into %s attention metadata.",
             len(translated_groups),
             self.__class__.__name__,

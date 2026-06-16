@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Graph Reuse Attention (Beam Attn) - Optimized attention with shared KV cache buffer separation."""
 
-import contextvars
 import copy
 from dataclasses import dataclass
 from itertools import compress
@@ -60,8 +59,9 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_gr.v1.attention.beam_context import BEAM_PREFIX_GROUPS_VAR
+
 logger = init_logger(__name__)
-BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM)
