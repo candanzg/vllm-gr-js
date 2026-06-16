@@ -358,6 +358,19 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
+        requests_map = getattr(self, "requests", {}) or {}
+        waiting_queue = getattr(self, "waiting", ()) or ()
+        running_state = getattr(self, "running", {}) or {}
+        request_count = len(requests_map)
+        waiting_count = len(waiting_queue)
+        running_count = len(running_state)
+        logger.info(
+            "Scheduler.schedule start: requests=%d waiting=%d running=%d",
+            request_count,
+            waiting_count,
+            running_count,
+        )
+
         # Cache for get_computed_blocks to optimize beam search
         computed_blocks_cache = {}
         last_key = None
@@ -429,7 +442,25 @@ def apply_scheduler_patch():
                 output.beam_prefix_groups[:2],
             )
         else:
-            logger.info("Scheduler beam_prefix_groups skipped: no scheduled req ids.")
+            request_items = list(requests_map.items())[:5]
+            request_debug = [
+                {
+                    "req_id": req_id,
+                    "priority": getattr(req, "priority", None),
+                    "status": getattr(req, "status", None),
+                    "num_tokens": getattr(req, "num_tokens", None),
+                    "num_computed_tokens": getattr(req, "num_computed_tokens", None),
+                }
+                for req_id, req in request_items
+            ]
+            logger.info(
+                "Scheduler beam_prefix_groups skipped: no scheduled req ids. "
+                "requests=%d waiting=%d running=%d sample_requests=%s",
+                request_count,
+                waiting_count,
+                running_count,
+                request_debug,
+            )
         return output
 
     Scheduler.schedule = patched_schedule
