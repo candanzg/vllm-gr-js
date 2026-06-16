@@ -37,6 +37,7 @@ class GRFeatureRunnerMixin:
         self._adapter = adapter
         self._gr_features_cache: dict[str, dict[str, Any]] = {}
         self._gr_feature_errors: dict[str, str] = {}
+        self._current_beam_prefix_groups = None
 
     def _apply_hstu_runtime_policy(self) -> None:
         gr_config = getattr(getattr(self, "vllm_config", None), "gr_config", None)
@@ -216,6 +217,71 @@ class GRFeatureRunnerMixin:
         # state here to keep the builder path shared across backends.
         self._prepare_hstu_attention_builders()
         return super()._prepare_inputs(*args, **kwargs)
+
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ):
+        self._current_beam_prefix_groups = getattr(
+            scheduler_output,
+            "beam_prefix_groups",
+            None,
+        )
+        if self._current_beam_prefix_groups:
+            logger.debug(
+                "Runner %s received %d beam prefix group(s) for %d scheduled request(s).",
+                self.__class__.__name__,
+                len(self._current_beam_prefix_groups),
+                len(getattr(getattr(self, "input_batch", None), "req_ids", ()) or ()),
+            )
+        try:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+        finally:
+            self._current_beam_prefix_groups = None
+
+    def _translate_beam_prefix_groups(self) -> list[tuple[int, list[int]]] | None:
+        beam_groups = getattr(self, "_current_beam_prefix_groups", None)
+        if not beam_groups:
+            return None
+
+        req_id_to_idx = {
+            req_id: idx
+            for idx, req_id in enumerate(getattr(self.input_batch, "req_ids", ()))
+            if req_id is not None
+        }
+        translated_groups: list[tuple[int, list[int]]] = []
+        for depth, group_req_ids in beam_groups:
+            indices = [req_id_to_idx[req_id] for req_id in group_req_ids if req_id in req_id_to_idx]
+            if indices:
+                translated_groups.append((depth, indices))
+        if beam_groups and not translated_groups:
+            logger.debug(
+                "Runner %s could not translate any beam prefix groups into active batch indices.",
+                self.__class__.__name__,
+            )
+        return translated_groups or None
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        translated_groups = self._translate_beam_prefix_groups()
+        if translated_groups is None:
+            return super()._build_attention_metadata(*args, **kwargs)
+
+        try:
+            from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR
+        except ImportError:
+            return super()._build_attention_metadata(*args, **kwargs)
+
+        logger.debug(
+            "Injecting %d translated beam prefix group(s) into %s attention metadata.",
+            len(translated_groups),
+            self.__class__.__name__,
+        )
+        token = BEAM_PREFIX_GROUPS_VAR.set(translated_groups)
+        try:
+            return super()._build_attention_metadata(*args, **kwargs)
+        finally:
+            BEAM_PREFIX_GROUPS_VAR.reset(token)
 
     def _get_hstu_kv_cache_spec_fallback(self) -> dict[str, Any]:
         self._sync_hstu_static_forward_context()

@@ -3,6 +3,7 @@
 
 
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
+import contextvars
 import importlib
 import importlib.machinery
 import sys
@@ -104,6 +105,7 @@ def _patched_gr_npu_model_runner() -> None:
             self.device = device
             self.attn_groups = []
             self.model = None
+            self.input_batch = SimpleNamespace(req_ids=[])
 
         def load_model(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -119,6 +121,11 @@ def _patched_gr_npu_model_runner() -> None:
         def _build_attention_metadata(self, *args, **kwargs) -> None:
             self._build_attention_metadata_called = (args, kwargs)
             return {"base_called": True}
+
+        def execute_model(self, scheduler_output, intermediate_tensors=None):
+            del intermediate_tensors
+            self._execute_model_called = scheduler_output
+            return self._build_attention_metadata()
 
     fake_vllm_ascend.__spec__ = importlib.machinery.ModuleSpec("vllm_ascend", loader=None)
     fake_vllm_ascend_worker.__spec__ = importlib.machinery.ModuleSpec(
@@ -1092,6 +1099,50 @@ class TestHSTUVllmNativeKVContract(unittest.TestCase):
         _FakeGPUModelRunner._allocate_kv_cache_tensors.assert_called_once()
         _FakeGPUModelRunner._reshape_kv_cache_tensors.assert_called_once()
         fake_worker_utils_module.bind_kv_cache.assert_called_once()
+
+    def test_npu_runner_injects_beam_prefix_groups_into_attention_metadata(self) -> None:
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="hstu"),
+            ),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        beam_groups = [(7, ["req-b", "missing", "req-a"])]
+        fake_beam_module = types.ModuleType("vllm_gr.v1.attention.backends.beam_attn")
+
+        class _FakeBeamPrefixGroupsVar:
+            def __init__(self) -> None:
+                self.value = None
+                self.last_set = None
+
+            def set(self, value):
+                token = self.value
+                self.value = value
+                self.last_set = value
+                return token
+
+            def reset(self, token) -> None:
+                self.value = token
+
+        fake_beam_module.BEAM_PREFIX_GROUPS_VAR = _FakeBeamPrefixGroupsVar()
+
+        with _patched_gr_npu_model_runner() as gr_npu_model_runner_cls:
+            runner = gr_npu_model_runner_cls(vllm_config, torch.device("cpu"))
+            runner.input_batch = SimpleNamespace(req_ids=["req-a", "req-b"])
+
+            with mock.patch.dict(
+                sys.modules,
+                {"vllm_gr.v1.attention.backends.beam_attn": fake_beam_module},
+            ):
+                result = runner.execute_model(
+                    SimpleNamespace(beam_prefix_groups=beam_groups),
+                )
+
+        self.assertEqual(result, {"base_called": True})
+        self.assertEqual(
+            fake_beam_module.BEAM_PREFIX_GROUPS_VAR.last_set,
+            [(7, [1, 0])],
+        )
 
     def test_hstu_transducer_falls_back_to_full_compute_when_cached_path_fails(
         self,
