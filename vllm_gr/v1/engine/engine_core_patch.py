@@ -422,6 +422,14 @@ def apply_scheduler_patch():
             output.beam_prefix_groups = _compute_beam_prefix_groups(
                 req_ids, self.requests, self.cache_config.block_size
             )
+            logger.info(
+                "Scheduler beam_prefix_groups computed: reqs=%d groups=%d sample=%s",
+                len(req_ids),
+                len(output.beam_prefix_groups),
+                output.beam_prefix_groups[:2],
+            )
+        else:
+            logger.info("Scheduler beam_prefix_groups skipped: no scheduled req ids.")
         return output
 
     Scheduler.schedule = patched_schedule

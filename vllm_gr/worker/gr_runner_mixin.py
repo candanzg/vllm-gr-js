@@ -224,17 +224,20 @@ class GRFeatureRunnerMixin:
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ):
-        self._current_beam_prefix_groups = getattr(
-            scheduler_output,
-            "beam_prefix_groups",
-            None,
-        )
-        if self._current_beam_prefix_groups:
+        has_beam_prefix_groups = hasattr(scheduler_output, "beam_prefix_groups")
+        self._current_beam_prefix_groups = getattr(scheduler_output, "beam_prefix_groups", None)
+        if has_beam_prefix_groups:
             logger.info(
-                "Runner %s received %d beam prefix group(s) for %d scheduled request(s).",
+                "Runner %s received beam_prefix_groups=%s (count=%d) for %d scheduled request(s).",
                 self.__class__.__name__,
-                len(self._current_beam_prefix_groups),
+                "present",
+                len(self._current_beam_prefix_groups or ()),
                 len(getattr(getattr(self, "input_batch", None), "req_ids", ()) or ()),
+            )
+        else:
+            logger.info(
+                "Runner %s received no beam_prefix_groups field on scheduler_output.",
+                self.__class__.__name__,
             )
         try:
             return super().execute_model(scheduler_output, intermediate_tensors)
