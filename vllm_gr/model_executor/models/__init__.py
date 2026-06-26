@@ -5,12 +5,12 @@
 Model wrappers and registry for vllm-GR.
 
 This module provides:
-- HSTUForRecommendation: Unified HSTU model (vLLM compatible)
+- FuXiForRecommendation: FuXi model wrapper (vLLM compatible)
 - register_gr_model_architectures(): Registers GR models with vLLM's
   ModelRegistry
 """
 
-from vllm_gr.model_executor.models.hstu_vllm import HSTUForRecommendation
+from vllm_gr.model_executor.models.fuxi_vllm import FuXiForRecommendation
 from vllm_gr.model_executor.models.registry import (
     get_gr_architectures,
     is_gr_model,
@@ -21,7 +21,7 @@ from vllm_gr.model_executor.models.registry import (
 
 __all__ = [
     # Unified model
-    "HSTUForRecommendation",
+    "FuXiForRecommendation",
     # Model registry
     "register_gr_model_architectures",
     "register_gr_models_to_vllm",

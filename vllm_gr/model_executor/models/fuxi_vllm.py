@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from vllm_gr.model_executor.models.hstu_vllm import HSTUPooler
-from vllm_gr.utils.hstu_runtime import resolve_hstu_runtime_devices
+from vllm_gr.models.fuxi.pooler import RecommendationPooler
+from vllm_gr.utils.runtime_devices import resolve_runtime_devices
 
 logger = init_logger(__name__)
 
@@ -51,14 +51,14 @@ class FuXiForRecommendation(nn.Module):
             self.config, "torch_dtype", torch.bfloat16
         )
         dense_device_override = torch.device(device) if device is not None else None
-        runtime_devices = resolve_hstu_runtime_devices(
+        runtime_devices = resolve_runtime_devices(
             explicit_dense_device=dense_device_override,
         )
         self._dense_device = runtime_devices.dense_device
 
         self._create_fuxi_model()
-        self._hstu_kv_cache_layers = nn.ModuleList(self._fuxi.kv_cache_layers)
-        self._pooler = HSTUPooler(self.config.item_embedding_dim)
+        self._kv_cache_layers = nn.ModuleList(self._fuxi.kv_cache_layers)
+        self._pooler = RecommendationPooler(self.config.item_embedding_dim)
 
         logger.info(
             "FuXiForRecommendation initialized: blocks=%d, heads=%d, "
@@ -101,12 +101,12 @@ class FuXiForRecommendation(nn.Module):
             )
         return list(torch.split(predictions, split_sizes, dim=-1))
 
-    def _get_hstu_attention_metadata(
+    def _get_attention_metadata(
         self,
         uih_seq_lengths: Optional[torch.Tensor] = None,
         num_targets: Optional[torch.Tensor] = None,
     ) -> Optional[Any]:
-        if not self.enable_kv_cache or len(self._hstu_kv_cache_layers) == 0:
+        if not self.enable_kv_cache or len(self._kv_cache_layers) == 0:
             return None
 
         try:
@@ -128,7 +128,7 @@ class FuXiForRecommendation(nn.Module):
         if not isinstance(attn_metadata, dict):
             return None
 
-        for cache_layer in self._hstu_kv_cache_layers:
+        for cache_layer in self._kv_cache_layers:
             layer_name = getattr(cache_layer, "layer_name", None)
             if layer_name is None:
                 continue
@@ -191,7 +191,7 @@ class FuXiForRecommendation(nn.Module):
                 )
                 if actual_token_slots < expected_total_tokens:
                     return None
-                metadata.cache_layers = list(self._hstu_kv_cache_layers)
+                metadata.cache_layers = list(self._kv_cache_layers)
                 return metadata
         return None
 
@@ -226,7 +226,7 @@ class FuXiForRecommendation(nn.Module):
         if past_payloads:
             past_payloads = {key: value.to(dense_device) for key, value in past_payloads.items()}
 
-        hstu_attn_metadata = self._get_hstu_attention_metadata(
+        attn_metadata = self._get_attention_metadata(
             uih_seq_lengths=past_lengths,
             num_targets=torch.zeros_like(past_lengths),
         )
@@ -236,7 +236,7 @@ class FuXiForRecommendation(nn.Module):
             past_payloads=past_payloads,
             candidate_ids=candidate_ids,
             candidate_lengths=candidate_lengths,
-            hstu_attn_metadata=hstu_attn_metadata,
+            attn_metadata=attn_metadata,
         )
         if candidate_lengths is None:
             return predictions

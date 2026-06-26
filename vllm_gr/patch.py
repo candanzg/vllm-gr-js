@@ -471,7 +471,7 @@ def patch_lmcache_adapter():
 def _apply_kv_merge_patch(force: bool = False) -> int:
     """Patch vllm-ascend to support K+V merged KV cache tensors.
 
-    This patch adds support for HSTU-style KV cache where K and V are concatenated
+    This patch adds support for paged-KV-style KV cache where K and V are concatenated
     into a single tensor per layer (kv_cache_per_layer=1), instead of the default
     separate K and V tensors (kv_cache_per_layer=2).
 
@@ -698,7 +698,7 @@ def _apply_kv_merge_patch(force: bool = False) -> int:
 
     if patch_count > 0:
         logger.info(
-            "vllm_gr: Applied %d KV merge monkey patch(es) for HSTU-style KV cache",
+            "vllm_gr: Applied %d KV merge monkey patch(es) for paged-KV-style KV cache",
             patch_count,
         )
     return patch_count

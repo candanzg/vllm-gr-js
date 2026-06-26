@@ -4,7 +4,7 @@
 """
 Core data types for generative recommendation.
 
-GRPrompt is the current user-facing HSTU-oriented input format for the
+GRPrompt is the current user-facing input format for the
 GRLLM API. ``is_gr_prompt()`` preserves backward compatibility with that
 shape while also allowing future model-specific prompt shapes to opt into
 the GR pipeline by setting a registered ``model_type``.
@@ -65,10 +65,10 @@ def is_gr_prompt(prompt: Any) -> bool:
     1. Model-type path: if ``model_type`` is present and corresponds to a
        registered adapter family, accept based on ``user_id + model_type``
        alone.  This allows future prompt shapes (e.g. SASRec) to enter the
-       GR pipeline without reusing HSTU-specific fields.
+       GR pipeline without reusing model-specific fields.
     2. Generic path: if ``model_type`` is absent, accept any dict that
        contains ``user_id``.  Model-specific field validation (e.g.
-       ``user_history`` / ``candidates`` for HSTU) is deferred to the
+       ``user_history`` / ``candidates``) is deferred to the
        adapter's ``validate_prompt()`` so that ``is_gr_prompt()`` itself
        stays model-family-agnostic.
     """
@@ -104,9 +104,9 @@ def _ensure_registered_model_type(model_type: str) -> None:
     package's ``register_family()`` call when such a package exists.
 
     Only suppresses ``ModuleNotFoundError`` when the missing module is
-    the adapter package itself.  A broken transitive dependency (e.g.
-    torchrec) propagates so the caller sees a real error, not a silent
-    "unregistered model type" failure.
+    the adapter package itself.  A broken transitive dependency propagates
+    so the caller sees a real error, not a silent "unregistered model type"
+    failure.
     """
     from vllm_gr.adapters.registry import get_registered_families
 

@@ -6,8 +6,8 @@
 
 - 已安装 `vllm-gr` 及其运行依赖
 - 可以访问本仓库目录
-- `demo` 分支使用 `examples/configs/movielens-1m`，该目录当前只包含 `config.json`，不包含真实权重
-- `load_weight` 分支使用你本地的已转换模型目录，该目录需要包含：
+- `demo` 分支使用 `examples/demo-model`，该目录当前只包含 `config.json`，不包含真实权重
+- `load_weight` 分支使用你本地的已训练模型目录，该目录需要包含：
     - `config.json`
     - `model.safetensors` 或等价权重文件
 
@@ -18,9 +18,8 @@
 启动命令：
 
 ```bash
-vllm-gr serve examples/configs/movielens-1m \
-  --served-model-name movielens-1m \
-  --model-family hstu \
+vllm-gr serve examples/demo-model \
+  --served-model-name fuxi-demo \
   --allow-missing-weights \
   --host 127.0.0.1 \
   --port 8000
@@ -34,14 +33,13 @@ vllm-gr serve examples/configs/movielens-1m \
 
 ## 3. Load Weight 分支
 
-`load_weight` 分支使用已转换好的真实权重模型目录，场景与 [load_converted_model.py](../load_converted_model.py) 一致。
+`load_weight` 分支使用已训练好的真实权重模型目录。
 
 启动命令：
 
 ```bash
-vllm-gr serve <converted_model_dir> \
-  --served-model-name movielens-1m \
-  --model-family hstu \
+vllm-gr serve <trained_model_dir> \
+  --served-model-name fuxi-demo \
   --host 127.0.0.1 \
   --port 8000
 ```
@@ -49,7 +47,7 @@ vllm-gr serve <converted_model_dir> \
 说明：
 
 - 这条分支不带 `--allow-missing-weights`
-- 共享请求样例仍然使用 `model: movielens-1m`
+- 共享请求样例仍然使用 `model: fuxi-demo`
 
 ## 5. 调用方式
 
@@ -74,7 +72,7 @@ curl -v --max-time 30 -X POST "http://127.0.0.1:8000/recommend" \
 - `recommendations`
 - 每个 `recommendation` 默认会包含 `index`、`item_id`、`score`
 - 如果模型输出了多任务分数，还会包含 `task_scores`
-- 响应中的 `model` 应为 `movielens-1m`
+- 响应中的 `model` 应为 `fuxi-demo`
 
 ## 6. 使用 Python 客户端调用
 

@@ -27,11 +27,11 @@ def generate_sample_prompts(
     """Generate sample GRPrompt requests for testing.
 
     Uses the default demo-model feature names:
-    - UIH: item_id, timestamp
-    - Candidates: item_candidate_id, query_time
+    - UIH: item_id, rating, timestamp
+    - Candidates: item_id, rating, timestamp
 
     All feature values are pre-processed embedding indices and must satisfy
-    0 <= value < num_embeddings (10000 for the demo-model item_embedding table).
+    0 <= value < num_embeddings for the demo-model embedding tables.
     """
     prompts: List[GRPrompt] = []
 
@@ -41,14 +41,16 @@ def generate_sample_prompts(
             "user_history": [
                 {
                     "item_id": (i * 100 + j) % 10000,
+                    "rating": 0,
                     "timestamp": 1609459200 + j * 3600,
                 }
                 for j in range(seq_length)
             ],
             "candidates": [
                 {
-                    "item_candidate_id": 5000 + (i * 30 + k) % 5000,
-                    "query_time": 1609459200 + i * 600,
+                    "item_id": 5000 + (i * 30 + k) % 5000,
+                    "rating": 0,
+                    "timestamp": 1609459200 + i * 600,
                 }
                 for k in range(num_candidates)
             ],
@@ -112,7 +114,7 @@ def main():
     print("\n[GRLLM Initialized]")
     print(f"   Engine: {llm.engine_class.__name__}")
     print(f"   Device path: {active_device}")
-    print("   Model: HSTU with randomly initialized weights (explicit demo mode)")
+    print("   Model: FuXi with randomly initialized weights (explicit demo mode)")
 
     # 2. Test parameters
     num_users = args.num_users
@@ -130,7 +132,7 @@ def main():
 
     # 4. Method 1: Use recommend() with all prompts at once
     print("\n[Method 1: recommend() with all prompts]")
-    print("   Running HSTU model inference...")
+    print("   Running FuXi model inference...")
     start_time = time.time()
     outputs: List[GRRequestOutput] = llm.recommend(
         prompts=prompts,
@@ -197,7 +199,7 @@ def main():
 
     print("\n" + "=" * 60)
     print(" Batch example completed successfully!")
-    print(f" Full HSTU model forward pass was executed on {active_device}.")
+    print(f" Full FuXi model forward pass was executed on {active_device}.")
     print("=" * 60)
 
 

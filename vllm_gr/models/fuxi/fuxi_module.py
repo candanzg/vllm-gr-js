@@ -15,7 +15,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_gr.model_executor.layers.hstu_attention_layer import HSTUKVCacheAttentionLayer
+from vllm_gr.model_executor.layers.paged_kv_attention_layer import (
+    PagedKVCacheAttentionLayer,
+)
 from vllm_gr.models.fuxi.input_features_preprocessors import (
     InputFeaturesPreprocessorModule,
     LearnablePositionalEmbeddingInputFeaturesPreprocessor,
@@ -192,7 +194,7 @@ class FuXiBlockJagged(torch.nn.Module):
 
         # vllm-GR: optional paged-KV wiring (Phase 1 uses full mode only).
         torch_dtype = torch.bfloat16
-        self.attn_layer = HSTUKVCacheAttentionLayer(
+        self.attn_layer = PagedKVCacheAttentionLayer(
             layer_name=f"{prefix}.attn",
             num_heads=self._num_heads,
             head_size=self._attention_dim,
@@ -220,7 +222,7 @@ class FuXiBlockJagged(torch.nn.Module):
         x_offsets: torch.Tensor,
         all_timestamps: Optional[torch.Tensor],
         invalid_attn_mask: torch.Tensor,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         del all_timestamps
         normed_x = self._norm_input(x)
@@ -253,17 +255,13 @@ class FuXiBlockJagged(torch.nn.Module):
 
         if self._normalization == "rel_bias":
             kv_cache = self.attn_layer.get_runtime_kv_cache()
-            if (
-                kv_cache is not None
-                and hstu_attn_metadata is not None
-                and self._rel_attn_bias is None
-            ):
+            if kv_cache is not None and attn_metadata is not None and self._rel_attn_bias is None:
                 attn = self.attn_layer(
                     query=q3,
                     key=k3,
                     value=v3,
                     kv_cache=kv_cache,
-                    attn_metadata=hstu_attn_metadata,
+                    attn_metadata=attn_metadata,
                     attn_mode="full",
                 )
                 attn_output = attn.reshape(-1, num_heads * dv)
@@ -306,7 +304,7 @@ class FuXiJagged(torch.nn.Module):
         x_offsets: torch.Tensor,
         all_timestamps: Optional[torch.Tensor],
         invalid_attn_mask: torch.Tensor,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         with torch.autocast(
             "cuda",
@@ -319,7 +317,7 @@ class FuXiJagged(torch.nn.Module):
                     x_offsets=x_offsets,
                     all_timestamps=all_timestamps,
                     invalid_attn_mask=invalid_attn_mask,
-                    hstu_attn_metadata=hstu_attn_metadata,
+                    attn_metadata=attn_metadata,
                 )
         return x
 
@@ -329,7 +327,7 @@ class FuXiJagged(torch.nn.Module):
         x_offsets: torch.Tensor,
         all_timestamps: Optional[torch.Tensor],
         invalid_attn_mask: torch.Tensor,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         if len(x.size()) == 3:
             x = ReliableOps.dense_to_jagged(x, [x_offsets])
@@ -339,7 +337,7 @@ class FuXiJagged(torch.nn.Module):
             x_offsets=x_offsets,
             all_timestamps=all_timestamps,
             invalid_attn_mask=invalid_attn_mask,
-            hstu_attn_metadata=hstu_attn_metadata,
+            attn_metadata=attn_metadata,
         )
         return ReliableOps.jagged_to_padded_dense(
             values=jagged_x,
@@ -471,7 +469,7 @@ class FuXiAlphaInferenceModel(nn.Module):
         past_ids: torch.Tensor,
         past_embeddings: torch.Tensor,
         past_payloads: dict,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         """
         [B, N] -> [B, N, D].
@@ -496,7 +494,7 @@ class FuXiAlphaInferenceModel(nn.Module):
                 past_payloads[TIMESTAMPS_KEY] if TIMESTAMPS_KEY in past_payloads else None
             ),
             invalid_attn_mask=1.0 - attn_mask.to(float_dtype),
-            hstu_attn_metadata=hstu_attn_metadata,
+            attn_metadata=attn_metadata,
         )
         return self._output_postproc(user_embeddings)
 
@@ -506,14 +504,14 @@ class FuXiAlphaInferenceModel(nn.Module):
         past_ids: torch.Tensor,
         past_embeddings: torch.Tensor,
         past_payloads: dict,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         encoded_seq_embeddings = self.generate_user_embeddings(
             past_lengths=past_lengths,
             past_ids=past_ids,
             past_embeddings=past_embeddings,
             past_payloads=past_payloads,
-            hstu_attn_metadata=hstu_attn_metadata,
+            attn_metadata=attn_metadata,
         )
         return get_current_embeddings(
             lengths=past_lengths,
@@ -526,14 +524,14 @@ class FuXiAlphaInferenceModel(nn.Module):
         past_ids: torch.Tensor,
         past_embeddings: torch.Tensor,
         past_payloads: dict,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         return self._encode(
             past_lengths=past_lengths,
             past_ids=past_ids,
             past_embeddings=past_embeddings,
             past_payloads=past_payloads,
-            hstu_attn_metadata=hstu_attn_metadata,
+            attn_metadata=attn_metadata,
         )
 
     def _score_candidates(
@@ -581,7 +579,7 @@ class FuXiAlphaInferenceModel(nn.Module):
         past_payloads: Optional[dict] = None,
         candidate_ids: Optional[torch.Tensor] = None,
         candidate_lengths: Optional[torch.Tensor] = None,
-        hstu_attn_metadata=None,
+        attn_metadata=None,
     ) -> torch.Tensor:
         past_payloads = past_payloads or {}
         past_embeddings = self.get_item_embeddings(past_ids)
@@ -592,7 +590,7 @@ class FuXiAlphaInferenceModel(nn.Module):
                 past_ids=past_ids,
                 past_embeddings=past_embeddings,
                 past_payloads=past_payloads,
-                hstu_attn_metadata=hstu_attn_metadata,
+                attn_metadata=attn_metadata,
             )
 
         current_embeddings = self.encode(
@@ -600,7 +598,7 @@ class FuXiAlphaInferenceModel(nn.Module):
             past_ids=past_ids,
             past_embeddings=past_embeddings,
             past_payloads=past_payloads,
-            hstu_attn_metadata=hstu_attn_metadata,
+            attn_metadata=attn_metadata,
         )
         return self._score_candidates(
             current_embeddings=current_embeddings,

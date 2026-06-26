@@ -8,7 +8,6 @@ import unittest
 from types import SimpleNamespace
 
 try:
-    import torchrec  # noqa: F401
     import vllm  # noqa: F401
 
     _VLLM_AVAILABLE = True
@@ -25,43 +24,41 @@ from vllm_gr.adapters.capabilities import (
 
 @unittest.skipUnless(_VLLM_AVAILABLE, "vLLM runtime not available")
 class TestGRCapabilities(unittest.TestCase):
-    """Verify that HSTUModelAdapter satisfies expected capability protocols."""
+    """Verify that FuXiAlphaModelAdapter satisfies expected capability protocols."""
 
-    def _make_hstu_adapter(self) -> None:
-        from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
+    def _make_fuxi_adapter(self) -> None:
+        from vllm_gr.adapters.fuxi.adapter import FuXiAlphaModelAdapter
 
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(
-                    hstu_uih_feature_names=["item_id"],
-                    user_embedding_feature_names=["item_id"],
-                    hstu_candidate_feature_names=["item_candidate_id"],
-                    item_embedding_feature_names=["item_candidate_id"],
-                    uih_post_id_feature_name="item_id",
-                    candidate_primary_id_feature_name="item_candidate_id",
-                    merge_uih_candidate_feature_mapping=[
-                        ["item_id", "item_candidate_id"],
-                    ],
-                    task_names=["is_click"],
-                    contextual_feature_to_max_length={},
-                    contextual_feature_to_min_uih_length={},
+                    max_seq_len=64,
+                    max_num_candidates_inference=50,
+                    item_embedding_dim=50,
+                    item_id_feature_name="item_id",
+                    rating_feature_name="rating",
+                    timestamp_feature_name="timestamp",
+                    task_names=["score"],
+                    use_rating_embedding=False,
+                    use_timestamp_payload=False,
+                    enable_kv_cache=True,
                 ),
             )
         )
-        gr_config = SimpleNamespace(max_seq_len=512, max_candidates=1000)
-        return HSTUModelAdapter(vllm_config, gr_config)
+        gr_config = SimpleNamespace(max_seq_len=64, max_candidates=50)
+        return FuXiAlphaModelAdapter(vllm_config, gr_config)
 
-    def test_hstu_is_pooling_model(self) -> None:
-        adapter = self._make_hstu_adapter()
+    def test_fuxi_is_pooling_model(self) -> None:
+        adapter = self._make_fuxi_adapter()
         self.assertIsInstance(adapter, GRPoolingModel)
 
-    def test_hstu_is_scoring_model(self) -> None:
-        adapter = self._make_hstu_adapter()
+    def test_fuxi_is_scoring_model(self) -> None:
+        adapter = self._make_fuxi_adapter()
         self.assertIsInstance(adapter, GRScoringModel)
 
-    def test_hstu_is_not_embedding_model(self) -> None:
-        """HSTU is a scoring model, not an embedding model."""
-        adapter = self._make_hstu_adapter()
+    def test_fuxi_is_not_embedding_model(self) -> None:
+        """FuXi is a scoring model, not an embedding model."""
+        adapter = self._make_fuxi_adapter()
         self.assertNotIsInstance(adapter, GREmbeddingModel)
 
     def test_scoring_and_embedding_are_distinguishable(self) -> None:
@@ -84,8 +81,8 @@ class TestGRCapabilities(unittest.TestCase):
         self.assertIsInstance(_FakeEmbeddingAdapter(), GREmbeddingModel)
         self.assertNotIsInstance(_FakeEmbeddingAdapter(), GRScoringModel)
 
-    def test_hstu_supports_prefix_cache(self) -> None:
-        adapter = self._make_hstu_adapter()
+    def test_fuxi_supports_prefix_cache(self) -> None:
+        adapter = self._make_fuxi_adapter()
         self.assertIsInstance(adapter, GRPrefixCacheSupport)
 
     def test_plain_adapter_is_not_pooling_model(self) -> None:

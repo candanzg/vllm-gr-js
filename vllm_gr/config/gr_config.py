@@ -5,20 +5,19 @@
 GRConfig — typed runtime configuration for GR inference.
 
 Separates GR-specific *runtime / serving* parameters from the model
-architecture parameters that live in HSTUConfig (config.json).
+architecture parameters that live in the model's HF config (config.json).
 
 Feature names (uih, candidate, primary_id, task_names, etc.) are NOT
-stored here — they are read directly from ``HSTUConfig`` (hf_config),
-which is the single source of truth.
+stored here — they are read directly from the model's HF config
+(``hf_config``), which is the single source of truth.
 
 * ``max_seq_len``  — runtime truncation length for user-history sequences.
-  Must be <= the model's ``HSTUConfig.max_seq_len`` (architecture limit).
+  Must be <= the model's architectural ``max_seq_len``.
 * ``max_candidates`` — runtime per-request candidate limit.
-  Must be <= the model's ``HSTUConfig.max_num_candidates`` (architecture limit).
+  Must be <= the model's architectural ``max_num_candidates``.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -26,7 +25,7 @@ class GRConfig:
     """Typed GR runtime config.
 
     Separates GR-specific runtime/serving parameters from model architecture
-    parameters that live in HSTUConfig (config.json).
+    parameters that live in the model's HF config (config.json).
     """
 
     max_seq_len: int = 512
@@ -34,9 +33,3 @@ class GRConfig:
 
     max_candidates: int = 1000
     """Runtime per-request candidate limit (can be <= model max_num_candidates)."""
-
-    enable_npu_fused_prefill: Optional[bool] = None
-    """Enable HSTU mxrec fused prefill/full-prefix attention path. ``None`` means platform default."""
-
-    force_hammer_npu: Optional[bool] = None
-    """Force all discovered HSTU HammerModule instances to use HammerKernel.NPU. ``None`` means platform default."""

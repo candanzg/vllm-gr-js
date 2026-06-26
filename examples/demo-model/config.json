@@ -1,6 +1,6 @@
 {
-  "model_type": "hstu",
-  "architectures": ["HSTUEmbeddingModel"],
+  "model_type": "fuxi",
+  "architectures": ["FuXiEmbeddingModel"],
 
   "torch_dtype": "bfloat16",
   "is_text_encoder": true,
@@ -9,45 +9,35 @@
 
   "max_seq_len": 128,
   "max_num_candidates": 50,
+  "max_num_candidates_inference": 50,
+  "item_embedding_dim": 64,
 
-  "hstu_num_heads": 2,
-  "hstu_attn_linear_dim": 64,
-  "hstu_attn_qk_dim": 32,
-  "hstu_attn_num_layers": 2,
-  "hstu_embedding_table_dim": 64,
-  "hstu_preprocessor_hidden_dim": 128,
-  "hstu_transducer_embedding_dim": 64,
+  "num_blocks": 2,
+  "num_heads": 2,
+  "dqk": 64,
+  "dv": 64,
+  "ffn_multiply": 1.0,
+  "ffn_single_stage": false,
+  "linear_activation": "silu",
+  "linear_dropout_rate": 0.0,
+  "attn_dropout_rate": 0.0,
+  "layer_norm_eps": 1e-6,
 
-  "user_embedding_feature_names": ["item_id"],
-  "item_embedding_feature_names": ["item_candidate_id"],
-  "uih_post_id_feature_name": "item_id",
-  "uih_action_time_feature_name": "timestamp",
-  "candidates_querytime_feature_name": "query_time",
-  "candidates_weight_feature_name": "",
-  "candidates_watchtime_feature_name": "",
+  "enable_relative_attention_bias": false,
+  "enable_kv_cache": true,
 
-  "hstu_uih_feature_names": [
-    "item_id", "timestamp"
-  ],
-  "hstu_candidate_feature_names": [
-    "item_candidate_id", "query_time"
-  ],
+  "input_preprocessor_type": "posi",
+  "positional_embedding_max_len": 128,
+  "rating_embedding_dim": 0,
+  "num_ratings": 0,
+  "output_postprocessor_type": "l2",
+  "temperature": 0.05,
 
-  "merge_uih_candidate_feature_mapping": [
-    ["item_id", "item_candidate_id"],
-    ["timestamp", "query_time"]
-  ],
+  "item_id_feature_name": "item_id",
+  "rating_feature_name": "rating",
+  "timestamp_feature_name": "timestamp",
+  "use_rating_embedding": false,
+  "use_timestamp_payload": false,
 
-  "hash_size": 10000,
-  "task_names": ["is_click"],
-  "task_types": ["binary_classification"],
-
-  "embedding_tables": [
-    {
-      "name": "item_embedding",
-      "embedding_dim": 64,
-      "num_embeddings": 10000,
-      "feature_names": ["item_id", "item_candidate_id"]
-    }
-  ]
+  "task_names": ["score"]
 }

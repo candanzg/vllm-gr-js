@@ -189,16 +189,22 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
             )
 
         scores = raw_output.float()
-        if scores.dim() == 2:
+        if scores.dim() != 2:
+            raise ValueError(
+                "GR pooling output must be 2D (num_tasks, num_candidates): "
+                f"shape={tuple(scores.shape)}"
+            )
+
+        all_task_scores: dict[str, list[float]] | None = None
+        if task_names:
             if primary_task and primary_task in task_names:
                 primary_idx = task_names.index(primary_task)
             else:
                 primary_idx = 0
             primary_scores = scores[primary_idx]
-        elif scores.dim() == 1:
-            primary_scores = scores
+            all_task_scores = {name: scores[i].tolist() for i, name in enumerate(task_names)}
         else:
-            raise ValueError(f"FuXi pooling output must be 1D or 2D: shape={tuple(scores.shape)}")
+            primary_scores = scores[0]
 
         if len(candidates) != len(primary_scores):
             raise ValueError(
@@ -208,12 +214,15 @@ class FuXiAlphaModelAdapter(GRModelAdapter, GRPoolingModel, GRScoringModel):
 
         recommendations = []
         for idx, candidate in enumerate(candidates):
+            item_task_scores = None
+            if all_task_scores is not None:
+                item_task_scores = {t: all_task_scores[t][idx] for t in all_task_scores}
             recommendations.append(
                 RecommendedItem(
                     item_id=candidate.get(primary_id_key, idx),
                     score=float(primary_scores[idx]),
                     features=candidate,
-                    task_scores=None,
+                    task_scores=item_task_scores,
                 )
             )
 

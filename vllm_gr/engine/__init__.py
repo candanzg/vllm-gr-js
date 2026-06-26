@@ -6,7 +6,7 @@ Engine-level data structures for generative recommendation.
 
 Defines GREngineCoreRequest for transporting GR features through
 vLLM's EngineCore pipeline.  Model-specific payload types live in
-their respective adapter packages (e.g. vllm_gr.adapters.hstu.payload).
+their respective adapter packages (e.g. vllm_gr.adapters.fuxi.payload).
 
 Serialization note:
     EngineCoreRequest uses array_like=True (positional msgspec encoding).

@@ -4,13 +4,13 @@
 """
 GRModelAdapter — base class for model-specific recommendation adapters.
 
-Each model family (HSTU, SASRec, etc.) subclasses ``GRModelAdapter`` to
+Each model family (FuXi, SASRec, etc.) subclasses ``GRModelAdapter`` to
 provide:
 
 - ``parse_prompt``      — extract features from a GRPrompt
 - ``build_payload``     — serialize features into a msgspec-safe payload
 - ``decode_payload``    — deserialize payload back into feature tensors
-- ``build_model_kwargs``— build model-specific kwargs (e.g. KJT for HSTU)
+- ``build_model_kwargs``— build model-specific kwargs
 - ``process_output``    — convert raw pooling output into GRRequestOutput (directly, not via GRModelOutput)
 
 Optional methods provide prefix-cache support, validation, and metadata
@@ -37,7 +37,7 @@ class GRModelAdapter:
     """
 
     model_type: str = ""
-    """Unique model family identifier (e.g. 'hstu', 'sasrec')."""
+    """Unique model family identifier (e.g. 'fuxi', 'sasrec')."""
 
     payload_type: type = object
     """The msgspec-serializable payload class used by this adapter."""

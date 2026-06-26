@@ -37,17 +37,16 @@ def _restore_modules(saved: dict[str, types.ModuleType]) -> None:
 
 def _build_fake_hf_config() -> None:
     return SimpleNamespace(
-        hstu_uih_feature_names=["item_id"],
-        user_embedding_feature_names=["item_id"],
-        hstu_candidate_feature_names=["item_candidate_id"],
-        item_embedding_feature_names=["item_candidate_id"],
-        uih_post_id_feature_name="item_id",
-        candidate_primary_id_feature_name="item_candidate_id",
-        merge_uih_candidate_feature_mapping=[
-            ["item_id", "item_candidate_id"],
-        ],
-        task_names=["is_click"],
-        task_types=["binary_classification"],
+        max_seq_len=64,
+        max_num_candidates_inference=50,
+        item_embedding_dim=50,
+        item_id_feature_name="item_id",
+        rating_feature_name="rating",
+        timestamp_feature_name="timestamp",
+        task_names=["score"],
+        use_rating_embedding=False,
+        use_timestamp_payload=False,
+        enable_kv_cache=True,
     )
 
 
@@ -61,7 +60,7 @@ class SmokeHarness:
 
     def create_llm(self, **kwargs) -> None:
         module = importlib.import_module("vllm_gr.entrypoints.gr")
-        kwargs.setdefault("model_type", "hstu")
+        kwargs.setdefault("model_type", "fuxi")
         return module.GRLLM(model="test-model", **kwargs)
 
     def prompt(self) -> dict[str, object]:
@@ -69,8 +68,8 @@ class SmokeHarness:
             "user_id": "u1",
             "user_history": [{"item_id": 1}, {"item_id": 2}],
             "candidates": [
-                {"item_candidate_id": 11},
-                {"item_candidate_id": 12},
+                {"item_id": 11},
+                {"item_id": 12},
             ],
         }
 
@@ -138,6 +137,8 @@ def smoke_harness(initial_device_type: str = "cuda") -> None:
         load_format: str | None = None
         disable_log_stats: bool = False
         gpu_memory_utilization: float = 0.9
+        kv_cache_dtype: str = "auto"
+        disable_hybrid_kv_cache_manager: bool = False
 
         def __post_init__(self) -> None:
             return None
@@ -345,14 +346,14 @@ def smoke_harness(initial_device_type: str = "cuda") -> None:
             self.kwargs = kwargs
             self.num_pending_requests = 0
 
-    class HSTUForRecommendation:
+    class FuXiForRecommendation:
         def __init__(self, backend: str) -> None:
             self.backend = backend
 
         def recommend(self, prompt: dict[str, object]) -> list[int]:
-            state["trace"].append(("hstu", self.backend))
+            state["trace"].append(("fuxi", self.backend))
             candidates = prompt["candidates"]
-            return [candidate["item_candidate_id"] for candidate in candidates]
+            return [candidate["item_id"] for candidate in candidates]
 
     class BaseGRRunner:
         runner_name = "base"
@@ -360,7 +361,7 @@ def smoke_harness(initial_device_type: str = "cuda") -> None:
         def __init__(self, vllm_config, device, gr_config=None) -> None:
             self.vllm_config = vllm_config
             self.device = device
-            self.model = HSTUForRecommendation(device.type)
+            self.model = FuXiForRecommendation(device.type)
             state["trace"].append((self.runner_name, device.type))
 
         def run(self, request: dict[str, object]) -> None:
@@ -421,14 +422,11 @@ def smoke_harness(initial_device_type: str = "cuda") -> None:
     fake_gr_input = types.ModuleType("vllm_gr.engine.gr_input_processor")
     fake_gr_output = types.ModuleType("vllm_gr.engine.gr_output_processor")
     fake_patch = types.ModuleType("vllm_gr.patch")
-    fake_hf_config = types.ModuleType("vllm_gr.config.hstu_vllm_registration")
+    fake_hf_config = types.ModuleType("vllm_gr.config.fuxi_vllm_registration")
     fake_registry = types.ModuleType("vllm_gr.model_executor.models.registry")
-    fake_hstu_module = types.ModuleType("vllm_gr.model_executor.models.hstu_vllm")
+    fake_fuxi_module = types.ModuleType("vllm_gr.model_executor.models.fuxi_vllm")
     fake_gr_model_runner = types.ModuleType("vllm_gr.worker.gr_model_runner")
     fake_gr_npu_model_runner = types.ModuleType("vllm_gr.worker.gr_npu_model_runner")
-    fake_torchrec = types.ModuleType("torchrec")
-    fake_torchrec_sparse = types.ModuleType("torchrec.sparse")
-    fake_torchrec_jagged = types.ModuleType("torchrec.sparse.jagged_tensor")
     fake_v1_input_processor = types.ModuleType("vllm.v1.engine.input_processor")
     fake_sampling_params = types.ModuleType("vllm.sampling_params")
     fake_lora = types.ModuleType("vllm.lora")
@@ -443,18 +441,15 @@ def smoke_harness(initial_device_type: str = "cuda") -> None:
         return state["patch_calls"]
 
     fake_patch.re_apply_patches = re_apply_patches
-    fake_hf_config.ensure_hstu_config_registered = lambda: True
+    fake_hf_config.ensure_fuxi_config_registered = lambda: True
     fake_registry.register_gr_models_to_vllm = lambda: True
-    fake_hstu_module.HSTUForRecommendation = HSTUForRecommendation
+    fake_fuxi_module.FuXiForRecommendation = FuXiForRecommendation
     fake_gr_config.GRConfig = FakeGRConfig
     fake_gr_input.GRInputProcessor = FakeGRInputProcessor
     fake_gr_output.GROutputProcessor = FakeGROutputProcessor
     fake_gr_output.GRRequestState = object
     fake_gr_model_runner.GRModelRunner = GRModelRunner
     fake_gr_npu_model_runner.GRNPUModelRunner = GRNPUModelRunner
-
-    # Mock torchrec.KeyedJaggedTensor for adapter imports
-    fake_torchrec_jagged.KeyedJaggedTensor = type("KeyedJaggedTensor", (), {})
 
     class FakeInputProcessor:
         pass
@@ -523,14 +518,11 @@ def smoke_harness(initial_device_type: str = "cuda") -> None:
             "vllm_gr.engine.gr_input_processor": fake_gr_input,
             "vllm_gr.engine.gr_output_processor": fake_gr_output,
             "vllm_gr.patch": fake_patch,
-            "vllm_gr.config.hstu_vllm_registration": fake_hf_config,
+            "vllm_gr.config.fuxi_vllm_registration": fake_hf_config,
             "vllm_gr.model_executor.models.registry": fake_registry,
-            "vllm_gr.model_executor.models.hstu_vllm": fake_hstu_module,
+            "vllm_gr.model_executor.models.fuxi_vllm": fake_fuxi_module,
             "vllm_gr.worker.gr_model_runner": fake_gr_model_runner,
             "vllm_gr.worker.gr_npu_model_runner": fake_gr_npu_model_runner,
-            "torchrec": fake_torchrec,
-            "torchrec.sparse": fake_torchrec_sparse,
-            "torchrec.sparse.jagged_tensor": fake_torchrec_jagged,
             "vllm.v1.engine.input_processor": fake_v1_input_processor,
             "vllm.sampling_params": fake_sampling_params,
             "vllm.lora": fake_lora,

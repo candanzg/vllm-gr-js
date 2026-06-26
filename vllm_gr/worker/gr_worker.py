@@ -59,8 +59,8 @@ class GRWorker(GPUWorker):
             runner = self.model_runner
             if runner is not None:
                 model = getattr(runner, "model", None)
-                if model is not None and hasattr(model, "_hstu_kv_cache_layers"):
-                    model._hstu_kv_cache_layers = None
+                if model is not None and hasattr(model, "_kv_cache_layers"):
+                    model._kv_cache_layers = None
             self.model_runner = None
 
         gc.collect()

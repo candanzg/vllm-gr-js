@@ -8,7 +8,7 @@ Two-layer adapter registry for GR model families.
 Worker class paths, defaults function references.  No heavy imports.
 
 **Layer 2 — adapter classes** (heavy, engine/worker instantiation time):
-Actual ``GRModelAdapter`` subclasses that import torch/torchrec.
+Actual ``GRModelAdapter`` subclasses that import torch.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def register_family(
     Parameters
     ----------
     model_type:
-        Unique family identifier (e.g. ``"hstu"``).
+        Unique family identifier (e.g. ``"fuxi"``).
     gpu_worker:
         Dotted path to the GPU worker class (e.g.
         ``"vllm_gr.worker.gr_worker.GRWorker"``).
@@ -48,7 +48,7 @@ def register_family(
         Layer 1 registration never triggers heavy imports.
     payload_type:
         Dotted path to the payload class (e.g.
-        ``"vllm_gr.adapters.hstu.payload:HSTUFeaturesPayload"``).  Stored as a string
+        ``"vllm_gr.adapters.fuxi.payload:FuXiFeaturesPayload"``).  Stored as a string
         and resolved lazily by ``get_payload_type()``.
     """
     _FAMILY_ENTRIES[model_type] = {
@@ -123,7 +123,7 @@ def register_adapter_class(
     """Register an adapter class for *model_type*.
 
     Called at module-import time in the adapter subpackage (e.g.
-    ``hstu/adapter.py``) so that ``create_adapter`` can look it up later.
+    ``fuxi/adapter.py``) so that ``create_adapter`` can look it up later.
     """
     _ADAPTER_CLASSES[model_type] = cls
 
@@ -219,7 +219,7 @@ def ensure_adapter_class_registered(model_type: str) -> None:
         importlib.import_module(target_module)
     except ModuleNotFoundError as exc:
         # Only suppress if the *target* module itself is missing.
-        # If a transitive dependency (e.g. torchrec) is missing,
+        # If a transitive dependency is missing,
         # exc.name will point to that dependency — re-raise it.
         if exc.name == target_module:
             pass
@@ -246,8 +246,8 @@ def get_model_type_from_config(vllm_config: Any) -> str | None:
 def _import_dotted_path(dotted_path: str) -> Callable:
     """Import and return the object at *dotted_path*.
 
-    ``"vllm_gr.adapters.hstu._defaults:apply_hstu_defaults"`` resolves to
-    the ``apply_hstu_defaults`` function.
+    ``"vllm_gr.adapters.fuxi._defaults:apply_fuxi_defaults"`` resolves to
+    the ``apply_fuxi_defaults`` function.
     """
     if ":" in dotted_path:
         module_path, attr = dotted_path.rsplit(":", 1)

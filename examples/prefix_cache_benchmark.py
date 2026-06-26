@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""End-to-end prefix-cache benchmark for HSTU on vLLM-GR.
+"""End-to-end prefix-cache benchmark on vLLM-GR.
 
 This script replays the same GR requests multiple times against one live
 ``GRLLM`` instance and reports:
@@ -33,12 +33,12 @@ from vllm.pooling_params import PoolingParams
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-DATASET_NAME = "movielens-1m"
+DATASET_NAME = None  # legacy; no longer validated
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark end-to-end HSTU prefix-cache hit rate.",
+        description="Benchmark end-to-end prefix-cache hit rate.",
     )
     parser.add_argument(
         "--model",
@@ -109,11 +109,6 @@ def _load_json(path: str) -> dict[str, Any]:
 
 
 def _validate_input_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    meta = payload.get("meta", {})
-    dataset = meta.get("dataset")
-    if dataset is not None and dataset != DATASET_NAME:
-        raise ValueError(f"Unsupported dataset: {dataset}, expected {DATASET_NAME}")
-
     cases = payload.get("cases")
     if not isinstance(cases, list):
         raise ValueError("input JSON must contain a list field: cases")

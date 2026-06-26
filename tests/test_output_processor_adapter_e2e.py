@@ -3,7 +3,7 @@
 
 """End-to-end output regression test for the adapter-driven output pipeline.
 
-Validates that GROutputProcessor + HSTUModelAdapter produce correct
+Validates that GROutputProcessor + FuXiAlphaModelAdapter produce correct
 GRRequestOutput objects with the same score mapping as before the
 refactoring.  This tests the exact output path used by both the sync
 and async engines.
@@ -45,29 +45,27 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
 
     @staticmethod
     def _make_adapter_and_processor() -> None:
-        from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
+        from vllm_gr.adapters.fuxi.adapter import FuXiAlphaModelAdapter
         from vllm_gr.engine.gr_output_processor import GROutputProcessor
 
         vllm_config = types.SimpleNamespace(
             model_config=types.SimpleNamespace(
                 hf_config=types.SimpleNamespace(
-                    hstu_uih_feature_names=["item_id"],
-                    user_embedding_feature_names=["item_id"],
-                    hstu_candidate_feature_names=["item_candidate_id"],
-                    item_embedding_feature_names=["item_candidate_id"],
-                    uih_post_id_feature_name="item_id",
-                    candidate_primary_id_feature_name="item_candidate_id",
-                    merge_uih_candidate_feature_mapping=[
-                        ["item_id", "item_candidate_id"],
-                    ],
-                    task_names=["is_click", "is_purchase"],
-                    contextual_feature_to_max_length={},
-                    contextual_feature_to_min_uih_length={},
+                    max_seq_len=64,
+                    max_num_candidates_inference=50,
+                    item_embedding_dim=50,
+                    item_id_feature_name="item_id",
+                    rating_feature_name="rating",
+                    timestamp_feature_name="timestamp",
+                    task_names=["score"],
+                    use_rating_embedding=False,
+                    use_timestamp_payload=False,
+                    enable_kv_cache=True,
                 ),
             ),
         )
-        gr_config = types.SimpleNamespace(max_seq_len=512, max_candidates=1000)
-        adapter = HSTUModelAdapter(vllm_config, gr_config)
+        gr_config = types.SimpleNamespace(max_seq_len=64, max_candidates=50)
+        adapter = FuXiAlphaModelAdapter(vllm_config, gr_config)
         processor = GROutputProcessor(
             tokenizer=None,
             log_stats=False,
@@ -87,14 +85,14 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         from vllm_gr.engine.gr_output_processor import GRRequestState
 
         candidates = [
-            {"item_candidate_id": 101},
-            {"item_candidate_id": 202},
-            {"item_candidate_id": 303},
+            {"item_id": 101},
+            {"item_id": 202},
+            {"item_id": 303},
         ]
         meta = {
             "user_id": "user-e2e",
             "original_candidates": candidates,
-            "primary_id_key": "item_candidate_id",
+            "primary_id_key": "item_id",
             "task_names": ["is_click", "is_purchase"],
             "primary_task": "is_click",
             "request_id": "req-e2e-001",
@@ -166,11 +164,11 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         from vllm_gr.engine.gr_output_processor import GRRequestState
 
         for req_idx in range(3):
-            candidates = [{"item_candidate_id": req_idx * 10 + i} for i in range(2)]
+            candidates = [{"item_id": req_idx * 10 + i} for i in range(2)]
             meta = {
                 "user_id": f"user-{req_idx}",
                 "original_candidates": candidates,
-                "primary_id_key": "item_candidate_id",
+                "primary_id_key": "item_id",
                 "task_names": ["is_click"],
                 "primary_task": "is_click",
                 "request_id": f"req-{req_idx}",
@@ -224,7 +222,7 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
         meta = {
             "user_id": "user-empty",
             "original_candidates": [],
-            "primary_id_key": "item_candidate_id",
+            "primary_id_key": "item_id",
             "task_names": [],
             "primary_task": "",
             "request_id": "req-empty",
@@ -264,35 +262,34 @@ class TestOutputProcessorAdapterE2E(unittest.TestCase):
 
     def test_extract_request_meta_via_adapter_round_trip(self) -> None:
         """Verify adapter.extract_request_meta -> process_output round trip."""
-        from vllm_gr.adapters.hstu.adapter import HSTUModelAdapter
+        from vllm_gr.adapters.fuxi.adapter import FuXiAlphaModelAdapter
 
         vllm_config = types.SimpleNamespace(
             model_config=types.SimpleNamespace(
                 hf_config=types.SimpleNamespace(
-                    hstu_uih_feature_names=["item_id"],
-                    user_embedding_feature_names=["item_id"],
-                    hstu_candidate_feature_names=["item_candidate_id"],
-                    item_embedding_feature_names=["item_candidate_id"],
-                    uih_post_id_feature_name="item_id",
-                    candidate_primary_id_feature_name="item_candidate_id",
-                    merge_uih_candidate_feature_mapping=[
-                        ["item_id", "item_candidate_id"],
-                    ],
-                    task_names=["is_click"],
-                    contextual_feature_to_max_length={},
+                    max_seq_len=64,
+                    max_num_candidates_inference=50,
+                    item_embedding_dim=50,
+                    item_id_feature_name="item_id",
+                    rating_feature_name="rating",
+                    timestamp_feature_name="timestamp",
+                    task_names=["score"],
+                    use_rating_embedding=False,
+                    use_timestamp_payload=False,
+                    enable_kv_cache=True,
                 ),
             ),
         )
-        gr_config = types.SimpleNamespace(max_seq_len=512, max_candidates=1000)
-        adapter = HSTUModelAdapter(vllm_config, gr_config)
+        gr_config = types.SimpleNamespace(max_seq_len=64, max_candidates=50)
+        adapter = FuXiAlphaModelAdapter(vllm_config, gr_config)
 
         # Build a payload via the full adapter path
         prompt = {
             "user_id": "user-roundtrip",
             "user_history": [{"item_id": 1}, {"item_id": 2}],
             "candidates": [
-                {"item_candidate_id": 10},
-                {"item_candidate_id": 20},
+                {"item_id": 10},
+                {"item_id": 20},
             ],
         }
         parsed = adapter.parse_prompt(prompt)

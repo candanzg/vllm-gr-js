@@ -16,7 +16,7 @@ except ImportError:
 
 
 class TestGPUSmoke(unittest.TestCase):
-    def test_gpu_smoke_runs_grllm_worker_runner_hstu_chain(self) -> None:
+    def test_gpu_smoke_runs_grllm_worker_runner_fuxi_chain(self) -> None:
         with smoke_harness("cuda") as harness:
             llm = harness.create_llm()
             outputs = llm.recommend(harness.prompt(), use_tqdm=False)
@@ -34,7 +34,7 @@ class TestGPUSmoke(unittest.TestCase):
             self.assertIsNone(llm.llm_engine)
             self.assertEqual(harness.state["active_platform"], None)
             self.assertIn(("gr_model_runner", "cuda"), harness.state["trace"])
-            self.assertIn(("hstu", "cuda"), harness.state["trace"])
+            self.assertIn(("fuxi", "cuda"), harness.state["trace"])
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ class GRModelOutput:
 class ScoringOutput(GRModelOutput):
     """Output from a scoring model — ranked candidate items.
 
-    Produced by adapters that implement ``GRScoringModel`` (e.g. HSTU).
+    Produced by adapters that implement ``GRScoringModel``.
     ``recommendations`` uses the same ``list[RecommendedItem]`` type as
     ``GRRequestOutput.recommendations`` to facilitate future unification.
     """

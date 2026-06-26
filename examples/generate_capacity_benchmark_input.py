@@ -20,7 +20,7 @@ Usage
 2. Use the generated file with the capacity benchmark:
 
     python examples/prefix_cache_scaling_benchmark.py \
-        --model /workspace/ckpt/movielens_1m/800_truncated_new/converted \
+        --model /workspace/ckpt/fuxi-demo \
         --input-json ./examples/prefix_cache_benchmark.capacity_input.json \
         --expect-device npu \
         --modes both \
@@ -92,7 +92,7 @@ Output Format
 The generated JSON follows the same schema as prefix_cache_benchmark.sample_input.json:
 
     {
-      "meta": { "dataset": "movielens-1m", "description": "..." },
+      "meta": { "dataset": "fuxi-demo", "description": "..." },
       "cases": [
         {
           "case_id": "capacity_diverse_u1",
@@ -189,7 +189,7 @@ def main():
 
     benchmark_data = {
         "meta": {
-            "dataset": "movielens-1m",
+            "dataset": "fuxi-demo",
             "description": (
                 f"High-diversity template for capacity benchmark. "
                 f"user_history contains {user_history_count} unique records with wide value ranges "

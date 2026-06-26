@@ -65,10 +65,10 @@ class GRLLM(LLM):
         model_type: Optional[str] = None,
         **kwargs,
     ):
-        hstu_runtime_policy = {
-            "enable_npu_fused_prefill": kwargs.pop("enable_npu_fused_prefill", None),
-            "force_hammer_npu": kwargs.pop("force_hammer_npu", None),
-        }
+        # Pop legacy GR runtime-policy kwargs that no longer have effect;
+        # kept as accepted (ignored) keyword arguments for backward compat.
+        kwargs.pop("enable_npu_fused_prefill", None)
+        kwargs.pop("force_hammer_npu", None)
 
         # Pop GR-specific parameters that shouldn't be passed to vLLM's LLM
         gr_specific_params = {
@@ -129,17 +129,11 @@ class GRLLM(LLM):
             max_seq_len=max_seq_len,
             max_candidates=max_candidates,
         )
-        for policy_name, policy_value in hstu_runtime_policy.items():
-            if policy_value is not None and hasattr(resolved_gr_config, policy_name):
-                setattr(resolved_gr_config, policy_name, policy_value)
-
         engine_args = GREngineArgs(
             model=model,
             model_type=resolved_model_type,
             max_seq_len=resolved_gr_config.max_seq_len,
             max_candidates=resolved_gr_config.max_candidates,
-            enable_npu_fused_prefill=getattr(resolved_gr_config, "enable_npu_fused_prefill", None),
-            force_hammer_npu=getattr(resolved_gr_config, "force_hammer_npu", None),
             allow_missing_weights=gr_specific_params["allow_missing_weights"],
             dataset=gr_specific_params["dataset"],
             tensor_parallel_size=tensor_parallel_size,

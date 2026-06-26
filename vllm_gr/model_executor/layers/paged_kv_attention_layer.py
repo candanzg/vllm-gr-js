@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Layer bridge that exposes HSTU attention to vLLM KV cache runtime."""
+"""Layer bridge that exposes paged-KV attention to vLLM KV cache runtime."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_gr.attention.backends.hstu_attn import (
-    HSTUAttentionBackend,
-    HSTUAttentionImpl,
-    HSTUAttentionMetadata,
+from vllm_gr.attention.backends.paged_kv_attn import (
+    PagedKVAttentionBackend,
+    PagedKVAttentionImpl,
+    PagedKVAttentionMetadata,
 )
 from vllm_gr.model_executor.kv_cache_utils import (
     _resolve_torch_dtype,
@@ -26,8 +26,8 @@ from vllm_gr.model_executor.kv_cache_utils import (
 )
 
 
-class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[misc]
-    """Thin bridge so vLLM can discover and bind HSTU KV cache specs."""
+class PagedKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[misc]
+    """Thin bridge so vLLM can discover and bind paged KV cache specs."""
 
     def __init__(
         self,
@@ -51,8 +51,8 @@ class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[
         self.kv_cache_torch_dtype = _resolve_torch_dtype(dtype)
         self.enable_kv_cache = enable_kv_cache
         self.kv_cache: list[torch.Tensor] = []
-        HSTUAttentionBackend.set_head_size_v(head_size_v)
-        self.impl = HSTUAttentionImpl(
+        PagedKVAttentionBackend.set_head_size_v(head_size_v)
+        self.impl = PagedKVAttentionImpl(
             num_heads=num_heads,
             head_size=head_size,
             scale=self.scale,
@@ -67,8 +67,8 @@ class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[
             compilation_config.static_forward_context[layer_name] = self
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        HSTUAttentionBackend.set_head_size_v(self.head_size_v)
-        return HSTUAttentionBackend  # type: ignore[no-any-return]
+        PagedKVAttentionBackend.set_head_size_v(self.head_size_v)
+        return PagedKVAttentionBackend  # type: ignore[no-any-return]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         if not self.enable_kv_cache:
@@ -87,7 +87,7 @@ class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: HSTUAttentionMetadata,
+        attn_metadata: PagedKVAttentionMetadata,
         attn_mode: str | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -156,4 +156,4 @@ class HSTUKVCacheAttentionLayer(nn.Module, AttentionLayerBase):  # type: ignore[
         )
 
 
-__all__ = ["HSTUKVCacheAttentionLayer"]
+__all__ = ["PagedKVCacheAttentionLayer"]

@@ -42,12 +42,11 @@ except ImportError:
 # architecture -> (module_relative_name, class_name)
 # Module path is relative to vllm_gr.model_executor.models
 #
-# "HSTUEmbeddingModel" is the canonical HuggingFace architecture name
-# declared in HSTUConfig.architectures and every config.json.  vLLM's
+# "FuXiEmbeddingModel" is the canonical HuggingFace architecture name
+# declared in FuXiConfig.architectures and every config.json.  vLLM's
 # ModelRegistry resolves the model class by this name.  The "Embedding"
 # suffix follows the vLLM convention for pooling-runner models.
 _GR_MODEL_ARCHITECTURES: Dict[str, Tuple[str, str]] = {
-    "HSTUEmbeddingModel": ("hstu_vllm", "HSTUForRecommendation"),
     "FuXiEmbeddingModel": ("fuxi_vllm", "FuXiForRecommendation"),
 }
 

@@ -21,7 +21,7 @@ from vllm_gr.worker.gr_runner_mixin import GRFeatureRunnerMixin
 
 
 class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
-    """NPU model runner that injects GR features into HSTU inputs."""
+    """NPU model runner that injects GR features into model inputs."""
 
     def __init__(self, vllm_config, device, gr_config=None):
         gr_config = gr_config or GRConfig()
@@ -37,9 +37,9 @@ class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
             adapter=adapter,
         )
 
-    def _use_hstu_generic_kv_cache_init(self) -> bool:
+    def _use_generic_kv_cache_init(self) -> bool:
         model = getattr(self, "model", None)
-        if model is None or not getattr(model, "_hstu_kv_cache_layers", None):
+        if model is None or not getattr(model, "_kv_cache_layers", None):
             return False
 
         from vllm_gr.adapters.registry import is_adapter_registered
@@ -49,22 +49,22 @@ class GRNPUModelRunner(GRFeatureRunnerMixin, NPUModelRunner):
 
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)
-        self._apply_hstu_runtime_policy()
-        self._sync_hstu_static_forward_context()
+        self._apply_runtime_policy()
+        self._sync_static_forward_context()
         return result
 
     def get_kv_cache_spec(self):
-        self._sync_hstu_static_forward_context()
+        self._sync_static_forward_context()
 
         kv_cache_spec = super().get_kv_cache_spec()
         if kv_cache_spec:
             return kv_cache_spec
 
-        return self._get_hstu_kv_cache_spec_fallback()
+        return self._get_kv_cache_spec_fallback()
 
     def initialize_kv_cache(self, kv_cache_config):
-        self._sync_hstu_static_forward_context()
-        if not self._use_hstu_generic_kv_cache_init():
+        self._sync_static_forward_context()
+        if not self._use_generic_kv_cache_init():
             return super().initialize_kv_cache(kv_cache_config)
 
         kv_cache_config = deepcopy(kv_cache_config)

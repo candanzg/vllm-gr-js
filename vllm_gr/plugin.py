@@ -23,24 +23,13 @@ logger = logging.getLogger("vllm_gr.plugin")
 
 def register_gr_configs() -> bool:
     """Register all GR config integrations with the active runtime."""
-    hstu_ok = True
-    fuxi_ok = True
-
-    try:
-        from vllm_gr.config.hstu_vllm_registration import ensure_hstu_config_registered
-
-        hstu_ok = ensure_hstu_config_registered()
-    except ModuleNotFoundError:
-        logger.debug("Skipping HSTU config registration in stubbed runtime")
-
     try:
         from vllm_gr.config.fuxi_vllm_registration import ensure_fuxi_config_registered
 
-        fuxi_ok = ensure_fuxi_config_registered()
+        return ensure_fuxi_config_registered()
     except ModuleNotFoundError:
         logger.debug("Skipping FuXi config registration in stubbed runtime")
-
-    return hstu_ok and fuxi_ok
+        return False
 
 
 def register_gr_model_architectures() -> bool:
@@ -61,7 +50,7 @@ def _register_adapter_families() -> None:
     """Discover and register all adapter families.
 
     Scans ``vllm_gr.adapters`` for sub-packages.  Each sub-package
-    (e.g. ``hstu/``) should have:
+    (e.g. ``fuxi/``) should have:
 
     - ``__init__.py`` calling ``register_family()`` (Layer 1, pure Python)
     - ``adapter.py`` calling ``register_adapter_class()`` (Layer 2, heavy)
@@ -127,7 +116,7 @@ def initialize_runtime() -> dict[str, int | bool]:
     }
     if not config_registered:
         raise RuntimeError(
-            "vllm-GR runtime initialization failed: HSTU config registration did not succeed"
+            "vllm-GR runtime initialization failed: GR config registration did not succeed"
         )
     if not models_registered:
         raise RuntimeError(

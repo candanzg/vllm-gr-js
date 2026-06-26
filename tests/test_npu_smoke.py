@@ -16,7 +16,7 @@ except ImportError:
 
 
 class TestNPUSmoke(unittest.TestCase):
-    def test_npu_smoke_runs_grllm_worker_runner_hstu_chain(self) -> None:
+    def test_npu_smoke_runs_grllm_worker_runner_fuxi_chain(self) -> None:
         with smoke_harness("npu") as harness:
             llm = harness.create_llm()
             outputs = llm.recommend(harness.prompt(), use_tqdm=False)
@@ -37,7 +37,7 @@ class TestNPUSmoke(unittest.TestCase):
             self.assertIsNone(llm.llm_engine)
             self.assertEqual(harness.state["active_platform"], None)
             self.assertIn(("gr_npu_model_runner", "npu"), harness.state["trace"])
-            self.assertIn(("hstu", "npu"), harness.state["trace"])
+            self.assertIn(("fuxi", "npu"), harness.state["trace"])
 
 
 if __name__ == "__main__":

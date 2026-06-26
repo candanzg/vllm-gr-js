@@ -4,9 +4,9 @@
 """Shared GR-specific model runner logic.
 
 Delegates feature decoding and model-kwargs building to the injected adapter.
-HSTU model execution infrastructure (static forward context sync, KV cache
+Paged-KV model execution infrastructure (static forward context sync, KV cache
 spec fallback, attention builder preparation) remains here as it is tied to
-the HSTU model's execution lifecycle.
+the model.s execution lifecycle.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -38,57 +38,18 @@ class GRFeatureRunnerMixin:
         self._gr_features_cache: dict[str, dict[str, Any]] = {}
         self._gr_feature_errors: dict[str, str] = {}
 
-    def _apply_hstu_runtime_policy(self) -> None:
+    def _apply_runtime_policy(self) -> None:
         gr_config = getattr(getattr(self, "vllm_config", None), "gr_config", None)
         if gr_config is None:
             return
 
-        from vllm_gr.ops.hstu_attention import configure_hstu_npu_fused_dispatch
         from vllm_gr.utils.npu_adapter import is_npu_device
 
         device = getattr(self, "device", None)
         is_npu_runtime = bool(device is not None and is_npu_device(device))
-
-        fused_prefill = (
-            is_npu_runtime
-            if gr_config.enable_npu_fused_prefill is None
-            else bool(gr_config.enable_npu_fused_prefill)
-        )
-        force_hammer_npu = (
-            is_npu_runtime
-            if gr_config.force_hammer_npu is None
-            else bool(gr_config.force_hammer_npu)
-        )
-
-        configure_hstu_npu_fused_dispatch(
-            prefill_enabled=fused_prefill,
-        )
-
         logger.info(
-            "Applied HSTU runtime policy: is_npu_runtime=%s prefill=%s force_hammer_npu=%s",
+            "Applied runtime policy: is_npu_runtime=%s",
             is_npu_runtime,
-            fused_prefill,
-            force_hammer_npu,
-        )
-
-        if not force_hammer_npu:
-            return
-
-        from vllm_gr.models.dlrm_v3.common import HammerKernel, HammerModule
-
-        model = getattr(self, "model", None)
-        if model is None:
-            return
-
-        changed = 0
-        for module in model.modules():
-            if isinstance(module, HammerModule):
-                module.set_hammer_kernel(HammerKernel.NPU)
-                changed += 1
-
-        logger.info(
-            "Forced HammerKernel.NPU on %d HammerModule instance(s)",
-            changed,
         )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
@@ -130,7 +91,7 @@ class GRFeatureRunnerMixin:
 
         super()._update_states(scheduler_output)
 
-    def _sync_hstu_static_forward_context(self) -> int:
+    def _sync_static_forward_context(self) -> int:
         compilation_config = getattr(
             getattr(self, "vllm_config", None),
             "compilation_config",
@@ -142,12 +103,12 @@ class GRFeatureRunnerMixin:
             None,
         )
         model = getattr(self, "model", None)
-        hstu_kv_layers = getattr(model, "_hstu_kv_cache_layers", None)
-        if static_forward_context is None or not hstu_kv_layers:
+        kv_layers = getattr(model, "_kv_cache_layers", None)
+        if static_forward_context is None or not kv_layers:
             return 0
 
         inserted = 0
-        for layer in hstu_kv_layers:
+        for layer in kv_layers:
             layer_name = getattr(layer, "layer_name", None)
             if layer_name is None:
                 continue
@@ -158,7 +119,7 @@ class GRFeatureRunnerMixin:
 
         if inserted:
             logger.debug(
-                "Registered %d HSTU KV cache layers into static_forward_context.",
+                "Registered %d paged-KV layers into static_forward_context.",
                 inserted,
             )
         return inserted
@@ -183,23 +144,23 @@ class GRFeatureRunnerMixin:
 
         return self._adapter.build_request_lengths(features_list)
 
-    def _prepare_hstu_attention_builders(self) -> None:
-        from vllm_gr.attention.backends.hstu_attn import (
-            HSTUAttentionMetadataBuilder,
+    def _prepare_attention_builders(self) -> None:
+        from vllm_gr.attention.backends.paged_kv_attn import (
+            PagedKVAttentionMetadataBuilder,
         )
 
-        hstu_builders: list[HSTUAttentionMetadataBuilder] = []
+        paged_kv_builders: list[PagedKVAttentionMetadataBuilder] = []
         for kv_cache_groups in getattr(self, "attn_groups", ()):
             for attn_group in kv_cache_groups:
                 for builder in attn_group.metadata_builders:
-                    if isinstance(builder, HSTUAttentionMetadataBuilder):
-                        hstu_builders.append(builder)
+                    if isinstance(builder, PagedKVAttentionMetadataBuilder):
+                        paged_kv_builders.append(builder)
 
-        if not hstu_builders:
+        if not paged_kv_builders:
             return
 
         request_lengths = self._build_request_lengths()
-        for builder in hstu_builders:
+        for builder in paged_kv_builders:
             if request_lengths is None:
                 builder.clear_request_lengths()
             else:
@@ -212,21 +173,21 @@ class GRFeatureRunnerMixin:
 
     def _prepare_inputs(self, *args, **kwargs):
         # Both GPUModelRunner and vllm-ascend NPUModelRunner build attention
-        # metadata from inside `_prepare_inputs`, so inject HSTU request-length
+        # metadata from inside `_prepare_inputs`, so inject paged-KV request-length
         # state here to keep the builder path shared across backends.
-        self._prepare_hstu_attention_builders()
+        self._prepare_attention_builders()
         return super()._prepare_inputs(*args, **kwargs)
 
-    def _get_hstu_kv_cache_spec_fallback(self) -> dict[str, Any]:
-        self._sync_hstu_static_forward_context()
+    def _get_kv_cache_spec_fallback(self) -> dict[str, Any]:
+        self._sync_static_forward_context()
 
         model = getattr(self, "model", None)
-        hstu_kv_layers = getattr(model, "_hstu_kv_cache_layers", None)
-        if not hstu_kv_layers:
+        kv_layers = getattr(model, "_kv_cache_layers", None)
+        if not kv_layers:
             return {}
 
         kv_cache_spec: dict[str, Any] = {}
-        for layer in hstu_kv_layers:
+        for layer in kv_layers:
             layer_name = getattr(layer, "layer_name", None)
             if layer_name is None:
                 continue
@@ -321,7 +282,7 @@ class GRFeatureRunnerMixin:
           scheduled token positions (used by embedding models like BERT).
 
         - list[torch.Tensor]: GR recommendation path. Each tensor in the list
-          is a per-request score tensor from HSTU. We bypass the token-centric
+          is a per-request score tensor from the model. We bypass the token-centric
           base implementation and construct pooler_output directly.
 
         This dispatch mechanism allows GRModelRunner to handle both standard

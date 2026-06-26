@@ -22,7 +22,7 @@ def _build_prompt(user_id: str, candidate_ids: list[int]) -> dict[str, object]:
             {"item_id": 1},
             {"item_id": 2},
         ],
-        "candidates": [{"item_candidate_id": candidate_id} for candidate_id in candidate_ids],
+        "candidates": [{"item_id": candidate_id} for candidate_id in candidate_ids],
     }
 
 
@@ -45,7 +45,7 @@ class TestBatchRecommendationContract(unittest.TestCase):
             user_id = prompt["user_id"]
             output = outputs_by_user[user_id]
             candidates = prompt["candidates"]
-            expected_item_ids = [candidate["item_candidate_id"] for candidate in candidates]
+            expected_item_ids = [candidate["item_id"] for candidate in candidates]
 
             self.assertTrue(output.finished)
             self.assertEqual(output.user_id, user_id)
@@ -71,7 +71,7 @@ class TestBatchRecommendationContract(unittest.TestCase):
 
                     self._assert_output_boundaries(outputs, prompts)
                     self.assertGreaterEqual(
-                        harness.state["trace"].count(("hstu", device_type)),
+                        harness.state["trace"].count(("fuxi", device_type)),
                         len(prompts),
                     )
 

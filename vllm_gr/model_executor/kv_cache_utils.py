@@ -26,16 +26,13 @@ def _resolve_torch_dtype(dtype: Any) -> torch.dtype:
 def _complete_cumsum(lengths: torch.Tensor) -> torch.Tensor:
     if lengths.numel() == 0:
         return torch.zeros(1, dtype=lengths.dtype, device=lengths.device)
-    try:
-        return torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-    except (RuntimeError, AttributeError):
-        cumsum = torch.zeros(
-            lengths.size(0) + 1,
-            dtype=lengths.dtype,
-            device=lengths.device,
-        )
-        cumsum[1:] = torch.cumsum(lengths, dim=0)
-        return cumsum
+    cumsum = torch.zeros(
+        lengths.size(0) + 1,
+        dtype=lengths.dtype,
+        device=lengths.device,
+    )
+    cumsum[1:] = torch.cumsum(lengths, dim=0)
+    return cumsum
 
 
 def write_to_paged_cache(

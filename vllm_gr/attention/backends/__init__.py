@@ -3,16 +3,16 @@
 
 """Attention backend implementations for vllm-GR."""
 
-from vllm_gr.attention.backends.hstu_attn import (
-    HSTUAttentionBackend,
-    HSTUAttentionImpl,
-    HSTUAttentionMetadata,
-    HSTUAttentionMetadataBuilder,
+from vllm_gr.attention.backends.paged_kv_attn import (
+    PagedKVAttentionBackend,
+    PagedKVAttentionImpl,
+    PagedKVAttentionMetadata,
+    PagedKVAttentionMetadataBuilder,
 )
 
 __all__ = [
-    "HSTUAttentionBackend",
-    "HSTUAttentionImpl",
-    "HSTUAttentionMetadata",
-    "HSTUAttentionMetadataBuilder",
+    "PagedKVAttentionBackend",
+    "PagedKVAttentionImpl",
+    "PagedKVAttentionMetadata",
+    "PagedKVAttentionMetadataBuilder",
 ]

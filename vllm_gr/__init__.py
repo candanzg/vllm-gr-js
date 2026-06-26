@@ -34,12 +34,6 @@ _COMPAT_EXPORTS: dict[str, tuple[str, str, bool]] = {
         "BeamAttentionBackend",
         False,
     ),
-    "HSTUConfig": ("vllm_gr.config.hstu_config", "HSTUConfig", False),
-    "ensure_hstu_config_registered": (
-        "vllm_gr.config.hstu_vllm_registration",
-        "ensure_hstu_config_registered",
-        True,
-    ),
     "GRRequest": ("vllm_gr.request", "GRRequest", True),
     "is_gr_request": ("vllm_gr.request", "is_gr_request", True),
     "GREngineCoreRequest": ("vllm_gr.engine", "GREngineCoreRequest", True),

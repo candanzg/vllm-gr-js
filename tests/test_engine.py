@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEMO_MODEL_DIR = os.path.join(ROOT, "examples", "configs", "movielens-1m")
+DEMO_MODEL_DIR = os.path.join(ROOT, "examples", "demo-model")
 
 sys.path.insert(0, ROOT)
 
@@ -77,12 +77,12 @@ class TestGREngineArgs(unittest.TestCase):
         ):
             args = GREngineArgs(
                 model=DEMO_MODEL_DIR,
-                hf_overrides={"model_type": "hstu"},
+                hf_overrides={"model_type": "fuxi"},
                 allow_missing_weights=True,
             )
         self.assertEqual(args.worker_cls, "vllm_gr.worker.gr_worker.GRWorker")
 
-    def test_hstu_defaults_do_not_force_disable_prefix_caching(self) -> None:
+    def test_fuxi_defaults_force_disable_prefix_caching(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -92,14 +92,15 @@ class TestGREngineArgs(unittest.TestCase):
         ):
             args = GREngineArgs(
                 model=DEMO_MODEL_DIR,
-                hf_overrides={"model_type": "hstu"},
+                hf_overrides={"model_type": "fuxi"},
                 enable_prefix_caching=True,
                 allow_missing_weights=True,
             )
 
-        self.assertTrue(args.enable_prefix_caching)
+        # FuXi defaults always disable prefix caching.
+        self.assertFalse(args.enable_prefix_caching)
 
-    def test_hstu_defaults_disable_hybrid_kv_cache_manager(self) -> None:
+    def test_fuxi_defaults_disable_hybrid_kv_cache_manager(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -110,12 +111,12 @@ class TestGREngineArgs(unittest.TestCase):
             args = GREngineArgs(
                 model=DEMO_MODEL_DIR,
                 allow_missing_weights=True,
-                hf_overrides={"model_type": "hstu"},
+                hf_overrides={"model_type": "fuxi"},
             )
 
         self.assertTrue(args.disable_hybrid_kv_cache_manager)
 
-    def test_no_model_type_does_not_apply_hstu_defaults(self) -> None:
+    def test_no_model_type_does_not_apply_fuxi_defaults(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         with mock.patch.object(
@@ -140,34 +141,15 @@ class TestGREngineArgs(unittest.TestCase):
         self.assertNotIn("uih_feature_names", fields)
         self.assertNotIn("candidate_feature_names", fields)
 
-    def test_dataset_overrides_use_hf_overrides(self) -> None:
+    def test_user_hf_overrides_preserved(self) -> None:
         from vllm_gr.engine.arg_utils import GREngineArgs
 
         args = GREngineArgs(
             model=DEMO_MODEL_DIR,
-            dataset="movielens-1m",
+            hf_overrides={"num_blocks": 99},
             allow_missing_weights=True,
         )
-        self.assertIsInstance(args.hf_overrides, dict)
-        self.assertEqual(
-            args.hf_overrides["uih_post_id_feature_name"],
-            "movie_id",
-        )
-
-    def test_dataset_overrides_preserve_user_hf_overrides(self) -> None:
-        from vllm_gr.engine.arg_utils import GREngineArgs
-
-        args = GREngineArgs(
-            model=DEMO_MODEL_DIR,
-            dataset="movielens-1m",
-            hf_overrides={"hstu_attn_num_layers": 99},
-            allow_missing_weights=True,
-        )
-        self.assertEqual(args.hf_overrides["hstu_attn_num_layers"], 99)
-        self.assertEqual(
-            args.hf_overrides["uih_post_id_feature_name"],
-            "movie_id",
-        )
+        self.assertEqual(args.hf_overrides["num_blocks"], 99)
 
 
 # ── GRConfig ──────────────────────────────────────────────────────
@@ -212,12 +194,12 @@ class TestGRPrompt(unittest.TestCase):
         }
         self.assertTrue(is_gr_prompt(prompt))
 
-    def test_is_gr_prompt_accepts_registered_model_type_without_hstu_shape(self) -> None:
+    def test_is_gr_prompt_accepts_registered_model_type_without_fuxi_shape(self) -> None:
         from vllm_gr.inputs.data import is_gr_prompt
 
         prompt = {
             "user_id": "user_abc",
-            "model_type": "hstu",
+            "model_type": "fuxi",
         }
         self.assertTrue(is_gr_prompt(prompt))
 
@@ -272,10 +254,10 @@ class TestGRPrompt(unittest.TestCase):
 
         from vllm_gr.inputs.data import _ensure_registered_model_type
 
-        exc = ModuleNotFoundError("torchrec")
-        exc.name = "torchrec"
+        exc = ModuleNotFoundError("some_broken_dep")
+        exc.name = "some_broken_dep"
         with mock.patch("importlib.import_module", side_effect=exc):
-            # torchrec is NOT the target module, so this should re-raise
+            # some_broken_dep is NOT the target module, so this should re-raise
             with self.assertRaises(ModuleNotFoundError):
                 _ensure_registered_model_type("broken_dep_adapter")
 
@@ -313,20 +295,20 @@ class TestGRRequest(unittest.TestCase):
     def test_with_features(self) -> None:
         from vllm.pooling_params import PoolingParams
 
-        from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload
+        from vllm_gr.adapters.fuxi.payload import FuXiFeaturesPayload
         from vllm_gr.engine.gr_features_codec import (
             decode_gr_features_payload,
             encode_gr_features_payload,
         )
         from vllm_gr.request import GRRequest, is_gr_request
 
-        payload = HSTUFeaturesPayload(
-            uih_keys=["item_id"],
-            uih_values_per_key=[[1, 2, 3]],
-            uih_lengths_per_key=[3],
-            cand_keys=["item_candidate_id"],
-            cand_values_per_key=[[10, 20]],
-            cand_lengths_per_key=[2],
+        payload = FuXiFeaturesPayload(
+            past_ids=[1, 2, 3],
+            past_ratings=[0, 0, 0],
+            past_timestamps=[1000, 2000, 3000],
+            history_len=3,
+            candidate_ids=[10, 20],
+            num_candidates=2,
             user_id="user_123",
         )
         request = GRRequest(
@@ -338,7 +320,7 @@ class TestGRRequest(unittest.TestCase):
             eos_token_id=None,
         )
         self.assertTrue(is_gr_request(request))
-        decoded = decode_gr_features_payload(request.gr_features, HSTUFeaturesPayload)
+        decoded = decode_gr_features_payload(request.gr_features, FuXiFeaturesPayload)
         self.assertEqual(decoded.user_id, "user_123")
 
     def test_is_gr_request_false_for_non_request(self) -> None:

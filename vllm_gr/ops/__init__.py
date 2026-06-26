@@ -3,30 +3,23 @@
 # Original code from Meta Platforms, Inc. (generative-recommenders)
 
 """
-HSTU Model Operators Package
+vllm-GR Operators Package
 
-Contains attention, compute, jagged tensor operations, and normalization operators.
-Currently provides PyTorch implementations, extensible to Triton/CUDA optimized versions.
+Provides paged-KV multi-head attention and shared jagged-tensor helpers used
+by the recommendation model runtime.
 """
 
-from vllm_gr.ops.hstu_attention import delta_hstu_mha, hstu_mha
-from vllm_gr.ops.hstu_compute import (
-    hstu_compute_output,
-    hstu_compute_uqvk,
-    hstu_preprocess_and_attention,
+from vllm_gr.ops.common import (
+    HammerKernel,
+    dense_to_jagged,
+    jagged_to_padded_dense,
 )
-from vllm_gr.ops.jagged_tensors import concat_2D_jagged, split_2D_jagged
-from vllm_gr.ops.layer_norm import LayerNorm, SwishLayerNorm, layer_norm
+from vllm_gr.ops.paged_mha import delta_paged_mha, paged_mha
 
 __all__ = [
-    "hstu_mha",
-    "delta_hstu_mha",
-    "hstu_compute_uqvk",
-    "hstu_compute_output",
-    "hstu_preprocess_and_attention",
-    "concat_2D_jagged",
-    "split_2D_jagged",
-    "LayerNorm",
-    "SwishLayerNorm",
-    "layer_norm",
+    "HammerKernel",
+    "dense_to_jagged",
+    "delta_paged_mha",
+    "jagged_to_padded_dense",
+    "paged_mha",
 ]

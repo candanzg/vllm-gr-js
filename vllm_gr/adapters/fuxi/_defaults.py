@@ -25,6 +25,29 @@ def apply_fuxi_defaults(engine_args: "GRCommonEngineArgsMixin") -> None:
     engine_args.enforce_eager = True
     engine_args.disable_hybrid_kv_cache_manager = True
 
+    if not hasattr(engine_args, "kv_cache_dtype"):
+        import dataclasses
+
+        import vllm
+        from vllm.engine.arg_utils import EngineArgs
+
+        logger.error(
+            "DIAG kv_cache_dtype missing | vllm=%s | EngineArgs is_dataclass=%s | "
+            "kv_cache_dtype in EngineArgs.__dataclass_fields__=%s | "
+            "kv_cache_dtype in type(engine_args).__dataclass_fields__=%s | "
+            "engine_args MRO=%s | engine_args type=%s",
+            getattr(vllm, "__version__", "<unknown>"),
+            dataclasses.is_dataclass(EngineArgs),
+            "kv_cache_dtype" in getattr(EngineArgs, "__dataclass_fields__", {}),
+            "kv_cache_dtype" in getattr(type(engine_args), "__dataclass_fields__", {}),
+            [c.__name__ for c in type(engine_args).__mro__],
+            type(engine_args).__name__,
+        )
+        raise AttributeError(
+            "engine_args has no attribute 'kv_cache_dtype'. "
+            "See DIAG log above for vllm version and field-ownership details."
+        )
+
     if engine_args.kv_cache_dtype == "auto":
         engine_args.kv_cache_dtype = "bfloat16"
     engine_args.enable_prefix_caching = False

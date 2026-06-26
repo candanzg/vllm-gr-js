@@ -15,7 +15,7 @@ from vllm_gr.worker.gr_runner_mixin import GRFeatureRunnerMixin
 
 
 class GRModelRunner(GRFeatureRunnerMixin, GPUModelRunner):
-    """GPU model runner that injects GR features into HSTU inputs."""
+    """GPU model runner that injects GR features into model inputs."""
 
     def __init__(self, vllm_config, device, gr_config=None):
         gr_config = gr_config or GRConfig()
@@ -33,5 +33,5 @@ class GRModelRunner(GRFeatureRunnerMixin, GPUModelRunner):
 
     def load_model(self, *args, **kwargs):
         result = super().load_model(*args, **kwargs)
-        self._apply_hstu_runtime_policy()
+        self._apply_runtime_policy()
         return result

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""HSTU attention backend that runs on top of vLLM paged KV cache."""
+"""Paged-KV attention backend that runs on top of vLLM paged KV cache."""
 
 from __future__ import annotations
 
@@ -22,25 +22,34 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_gr.config.hstu_config import get_hstu_contextual_seq_len
-from vllm_gr.models.dlrm_v3.common import HammerKernel
-from vllm_gr.ops.hstu_attention import delta_hstu_mha, hstu_mha
+from vllm_gr.ops.paged_mha import delta_paged_mha, paged_mha
 
 
-def _build_hstu_token_positions(
-    attn_metadata: "HSTUAttentionMetadata",
+def _get_contextual_seq_len(config: object) -> int:
+    """Return the fixed contextual-prefix token count for one request.
+
+    Reads the optional ``contextual_feature_to_max_length`` mapping from the
+    HF config and sums its values. Models without this field (the common case)
+    return 0.
+    """
+    contextual_mapping = getattr(config, "contextual_feature_to_max_length", None) or {}
+    return int(sum(int(length) for length in contextual_mapping.values()))
+
+
+def _build_token_positions(
+    attn_metadata: "PagedKVAttentionMetadata",
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return attn_metadata.get_partition_positions(device=device)
 
 
-def _resolve_hstu_attention_mode(
-    attn_metadata: "HSTUAttentionMetadata",
+def _resolve_attention_mode(
+    attn_metadata: "PagedKVAttentionMetadata",
     query: torch.Tensor,
     key: torch.Tensor,
     attn_mode: str | None = None,
 ) -> tuple[str, torch.Tensor]:
-    prefix_positions, delta_positions, full_positions = _build_hstu_token_positions(
+    prefix_positions, delta_positions, full_positions = _build_token_positions(
         attn_metadata,
         device=query.device,
     )
@@ -57,25 +66,25 @@ def _resolve_hstu_attention_mode(
             if query.shape[0] == expected and key.shape[0] == expected:
                 return candidate_mode, token_positions[candidate_mode]
         raise ValueError(
-            "HSTUAttentionImpl input token count does not match any known "
+            "PagedKVAttentionImpl input token count does not match any known "
             f"sequence partition: query={query.shape[0]} key={key.shape[0]}, "
             f"expected one of {expected_tokens!r}."
         )
 
     if attn_mode not in expected_tokens:
-        raise ValueError(f"Unsupported HSTU attention mode: {attn_mode}")
+        raise ValueError(f"Unsupported paged-KV attention mode: {attn_mode}")
     expected = expected_tokens[attn_mode]
     if query.shape[0] != expected or key.shape[0] != expected:
         raise ValueError(
-            f"HSTUAttentionImpl expected {expected} tokens for mode "
+            f"PagedKVAttentionImpl expected {expected} tokens for mode "
             f"{attn_mode}, got query={query.shape[0]} key={key.shape[0]}."
         )
     return attn_mode, token_positions[attn_mode]
 
 
 @dataclass
-class HSTUAttentionMetadata(AttentionMetadata):  # type: ignore[misc]
-    """HSTU-specific metadata layered on top of vLLM common attention metadata."""
+class PagedKVAttentionMetadata(AttentionMetadata):  # type: ignore[misc]
+    """Paged-KV-specific metadata layered on top of vLLM common attention metadata."""
 
     common_attn_metadata: CommonAttentionMetadata
     num_targets: torch.Tensor
@@ -262,11 +271,11 @@ class HSTUAttentionMetadata(AttentionMetadata):  # type: ignore[misc]
         if mode == "full":
             assert self._cached_full_slot_mapping is not None
             return self._cached_full_slot_mapping
-        raise ValueError(f"Unsupported HSTU attention mode: {mode}")
+        raise ValueError(f"Unsupported paged-KV attention mode: {mode}")
 
 
-class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadata]):  # type: ignore[misc]
-    """Build complete HSTU metadata for vLLM attention layers."""
+class PagedKVAttentionMetadataBuilder(AttentionMetadataBuilder[PagedKVAttentionMetadata]):  # type: ignore[misc]
+    """Build complete paged-KV metadata for vLLM attention layers."""
 
     supports_update_block_table = True
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -284,7 +293,7 @@ class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadat
         self._history_lengths: torch.Tensor | None = None
         hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
         self._contextual_seq_len: int = (
-            get_hstu_contextual_seq_len(hf_config) if hf_config is not None else 0
+            _get_contextual_seq_len(hf_config) if hf_config is not None else 0
         )
 
     def set_request_lengths(
@@ -307,7 +316,7 @@ class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadat
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> HSTUAttentionMetadata:
+    ) -> PagedKVAttentionMetadata:
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         zeros = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
@@ -321,7 +330,7 @@ class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadat
             if self._history_lengths is not None
             else zeros.clone()
         )
-        return HSTUAttentionMetadata(
+        return PagedKVAttentionMetadata(
             common_attn_metadata=common_attn_metadata,
             num_targets=num_targets,
             history_lengths=history_lengths,
@@ -332,14 +341,14 @@ class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadat
 
     def update_block_table(
         self,
-        metadata: HSTUAttentionMetadata,
+        metadata: PagedKVAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> HSTUAttentionMetadata:
+    ) -> PagedKVAttentionMetadata:
         common_attn_metadata = copy.copy(metadata.common_attn_metadata)
         common_attn_metadata.block_table_tensor = blk_table
         common_attn_metadata.slot_mapping = slot_mapping
-        return HSTUAttentionMetadata(
+        return PagedKVAttentionMetadata(
             common_attn_metadata=common_attn_metadata,
             num_targets=metadata.num_targets,
             history_lengths=metadata.history_lengths,
@@ -349,8 +358,8 @@ class HSTUAttentionMetadataBuilder(AttentionMetadataBuilder[HSTUAttentionMetadat
         )
 
 
-class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[misc]
-    """HSTU attention impl that consumes vLLM paged KV cache."""
+class PagedKVAttentionImpl(AttentionImpl[PagedKVAttentionMetadata]):  # type: ignore[misc]
+    """Paged-KV attention impl that consumes vLLM paged KV cache."""
 
     def __init__(
         self,
@@ -380,7 +389,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: HSTUAttentionMetadata,
+        attn_metadata: PagedKVAttentionMetadata,
         attn_mode: str | None = None,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
@@ -388,7 +397,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
     ) -> torch.Tensor:
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "HSTUAttentionImpl does not support fused output quantization."
+                "PagedKVAttentionImpl does not support fused output quantization."
             )
 
         if attn_metadata is None:
@@ -421,7 +430,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
                 device=value.device,
             )
 
-        mode, _token_positions = _resolve_hstu_attention_mode(
+        mode, _token_positions = _resolve_attention_mode(
             attn_metadata=attn_metadata,
             query=query,
             key=key,
@@ -438,7 +447,6 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
         # but the underlying attention kernels are still invoked with
         # contextual_seq_len=0 in the regular full-forward implementation.
         contextual_seq_len = 0
-        runtime_kernel = HammerKernel.NPU if query.device.type == "npu" else HammerKernel.PYTORCH
 
         if mode == "delta":
             if total_delta_tokens == 0:
@@ -453,7 +461,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
                 full_seq_lens,
                 kv_cache=kv_cache,
             )
-            delta_output = delta_hstu_mha(
+            delta_output = delta_paged_mha(
                 max_seq_len=max_seq_len,
                 alpha=self.scale,
                 delta_q=query,
@@ -462,7 +470,6 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
                 seq_offsets=seq_offsets,
                 num_targets=attn_metadata.num_targets,
                 contextual_seq_len=contextual_seq_len,
-                kernel=runtime_kernel,
             )
             if output is not None:
                 output[: delta_output.shape[0]].copy_(delta_output)
@@ -477,7 +484,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
             )
             del prefix_max_seq_len
             full_max_seq_len = int(full_seq_lens.max().item()) if full_seq_lens.numel() > 0 else 0
-            prefix_output = hstu_mha(
+            prefix_output = paged_mha(
                 max_seq_len=full_max_seq_len,
                 alpha=self.scale,
                 q=query,
@@ -487,7 +494,6 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
                 causal=True,
                 num_targets=torch.zeros_like(attn_metadata.num_targets),
                 contextual_seq_len=contextual_seq_len,
-                kernel=runtime_kernel,
             )
             if output is not None:
                 output[: prefix_output.shape[0]].copy_(prefix_output)
@@ -499,7 +505,7 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
             full_seq_lens,
             kv_cache=kv_cache,
         )
-        full_output = hstu_mha(
+        full_output = paged_mha(
             max_seq_len=max_seq_len,
             alpha=self.scale,
             q=query,
@@ -509,7 +515,6 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
             causal=True,
             num_targets=attn_metadata.num_targets,
             contextual_seq_len=contextual_seq_len,
-            kernel=runtime_kernel,
         )
         if output is not None:
             output[: full_output.shape[0]].copy_(full_output)
@@ -517,8 +522,8 @@ class HSTUAttentionImpl(AttentionImpl[HSTUAttentionMetadata]):  # type: ignore[m
         return full_output
 
 
-class HSTUAttentionBackend(AttentionBackend):  # type: ignore[misc]
-    """vLLM backend descriptor for HSTU KV cache pages."""
+class PagedKVAttentionBackend(AttentionBackend):  # type: ignore[misc]
+    """vLLM backend descriptor for paged KV cache pages."""
 
     head_size_v: int = 128
 
@@ -528,15 +533,15 @@ class HSTUAttentionBackend(AttentionBackend):  # type: ignore[misc]
 
     @staticmethod
     def get_name() -> str:
-        return "HSTU_KV_CACHE"
+        return "PAGED_KV_CACHE"
 
     @staticmethod
-    def get_impl_cls() -> type[HSTUAttentionImpl]:
-        return HSTUAttentionImpl
+    def get_impl_cls() -> type[PagedKVAttentionImpl]:
+        return PagedKVAttentionImpl
 
     @staticmethod
-    def get_builder_cls() -> type[HSTUAttentionMetadataBuilder]:
-        return HSTUAttentionMetadataBuilder
+    def get_builder_cls() -> type[PagedKVAttentionMetadataBuilder]:
+        return PagedKVAttentionMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -551,7 +556,7 @@ class HSTUAttentionBackend(AttentionBackend):  # type: ignore[misc]
             num_blocks,
             block_size,
             num_kv_heads,
-            head_size + HSTUAttentionBackend.head_size_v,
+            head_size + PagedKVAttentionBackend.head_size_v,
         )
 
     @staticmethod
@@ -564,9 +569,9 @@ class HSTUAttentionBackend(AttentionBackend):  # type: ignore[misc]
 
 
 __all__ = [
-    "HSTUAttentionBackend",
-    "HSTUAttentionImpl",
-    "HSTUAttentionMetadata",
-    "HSTUAttentionMetadataBuilder",
-    "_build_hstu_token_positions",
+    "PagedKVAttentionBackend",
+    "PagedKVAttentionImpl",
+    "PagedKVAttentionMetadata",
+    "PagedKVAttentionMetadataBuilder",
+    "_build_token_positions",
 ]

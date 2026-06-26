@@ -27,9 +27,9 @@ cd vllm-gr
 uv pip install -e .
 ```
 
-setup.py detects the CUDA backend and loads `requirements/cuda.txt` (torchrec,
-fbgemm-gpu, plus shared deps from `requirements/common.txt`). LMCache is
-not installed by default for now.
+setup.py detects the CUDA backend and loads `requirements/cuda.txt`, which pulls
+in the shared deps from `requirements/common.txt` (no CUDA-only extras).
+LMCache is not installed by default for now.
 
 ## Developer tools (optional)
 
@@ -41,7 +41,7 @@ uv pip install -e ".[dev]"
 
 ```bash
 python -c "import vllm_gr; print(vllm_gr.__version__)"
-python -c "import torchrec, fbgemm_gpu; print('cuda deps ok')"
+python -c "import msgspec, safetensors; print('cuda deps ok')"
 ```
 
 ## Notes

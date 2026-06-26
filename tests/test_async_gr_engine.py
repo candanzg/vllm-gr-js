@@ -74,10 +74,10 @@ def _fake_async_engine_runtime() -> None:
         "vllm_gr.adapters",
         "vllm_gr.adapters.base",
         "vllm_gr.adapters.capabilities",
-        "vllm_gr.adapters.hstu",
-        "vllm_gr.adapters.hstu.adapter",
-        "vllm_gr.adapters.hstu.feature_extractor",
-        "vllm_gr.adapters.hstu.kjt_builder",
+        "vllm_gr.adapters.fuxi",
+        "vllm_gr.adapters.fuxi.adapter",
+        "vllm_gr.adapters.fuxi.feature_extractor",
+        "vllm_gr.adapters.fuxi.payload_builder",
     )
 
     # vllm core
@@ -235,7 +235,7 @@ class TestGRAsyncLLM(unittest.TestCase):
         sys.modules.pop("async_gr_engine_test_module", None)
 
     def test_replace_processors_creates_adapter_and_injects_into_processors(self) -> None:
-        """_replace_processors() creates HSTUModelAdapter and passes it to both processors."""
+        """_replace_processors() creates FuXiAlphaModelAdapter and passes it to both processors."""
         import types as _types
 
         _fake_adapter = object()
@@ -244,7 +244,7 @@ class TestGRAsyncLLM(unittest.TestCase):
         class _FakeAdapter:
             pass
 
-        # We mock HSTUModelAdapter by intercepting the import
+        # We mock FuXiAlphaModelAdapter by intercepting the import
         _saved_import = (
             __builtins__.__import__
             if hasattr(__builtins__, "__import__")
@@ -258,19 +258,17 @@ class TestGRAsyncLLM(unittest.TestCase):
         fake_vllm_config = _types.SimpleNamespace(
             model_config=_types.SimpleNamespace(
                 hf_config=_types.SimpleNamespace(
-                    model_type="hstu",
-                    hstu_uih_feature_names=["item_id"],
-                    user_embedding_feature_names=["item_id"],
-                    hstu_candidate_feature_names=["item_candidate_id"],
-                    item_embedding_feature_names=["item_candidate_id"],
-                    uih_post_id_feature_name="item_id",
-                    candidate_primary_id_feature_name="item_candidate_id",
-                    merge_uih_candidate_feature_mapping=[
-                        ["item_id", "item_candidate_id"],
-                    ],
-                    task_names=["is_click"],
-                    contextual_feature_to_max_length={},
-                    contextual_feature_to_min_uih_length={},
+                    model_type="fuxi",
+                    max_seq_len=64,
+                    max_num_candidates_inference=50,
+                    item_embedding_dim=50,
+                    item_id_feature_name="item_id",
+                    rating_feature_name="rating",
+                    timestamp_feature_name="timestamp",
+                    task_names=["score"],
+                    use_rating_embedding=False,
+                    use_timestamp_payload=False,
+                    enable_kv_cache=True,
                 ),
             ),
             scheduler_config=_types.SimpleNamespace(stream_interval=1),
@@ -281,25 +279,12 @@ class TestGRAsyncLLM(unittest.TestCase):
         instance.tokenizer = None
         instance.log_stats = False
 
-        # We need torchrec for the real HSTUModelAdapter.
-        # Instead, verify the import path and adapter injection by checking
-        # that the processors receive the same adapter instance.
-        try:
-            import torchrec  # noqa: F401
-
-            _HAS_TORCHREC = True
-        except ImportError:
-            _HAS_TORCHREC = False
-
-        if not _HAS_TORCHREC:
-            self.skipTest("torchrec not available for full adapter wiring test")
-
-        # Ensure the HSTU family is registered so is_adapter_registered() can find it.
+        # Ensure the FuXi family is registered so is_adapter_registered() can find it.
         from vllm_gr.adapters.registry import get_registered_families, register_family
 
-        if "hstu" not in get_registered_families():
+        if "fuxi" not in get_registered_families():
             register_family(
-                model_type="hstu",
+                model_type="fuxi",
                 gpu_worker="vllm_gr.worker.gr_worker.GRWorker",
                 npu_worker="vllm_gr.worker.gr_npu_worker.GRNPUWorker",
             )

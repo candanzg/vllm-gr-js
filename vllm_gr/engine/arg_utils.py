@@ -43,21 +43,17 @@ class GRCommonEngineArgsMixin:
         max_candidates: Maximum number of candidate items
 
     Feature names (uih, candidate, primary_id, task_names) are read
-    directly from HSTUConfig (hf_config), which is the single source of
-    truth.  Override via hf_overrides or config.json, not here.
+    directly from the model's HF config (hf_config), which is the single
+    source of truth.  Override via hf_overrides or config.json, not here.
 
     Model architecture parameters (num_layers, embedding_dim, etc.) live in
-    config.json / HSTUConfig and are loaded via hf_config, following vLLM's
+    config.json and are loaded via hf_config, following vLLM's
     convention.  They are NOT duplicated here.
     """
 
     # GR-specific: Sequence configuration
     max_seq_len: int = 512
     max_candidates: int = 1000
-
-    # GR-specific: HSTU NPU fused runtime policy
-    enable_npu_fused_prefill: Optional[bool] = None
-    force_hammer_npu: Optional[bool] = None
 
     # GR-specific: Dataset identifier (drives config overrides)
     dataset: Optional[str] = None
@@ -77,9 +73,6 @@ class GRCommonEngineArgsMixin:
     def __post_init__(self):
         """Post-init processing to ensure proper configuration."""
         super().__post_init__()
-
-        # Merge dataset overrides into hf_overrides (in-memory, never disk)
-        self._apply_dataset_overrides()
 
         self.model_type = self._resolve_model_type()
 
@@ -242,38 +235,6 @@ class GRCommonEngineArgsMixin:
             else:
                 raise
 
-    def _apply_dataset_overrides(self) -> None:
-        """Merge dataset-specific overrides into ``hf_overrides`` (in-memory).
-
-        Unlike the previous implementation that mutated ``config.json`` on
-        disk, this uses vLLM's ``hf_overrides`` mechanism so that overrides
-        are applied in-memory when HuggingFace loads the config.  This is
-        safe for concurrent processes and read-only model directories.
-
-        User-supplied ``hf_overrides`` take precedence over dataset defaults.
-        """
-        if not self.dataset:
-            return
-
-        from vllm_gr.config.dataset_configs import (
-            get_embedding_table_overrides,
-            get_hstu_config_overrides,
-        )
-
-        overrides = get_hstu_config_overrides(self.dataset)
-        tables = get_embedding_table_overrides(self.dataset)
-        if tables:
-            overrides["embedding_tables"] = tables
-
-        if isinstance(self.hf_overrides, dict):
-            merged = dict(overrides)
-            merged.update(self.hf_overrides)
-            self.hf_overrides = merged
-        elif self.hf_overrides is None:
-            self.hf_overrides = overrides
-
-        logger.info("Applied dataset=%s overrides via hf_overrides", self.dataset)
-
     def create_engine_config(self, usage_context=None, headless: bool = False):
         """
         Create the vLLM engine config for GR models.
@@ -299,13 +260,11 @@ class GREngineArgs(GRCommonEngineArgsMixin, EngineArgs):
     GR Engine arguments for offline/synchronous recommendation runtime.
 
     Feature names and task metadata are sourced from the model config
-    (HSTUConfig / hf_config) rather than duplicated in CLI/runtime args.
+    (hf_config) rather than duplicated in CLI/runtime args.
     """
 
     max_seq_len: int = 512
     max_candidates: int = 1000
-    enable_npu_fused_prefill: Optional[bool] = None
-    force_hammer_npu: Optional[bool] = None
     dataset: Optional[str] = None
     model_type: Optional[str] = None
     allow_missing_weights: bool = False
@@ -331,8 +290,6 @@ class GRAsyncEngineArgs(GRCommonEngineArgsMixin, AsyncEngineArgs):
 
     max_seq_len: int = 512
     max_candidates: int = 1000
-    enable_npu_fused_prefill: Optional[bool] = None
-    force_hammer_npu: Optional[bool] = None
     dataset: Optional[str] = None
     model_type: Optional[str] = None
     allow_missing_weights: bool = False

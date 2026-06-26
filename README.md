@@ -6,7 +6,7 @@
 
 vLLM-based Generative Recommender Inference Engine
 
-This repository focuses on vLLM-based generative recommendation inference, including the HSTU offline inference pipeline, example scripts, test suites, and GPU / NPU runtime adaptation code.
+This repository focuses on vLLM-based generative recommendation inference, including the FuXi offline inference pipeline, example scripts, test suites, and GPU / NPU runtime adaptation code.
 
 ## Current Scope
 
@@ -52,7 +52,7 @@ cd vllm-gr
 uv pip install -e .
 ```
 
-`setup.py` detects the CUDA backend and automatically loads `requirements/cuda.txt` (includes torchrec and fbgemm-gpu). LMCache is not installed by default for now.
+`setup.py` detects the CUDA backend and automatically loads `requirements/cuda.txt` (shares the common dependencies; no CUDA-only extras). LMCache is not installed by default for now.
 
 #### Step 3 (optional): Developer tools
 
@@ -64,7 +64,7 @@ uv pip install -e ".[dev]"
 
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
-python -c "import vllm, msgspec, safetensors, torchrec; print('gpu python deps ok')"
+python -c "import vllm, msgspec, safetensors; print('gpu python deps ok')"
 ```
 
 ### NPU Installation
@@ -75,10 +75,11 @@ Follow the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend
 
 #### Step 1.5: GR-specific dependencies (manual install)
 
+The NPU runtime no longer requires torchrec or fbgemm-gpu; jagged-tensor
+ops run through the native PyTorch fallback path.
+
 ```bash
-pip install /path/to/torchrec-1.4.0-npu.whl
-pip install fbgemm-gpu==1.4.0+cpu \
-  --extra-index-url https://download.pytorch.org/whl/cpu
+# No additional GR-specific wheels required on NPU.
 ```
 
 #### Step 2: Install vllm-gr
@@ -314,17 +315,13 @@ SUITE_DEFINITIONS: dict[str, dict[str, object]] = {
         "runner": "pytest",
         "files": [
             "test_engine.py",
-            "test_gr_schema_contract.py",
             "test_processors.py",
-            "test_embedding_collection_patch.py",
-            "test_gr_runner_core.py",
-            "test_dataset_config_parity.py",
-            "test_checkpoint_conversion_contract.py",
-            "test_output_contract.py",
-            "test_positional_encoder_parity.py",
             "test_run_tests_script.py",
-            "test_hstu_attention_contract.py",
+            "test_gr_capabilities.py",
+            "test_async_gr_engine.py",
             "test_batch_recommendation_contract.py",
+            "test_fuxi_adapter_contract.py",
+            "test_registry.py",
         ],
     },
 }
@@ -428,58 +425,38 @@ Minimum checks:
 GPU:
 
 ```bash
-python examples/simple_inference.py --expect-device gpu
-python examples/dataset_inference.py --expect-device gpu debug
+python examples/fuxi_simple_inference.py --expect-device gpu
+python examples/batch_inference.py --expect-device gpu
 ```
 
 NPU:
 
 ```bash
-python examples/simple_inference.py --expect-device npu
-python examples/dataset_inference.py --expect-device npu debug
+python examples/fuxi_simple_inference.py --expect-device npu
+python examples/batch_inference.py --expect-device npu
 ```
 
 CPU:
 
 ```bash
-python examples/simple_inference.py --expect-device cpu
-python examples/dataset_inference.py --expect-device cpu debug
+python examples/fuxi_simple_inference.py --expect-device cpu
+python examples/batch_inference.py --expect-device cpu
 ```
 
-Once the `debug` dataset passes, continue with:
+### 4. Load real weights
+
+To run with trained weights, point the engine at a model directory containing
+`config.json` + `model.safetensors`:
 
 ```bash
-python examples/dataset_inference.py movielens-1m
-python examples/dataset_inference.py kuairand-1k
-python examples/dataset_inference.py streaming
-```
-
-### 4. Convert and load real weights
-
-First, convert the training checkpoint:
-
-```bash
-python scripts/convert_gr_checkpoint.py \
-  --input-path /path/to/training_checkpoint \
-  --output-dir /path/to/converted_model \
-  --dataset movielens-1m
-```
-
-Then load the converted model:
-
-```bash
-python examples/load_converted_model.py \
-  --model /path/to/converted_model \
+python examples/batch_inference.py \
+  --model /path/to/trained_model \
   --expect-device gpu
 ```
 
-For NPU environments, replace `--expect-device gpu` with `npu`.
-
 Note:
 
-- `examples/demo-model/` contains only `config.json` with no real weights; it is only used for the demo/random-init path
-- `scripts/convert_gr_checkpoint.py` depends on `torchrec` capabilities and is best run in a GPU environment or an environment with `torchrec` already available
-- A minimal NPU dependency environment may not support running the checkpoint conversion script directly
+- `examples/demo-model/` contains only `config.json` with no real weights; it is only used for the demo/random-init path (`--allow-missing-weights`)
 
 ### 5. Run benchmark / accuracy tools
 
@@ -514,12 +491,12 @@ llm = GRLLM(
 prompt: GRPrompt = {
     "user_id": "user_001",
     "user_history": [
-        {"item_id": 1001, "timestamp": 1609459200},
-        {"item_id": 1002, "timestamp": 1609545600},
+        {"item_id": 1001, "rating": 0, "timestamp": 1609459200},
+        {"item_id": 1002, "rating": 0, "timestamp": 1609545600},
     ],
     "candidates": [
-        {"item_candidate_id": 2001, "query_time": 1610000000},
-        {"item_candidate_id": 2002, "query_time": 1610000000},
+        {"item_id": 2001, "rating": 0, "timestamp": 1610000000},
+        {"item_id": 2002, "rating": 0, "timestamp": 1610000000},
     ],
 }
 

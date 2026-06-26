@@ -175,11 +175,11 @@ class TestRegistryReset:
             get_adapter_class("x")
 
 
-class TestHSTURegistration:
-    """Verify the HSTU family is properly registered."""
+class TestFuXiRegistration:
+    """Verify the FuXi family is properly registered."""
 
-    def test_hstu_layer1_registration(self) -> None:
-        """Importing hstu __init__ should register the family."""
+    def test_fuxi_layer1_registration(self) -> None:
+        """Importing fuxi __init__ should register the family."""
         from vllm_gr.adapters.registry import (
             _reset,
             get_family_info,
@@ -190,19 +190,19 @@ class TestHSTURegistration:
         # Re-import triggers registration
         import importlib
 
-        import vllm_gr.adapters.hstu
+        import vllm_gr.adapters.fuxi
 
-        importlib.reload(vllm_gr.adapters.hstu)
+        importlib.reload(vllm_gr.adapters.fuxi)
 
-        assert get_worker_cls_path("hstu", is_npu=False) == "vllm_gr.worker.gr_worker.GRWorker"
+        assert get_worker_cls_path("fuxi", is_npu=False) == "vllm_gr.worker.gr_worker.GRWorker"
         assert (
-            get_worker_cls_path("hstu", is_npu=True) == "vllm_gr.worker.gr_npu_worker.GRNPUWorker"
+            get_worker_cls_path("fuxi", is_npu=True) == "vllm_gr.worker.gr_npu_worker.GRNPUWorker"
         )
 
-        info = get_family_info("hstu")
+        info = get_family_info("fuxi")
         assert info is not None
         assert info["defaults_fn"] is not None
-        assert "apply_hstu_defaults" in info["defaults_fn"]
+        assert "apply_fuxi_defaults" in info["defaults_fn"]
 
 
 class TestDottedPathImport:
@@ -211,7 +211,7 @@ class TestDottedPathImport:
     def test_colon_syntax(self) -> None:
         from vllm_gr.adapters.registry import _import_dotted_path
 
-        fn = _import_dotted_path("vllm_gr.adapters.hstu._defaults:apply_hstu_defaults")
+        fn = _import_dotted_path("vllm_gr.adapters.fuxi._defaults:apply_fuxi_defaults")
         assert callable(fn)
 
     def test_dot_syntax(self) -> None:
@@ -222,14 +222,14 @@ class TestDottedPathImport:
 
 
 class TestLayerIsolation:
-    """Verify that Layer 1 imports don't pull in torch/torchrec."""
+    """Verify that Layer 1 imports do not pull in torch."""
 
     def test_layer1_no_heavy_imports(self) -> None:
-        """Importing vllm_gr.adapters.hstu (Layer 1 only) should not import torch."""
+        """Importing vllm_gr.adapters.fuxi (Layer 1 only) should not import torch."""
         code = textwrap.dedent("""\
             import sys
             # Import Layer 1 only
-            import vllm_gr.adapters.hstu  # triggers register_family()
+            import vllm_gr.adapters.fuxi  # triggers register_family()
             # Check that torch was NOT imported
             torch_imported = "torch" in sys.modules
             print(f"torch_imported={torch_imported}")
@@ -313,45 +313,45 @@ class TestGetPayloadType:
             get_payload_type("no_pt")
 
 
-class TestHSTURegistrationExtended:
-    """Extended HSTU registration tests covering payload_type and
+class TestFuXiRegistrationExtended:
+    """Extended FuXi registration tests covering payload_type and
     dynamic discovery."""
 
-    def test_hstu_payload_type_in_family_info(self) -> None:
+    def test_fuxi_payload_type_in_family_info(self) -> None:
         """Layer 1 registration should include payload_type path."""
         from vllm_gr.adapters.registry import _reset, get_family_info
 
         _reset()
         import importlib
 
-        import vllm_gr.adapters.hstu
+        import vllm_gr.adapters.fuxi
 
-        importlib.reload(vllm_gr.adapters.hstu)
+        importlib.reload(vllm_gr.adapters.fuxi)
 
-        info = get_family_info("hstu")
+        info = get_family_info("fuxi")
         assert info is not None
         assert info["payload_type"] is not None
-        assert "HSTUFeaturesPayload" in info["payload_type"]
+        assert "FuXiFeaturesPayload" in info["payload_type"]
 
-    def test_hstu_get_payload_type_returns_class(self) -> None:
-        """get_payload_type('hstu') should resolve to HSTUFeaturesPayload."""
+    def test_fuxi_get_payload_type_returns_class(self) -> None:
+        """get_payload_type("fuxi") should resolve to FuXiFeaturesPayload."""
         try:
-            from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload  # noqa: F401
+            from vllm_gr.adapters.fuxi.payload import FuXiFeaturesPayload  # noqa: F401
         except Exception:
-            pytest.skip("requires full vLLM runtime (HSTUFeaturesPayload import)")
+            pytest.skip("requires full vLLM runtime (FuXiFeaturesPayload import)")
         from vllm_gr.adapters.registry import _reset, get_payload_type
 
         _reset()
         import importlib
 
-        import vllm_gr.adapters.hstu
+        import vllm_gr.adapters.fuxi
 
-        importlib.reload(vllm_gr.adapters.hstu)
+        importlib.reload(vllm_gr.adapters.fuxi)
 
-        pt = get_payload_type("hstu")
-        from vllm_gr.adapters.hstu.payload import HSTUFeaturesPayload
+        pt = get_payload_type("fuxi")
+        from vllm_gr.adapters.fuxi.payload import FuXiFeaturesPayload
 
-        assert pt is HSTUFeaturesPayload
+        assert pt is FuXiFeaturesPayload
 
     def test_dynamic_family_discovery_in_arg_utils(self) -> None:
         """_ensure_family_registered should use dynamic import, not a
@@ -363,16 +363,16 @@ class TestHSTURegistrationExtended:
         from vllm_gr.adapters.registry import _reset, get_registered_families
 
         _reset()
-        assert "hstu" not in get_registered_families()
+        assert "fuxi" not in get_registered_families()
 
-        # Simulate a fresh process: remove the cached hstu module so
+        # Simulate a fresh process: remove the cached fuxi module so
         # importlib.import_module re-executes __init__.py, which calls
         # register_family().
-        sys.modules.pop("vllm_gr.adapters.hstu", None)
+        sys.modules.pop("vllm_gr.adapters.fuxi", None)
 
-        GRCommonEngineArgsMixin._ensure_family_registered("hstu")
+        GRCommonEngineArgsMixin._ensure_family_registered("fuxi")
 
-        assert "hstu" in get_registered_families()
+        assert "fuxi" in get_registered_families()
 
     def test_dynamic_discovery_ignores_unknown_family(self) -> None:
         """_ensure_family_registered for an unknown family should not raise."""
@@ -389,20 +389,20 @@ class TestDynamicFamilyDiscovery:
 
     def test_try_register_family_by_convention(self) -> None:
         """Dynamic import of vllm_gr.adapters.<family> should trigger
-        register_family().  Verified via the real HSTU adapter."""
+        register_family().  Verified via the real FuXi adapter."""
         import importlib
 
         from vllm_gr.adapters.registry import _reset, get_registered_families
 
         _reset()
-        assert "hstu" not in get_registered_families()
+        assert "fuxi" not in get_registered_families()
 
-        # Reload (or import) the hstu package to trigger register_family()
-        import vllm_gr.adapters.hstu
+        # Reload (or import) the fuxi package to trigger register_family()
+        import vllm_gr.adapters.fuxi
 
-        importlib.reload(vllm_gr.adapters.hstu)
+        importlib.reload(vllm_gr.adapters.fuxi)
 
-        assert "hstu" in get_registered_families()
+        assert "fuxi" in get_registered_families()
 
     def test_try_register_family_subprocess(self) -> None:
         """End-to-end: import adapter → get_payload_type → create_adapter.
@@ -413,9 +413,9 @@ class TestDynamicFamilyDiscovery:
         code = textwrap.dedent("""\
             import sys
             # Layer 1
-            import vllm_gr.adapters.hstu
+            import vllm_gr.adapters.fuxi
             # Layer 2
-            import vllm_gr.adapters.hstu.adapter
+            import vllm_gr.adapters.fuxi.adapter
 
             from vllm_gr.adapters.registry import (
                 get_payload_type,
@@ -425,16 +425,16 @@ class TestDynamicFamilyDiscovery:
 
             # Verify Layer 1
             families = get_registered_families()
-            assert "hstu" in families, f"hstu not in {families}"
+            assert "fuxi" in families, f"fuxi not in {families}"
 
             # Verify payload_type (3.6.3)
-            pt = get_payload_type("hstu")
+            pt = get_payload_type("fuxi")
             assert pt is not None, "payload_type is None"
             print(f"payload_type={pt.__name__}")
 
             # Verify adapter class (3.6.5)
-            cls = get_adapter_class("hstu")
-            assert cls.model_type == "hstu"
+            cls = get_adapter_class("fuxi")
+            assert cls.model_type == "fuxi"
 
             print("ALL_CHECKS_PASSED")
         """)

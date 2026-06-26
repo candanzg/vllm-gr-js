@@ -33,7 +33,7 @@ Usage Examples
 1. Scaling scenario (default), both local and Yuanrong modes:
 
     python examples/prefix_cache_scaling_benchmark.py \\
-        --model /workspace/ckpt/movielens_1m/800_truncated_new/converted \\
+        --model /workspace/ckpt/fuxi-demo \\
         --input-json ./examples/prefix_cache_benchmark.sample_input.json \\
         --expect-device npu \\
         --modes both \\
@@ -43,7 +43,7 @@ Usage Examples
 2. Capacity scenario with low GPU memory utilization to pressure local cache:
 
     python examples/prefix_cache_scaling_benchmark.py \\
-        --model /workspace/ckpt/movielens_1m/800_truncated_new/converted \\
+        --model /workspace/ckpt/fuxi-demo \\
         --input-json ./examples/prefix_cache_benchmark.sample_input.json \\
         --expect-device npu \\
         --modes both \\
@@ -57,7 +57,7 @@ Usage Examples
 3. Local mode only (no Yuanrong connector):
 
     python examples/prefix_cache_scaling_benchmark.py \\
-        --model /workspace/ckpt/movielens_1m/800_truncated_new/converted \\
+        --model /workspace/ckpt/fuxi-demo \\
         --input-json ./examples/prefix_cache_benchmark.sample_input.json \\
         --expect-device npu \\
         --modes local \\
@@ -70,7 +70,7 @@ Usage Examples
 4. Yuanrong mode only with custom backend settings:
 
     python examples/prefix_cache_scaling_benchmark.py \\
-        --model /workspace/ckpt/movielens_1m/800_truncated_new/converted \\
+        --model /workspace/ckpt/fuxi-demo \\
         --input-json ./examples/prefix_cache_benchmark.sample_input.json \\
         --expect-device npu \\
         --modes yuanrong \\
@@ -86,7 +86,7 @@ Usage Examples
 5. With JSON report output:
 
     python examples/prefix_cache_scaling_benchmark.py \\
-        --model /workspace/ckpt/movielens_1m/800_truncated_new/converted \\
+        --model /workspace/ckpt/fuxi-demo \\
         --input-json ./examples/prefix_cache_benchmark.sample_input.json \\
         --expect-device npu \\
         --modes both \\
@@ -100,7 +100,7 @@ Arguments
 
 Model & Input:
   --model (required)
-      Path to the converted HSTU model directory containing config.json.
+      Path to the FuXi model directory containing config.json.
   --input-json (default: examples/prefix_cache_benchmark.sample_input.json)
       Template input JSON path used to derive synthetic benchmark cases.
       For capacity scenario with large warm-unique-requests, use the
@@ -205,7 +205,7 @@ add_repo_root_to_path(__file__)
 
 from vllm_gr.utils.npu_adapter import release_accelerator_memory  # noqa: E402
 
-DATASET_NAME = "movielens-1m"
+DATASET_NAME = None  # legacy; no longer validated
 DEFAULT_INPUT_JSON = os.path.join(
     SCRIPT_DIR,
     "prefix_cache_benchmark.sample_input.json",
@@ -411,11 +411,6 @@ def _load_json(path: str) -> dict[str, Any]:
 
 
 def _validate_input_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    meta = payload.get("meta", {})
-    dataset = meta.get("dataset")
-    if dataset is not None and dataset != DATASET_NAME:
-        raise ValueError(f"Unsupported dataset: {dataset}, expected {DATASET_NAME}")
-
     cases = payload.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("input JSON must contain a non-empty list field: cases")
@@ -662,9 +657,7 @@ def _derive_prompt_layout(llm, template_case: dict[str, Any]) -> dict[str, int]:
     overhead = prompt_len - history_len
     context_len = overhead - candidate_len
     if context_len < 0:
-        raise RuntimeError(
-            "Unable to derive HSTU prompt layout: contextual token count is negative"
-        )
+        raise RuntimeError("Unable to derive prompt layout: contextual token count is negative")
     return {
         "prompt_len": prompt_len,
         "history_len": history_len,

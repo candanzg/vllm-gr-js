@@ -26,8 +26,8 @@ def _truncate_or_pad_seq(values: list[int], target_len: int, *, pad_value: int =
     - ``movielens_seq_features_from_row`` when it appends zero columns for
       decode slots (``features.py``);
     - ``get_current_embeddings`` which indexes ``lengths[i] - 1``;
-    - fbgemm ``dense_to_jagged`` / ``jagged_to_padded_dense``, which consume the
-      first ``past_lengths[i]`` entries of each dense row.
+    - the PyTorch ``dense_to_jagged`` / ``jagged_to_padded_dense`` helpers,
+      which consume the first ``past_lengths[i]`` entries of each dense row.
 
     Batch construction only needs the ``len(values) <= target_len`` branch: each
     row is padded to ``n_max`` / ``k_max`` within the batch.

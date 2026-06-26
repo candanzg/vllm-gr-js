@@ -12,7 +12,7 @@ expands each seed case into multiple replay variants that intentionally share:
 - the same context
 - the same user_history
 
-while varying candidates in controlled ways so that HSTU can exercise both:
+while varying candidates in controlled ways so that the model can exercise both:
 
 - full request replay hits
 - partial prefix hits on ``contextual prefix + history`` with changed targets
@@ -34,7 +34,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 
-DATASET_NAME = "movielens-1m"
+DATASET_NAME = None  # legacy; no longer validated
 
 
 def _parse_args() -> argparse.Namespace:
@@ -87,11 +87,6 @@ def _load_json(path: str) -> dict[str, Any]:
 
 
 def _validate_input_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    meta = payload.get("meta", {})
-    dataset = meta.get("dataset")
-    if dataset is not None and dataset != DATASET_NAME:
-        raise ValueError(f"Unsupported dataset: {dataset}, expected {DATASET_NAME}")
-
     cases = payload.get("cases")
     if not isinstance(cases, list):
         raise ValueError("input JSON must contain a list field: cases")

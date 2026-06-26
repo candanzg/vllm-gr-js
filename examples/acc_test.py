@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from vllm_gr.config.gr_config import GRConfig
 from vllm_gr.logger import init_logger
 
-DATASET_NAME = "movielens-1m"
+DATASET_NAME = "fuxi-demo"
 logger = init_logger(__name__)
 
 

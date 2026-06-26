@@ -23,8 +23,8 @@ class TestGRPromptBase(unittest.TestCase):
         self.assertIsInstance(prompt, dict)
 
     def test_dict_with_model_type(self) -> None:
-        prompt: GRPromptBase = {"user_id": "u1", "model_type": "hstu"}
-        self.assertEqual(prompt["model_type"], "hstu")
+        prompt: GRPromptBase = {"user_id": "u1", "model_type": "fuxi"}
+        self.assertEqual(prompt["model_type"], "fuxi")
 
 
 class TestGRParsedInput(unittest.TestCase):

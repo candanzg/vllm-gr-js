@@ -7,7 +7,7 @@ Base input types for generative recommendation.
 GRPromptBase defines the structural contract for all GR model prompts.
 GRParsedInput carries the adapter-specific parsed representation.
 
-Both types are model-family-agnostic.  Model-specific fields (e.g. HSTU's
+Both types are model-family-agnostic.  Model-specific fields (e.g. the model's own
 user_history, SASRec's past_ids) belong in model-specific prompt subtypes
 or in the ``metadata`` dict of GRParsedInput.
 """
@@ -45,7 +45,7 @@ class GRParsedInput:
     - ``user_id`` and ``schema_fingerprint`` — cross-model通用字段
     - ``raw_features`` — model-specific raw feature data, only the adapter
       knows how to interpret
-    - ``metadata`` — model-specific metadata (e.g. HSTU's ``history_len``,
+    - ``metadata`` — model-specific metadata (e.g. ``history_len``,
       ``num_candidates``).  Pipeline components do NOT interpret this field
     - ``original_prompt`` — preserves the original request for output mapping
 

@@ -3,14 +3,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Ported to vllm-GR with modifications.
 
-"""PyTorch implementation of HSTU attention"""
+"""PyTorch implementation of paged-KV attention"""
 
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from vllm_gr.models.dlrm_v3.common import dense_to_jagged, jagged_to_padded_dense
+from vllm_gr.ops.common import dense_to_jagged, jagged_to_padded_dense
 
 
 @torch.fx.wrap
@@ -24,7 +24,7 @@ def _get_valid_attn_mask(
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
 ) -> torch.Tensor:
-    """Generate valid attention mask for HSTU"""
+    """Generate valid attention mask for paged-KV attention"""
     ids = torch.arange(0, N, device=device).view(1, N)
     max_ids = seq_lengths.view(-1, 1, 1)
 
@@ -120,7 +120,7 @@ def _pad_qkv(
 
 
 @torch.fx.wrap
-def pytorch_hstu_mha(
+def pytorch_paged_mha(
     max_seq_len: int,
     alpha: float,
     q: torch.Tensor,
@@ -136,7 +136,7 @@ def pytorch_hstu_mha(
     min_full_attn_seq_len: int = 0,
 ) -> torch.Tensor:
     """
-    PyTorch implementation of HSTU multi-head attention.
+    PyTorch implementation of paged-KV multi-head attention.
 
     Args:
         max_seq_len: Maximum sequence length
@@ -192,7 +192,7 @@ def pytorch_hstu_mha(
 
 
 @torch.fx.wrap
-def pytorch_cached_hstu_mha(
+def pytorch_cached_paged_mha(
     max_seq_len: int,
     alpha: float,
     delta_q: torch.Tensor,
@@ -204,7 +204,7 @@ def pytorch_cached_hstu_mha(
     contextual_seq_len: int = 0,
 ) -> torch.Tensor:
     """
-    PyTorch implementation of cached HSTU attention (for incremental inference).
+    PyTorch implementation of cached paged-KV attention (for incremental inference).
     """
     L, H, D = delta_q.shape
     _, _, V_dim = v.shape
@@ -214,7 +214,7 @@ def pytorch_cached_hstu_mha(
             return delta_q.new_empty((0, H, V_dim))
         if L % B != 0:
             raise ValueError(
-                "pytorch_cached_hstu_mha requires num_targets for variable-size "
+                "pytorch_cached_paged_mha requires num_targets for variable-size "
                 f"delta batches; got total_delta_tokens={L}, batch_size={B}."
             )
         num_targets = torch.full(
