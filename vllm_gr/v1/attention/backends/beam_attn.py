@@ -17,10 +17,10 @@ from vllm.v1.attention.backend import (
     AttentionImpl,
     AttentionType,
     MultipleOf,
-    is_quantized_kv_cache,
 )
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backends.fa_utils import (
-    flash_attn_supports_fp8,
+    flash_attn_supports_quant_query_input,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
@@ -51,13 +51,14 @@ else:
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+from vllm.platforms import current_platform
+import vllm.envs as envs
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
     get_kv_cache_layout,
 )
+from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -165,9 +166,14 @@ class BeamAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
-        if kv_cache_dtype.startswith("fp8"):
-            return flash_attn_supports_fp8()
-        return kv_cache_dtype in ["auto"]
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            if current_platform.is_xpu():
+                return True
+            return (
+                get_flash_attn_version() == 3
+                and current_platform.is_device_capability_family(90)
+            )
+        return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -392,7 +398,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         ):
             max_num_splits = self.max_num_splits
 
-        if vllm_is_batch_invariant():
+        if envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
         return max_num_splits
 
@@ -895,18 +901,14 @@ class BeamAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.attn_type = attn_type
         self.vllm_flash_attn_version = get_flash_attn_version()
-        self.batch_invariant_enabled = vllm_is_batch_invariant()
-
-        if is_quantized_kv_cache(self.kv_cache_dtype) and not flash_attn_supports_fp8():
-            raise NotImplementedError("BeamAttention does not support fp8 kv-cache on this device.")
-
+        self.batch_invariant_enabled = envs.VLLM_BATCH_INVARIANT
         self.sinks = sinks
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), "Sinks are only supported in FlashAttention 3"
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of heads in the layer"
             )
-        self.supports_quant_query_input = True
+        self.supports_quant_query_input = flash_attn_supports_quant_query_input()
         self.use_cascade = True
 
     @staticmethod
@@ -980,7 +982,7 @@ class BeamAttentionImpl(AttentionImpl):
                 k_descale=k_descale_prefix,
                 v_descale=v_descale_prefix,
                 s_aux=s_aux,
-                num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+                num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
             )
 
         # 2. Run Suffix Attention (Non-shared Blocks)
@@ -1004,7 +1006,7 @@ class BeamAttentionImpl(AttentionImpl):
             q_descale=q_descale_suffix,
             k_descale=k_descale_suffix,
             v_descale=v_descale_suffix,
-            num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+            num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
             out=output,
         )
 
@@ -1230,7 +1232,7 @@ class BeamAttentionImpl(AttentionImpl):
             q_descale=layer._q_scale.expand(descale_shape) if layer._q_scale is not None else None,
             k_descale=layer._k_scale.expand(descale_shape) if layer._k_scale is not None else None,
             v_descale=layer._v_scale.expand(descale_shape) if layer._v_scale is not None else None,
-            num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+            num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
         )
 
         return output

@@ -8,11 +8,11 @@ from http import HTTPStatus
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from typing_extensions import assert_never
-from vllm.entrypoints.openai.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 
 from vllm_gr.entrypoints.pooling.recommend.protocol import (
+    ErrorResponse,
     GRRecommendRequest,
     GRRecommendResponse,
 )

@@ -2,15 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
-
 import time
 
-from pydantic import Field
-from vllm.entrypoints.openai.protocol import OpenAIBaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from vllm.pooling_params import PoolingParams
 from vllm.utils import random_uuid
 
+from vllm_gr.entrypoints.openai.protocol import resolve_openai_symbol
 from vllm_gr.inputs.data import GRPrompt
+
+try:
+    from vllm.entrypoints.openai.protocol import ErrorResponse, OpenAIBaseModel
+except ModuleNotFoundError:
+    ErrorResponse = resolve_openai_symbol("ErrorResponse")
+    try:
+        OpenAIBaseModel = resolve_openai_symbol("OpenAIBaseModel")
+    except ModuleNotFoundError:
+
+        class OpenAIBaseModel(BaseModel):
+            model_config = ConfigDict(extra="forbid")
 
 
 class GRRecommendRequest(OpenAIBaseModel):

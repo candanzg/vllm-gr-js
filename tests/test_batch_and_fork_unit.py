@@ -831,7 +831,7 @@ class TestBeamSearchOrchestration:
 
     # 5.1
     def test_beam_search_validation_zero_width(self) -> None:
-        from vllm.entrypoints.openai.protocol import VLLMValidationError
+        from vllm.exceptions import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -843,7 +843,7 @@ class TestBeamSearchOrchestration:
 
     # 5.2
     def test_beam_search_validation_no_tokenizer(self) -> None:
-        from vllm.entrypoints.openai.protocol import VLLMValidationError
+        from vllm.exceptions import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -856,7 +856,7 @@ class TestBeamSearchOrchestration:
 
     # 5.3
     def test_beam_search_invalid_begin_token(self) -> None:
-        from vllm.entrypoints.openai.protocol import VLLMValidationError
+        from vllm.exceptions import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -869,7 +869,7 @@ class TestBeamSearchOrchestration:
 
     # 5.4
     def test_beam_search_max_tokens_too_small(self) -> None:
-        from vllm.entrypoints.openai.protocol import VLLMValidationError
+        from vllm.exceptions import VLLMValidationError
 
         from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
@@ -1278,6 +1278,29 @@ def _patch_batch_and_fork_calls_apply_target() -> None:
     assert hasattr(EngineCoreRequestType, "BEAM_FORK")
 
 
+def _patch_batch_and_fork_preserves_external_wrapper_target() -> None:
+    from vllm.v1.engine.core import EngineCoreProc
+
+    from vllm_gr.entrypoints.openai.beam_search_patch import patch_batch_and_fork
+
+    def ascend_run_engine_core(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    ascend_run_engine_core.__module__ = "vllm_ascend.patch.platform.patch_balance_schedule"
+    ascend_run_engine_core.__qualname__ = "patched_run_engine_core"
+
+    EngineCoreProc.run_engine_core = ascend_run_engine_core
+    patch_batch_and_fork()
+
+    assert EngineCoreProc.run_engine_core is run_engine_core
+    assert getattr(run_engine_core, "_original_run_engine_core") is ascend_run_engine_core
+    assert (
+        getattr(run_engine_core, "_delegate_run_engine_core_module")
+        == "vllm_ascend.patch.platform.patch_balance_schedule"
+    )
+    assert getattr(run_engine_core, "_delegate_run_engine_core_name") == "patched_run_engine_core"
+
+
 def _run_patch_calls_all_three_target() -> None:
     with (
         patch("vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search") as mock_bs,
@@ -1307,6 +1330,23 @@ def _run_engine_core_applies_child_patches_target() -> None:
         original_run.assert_called_once_with("arg1", key="val")
 
 
+def _run_engine_core_accepts_ascend_delegate_target() -> None:
+    with patch("vllm_gr.v1.engine.engine_core_patch.apply_engine_core_child_patches") as mock_apply:
+        original_delegate = MagicMock()
+        original_delegate.__module__ = "vllm_ascend.patch.platform.patch_balance_schedule"
+        original_delegate.__qualname__ = "patched_run_engine_core"
+        run_engine_core._original_run_engine_core = original_delegate
+
+        try:
+            run_engine_core("arg1", key="val")
+        finally:
+            if hasattr(run_engine_core, "_original_run_engine_core"):
+                delattr(run_engine_core, "_original_run_engine_core")
+
+        mock_apply.assert_called_once()
+        original_delegate.assert_called_once_with("arg1", key="val")
+
+
 class TestPatchWiring:
     """Section 6: patch orchestration."""
 
@@ -1319,12 +1359,20 @@ class TestPatchWiring:
         _run_process(_patch_batch_and_fork_calls_apply_target)
 
     # 6.3
+    def test_patch_batch_and_fork_preserves_external_wrapper(self) -> None:
+        _run_process(_patch_batch_and_fork_preserves_external_wrapper_target)
+
+    # 6.4
     def test_run_patch_calls_all_three(self) -> None:
         _run_process(_run_patch_calls_all_three_target)
 
-    # 6.4
+    # 6.5
     def test_run_engine_core_applies_child_patches(self) -> None:
         _run_process(_run_engine_core_applies_child_patches_target)
+
+    # 6.6
+    def test_run_engine_core_accepts_ascend_delegate(self) -> None:
+        _run_process(_run_engine_core_accepts_ascend_delegate_target)
 
 
 # ---------------------------------------------------------------------------

@@ -9,16 +9,18 @@ import time
 from fastapi import Request
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ErrorResponse
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 
+from vllm_gr.entrypoints.openai.protocol import resolve_openai_symbol
 from vllm_gr.entrypoints.pooling.recommend.protocol import (
+    ErrorResponse,
     GRRecommendRequest,
     GRRecommendResponse,
     GRRecommendResult,
 )
 from vllm_gr.outputs import GRRequestOutput
+
+OpenAIServing = resolve_openai_symbol("OpenAIServing")
+OpenAIServingModels = resolve_openai_symbol("OpenAIServingModels")
 
 
 class GRRecommendResponseMixin:

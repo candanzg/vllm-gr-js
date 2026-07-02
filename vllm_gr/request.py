@@ -24,8 +24,8 @@ class GRRequest(Request):
 
     def __init__(
         self,
-        gr_features: Optional[bytes] = None,
         *args,
+        gr_features: Optional[bytes] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -48,7 +48,6 @@ class GRRequest(Request):
             prompt_token_ids=request.prompt_token_ids,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
-            eos_token_id=request.eos_token_id,
             client_index=getattr(request, "client_index", 0),
             arrival_time=request.arrival_time,
             prompt_embeds=getattr(request, "prompt_embeds", None),

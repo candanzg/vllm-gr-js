@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 from vllm.beam_search import BeamSearchSequence
-from vllm.entrypoints.openai.protocol import VLLMValidationError
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
 from vllm.logger import init_logger

@@ -12,6 +12,13 @@ from vllm.v1.engine import EngineCoreRequestType
 
 logger = init_logger(__name__)
 
+_SUPPORTED_RUN_ENGINE_CORE_MODULE_PREFIXES = (
+    "vllm.v1.engine.core",
+    "vllm_ascend.",
+    "unittest.mock",
+    "mock",
+)
+
 # ---------------------------------------------------------------------------
 # Helper: Pre-compute shared prefix groups for attention beam routing
 # ---------------------------------------------------------------------------
@@ -265,6 +272,20 @@ def apply_engine_core_child_patches(vllm_config=None):
 _run_engine_core_active = False
 
 
+def _describe_callable(func) -> str:
+    module = getattr(func, "__module__", type(func).__module__)
+    name = getattr(func, "__qualname__", getattr(func, "__name__", type(func).__name__))
+    return f"{module}.{name}"
+
+
+def _is_supported_run_engine_core_delegate(func) -> bool:
+    module = getattr(func, "__module__", "")
+    return any(
+        module == prefix.rstrip(".") or module.startswith(prefix)
+        for prefix in _SUPPORTED_RUN_ENGINE_CORE_MODULE_PREFIXES
+    )
+
+
 def run_engine_core(*args, **kwargs):
     """Wrapper for EngineCoreProc.run_engine_core that applies patches
     before the engine starts.  This is a module-level function so that
@@ -322,19 +343,17 @@ def run_engine_core(*args, **kwargs):
             "vllm_gr before starting."
         )
 
-    # Validate that original_run looks like a real function from vllm
-    # (Skip validation for test mocks)
-    if hasattr(original_run, "__module__"):
-        original_module = original_run.__module__
-        expected_module = "vllm.v1.engine.core"
-        # Skip warning for unittest mocks (used in tests)
-        if original_module not in (expected_module, "unittest.mock", "mock"):
-            logger.warning(
-                "Unexpected module for original run_engine_core: %s (expected %s). "
-                "Proceeding anyway, but this may indicate an issue.",
-                original_module,
-                expected_module,
-            )
+    if not _is_supported_run_engine_core_delegate(original_run):
+        logger.warning(
+            "Unexpected run_engine_core delegate %s. Proceeding anyway, but "
+            "this may indicate an unsupported runtime wrapper.",
+            _describe_callable(original_run),
+        )
+    elif getattr(original_run, "__module__", "").startswith("vllm_ascend."):
+        logger.debug(
+            "Chaining vllm_gr run_engine_core wrapper through external delegate %s",
+            _describe_callable(original_run),
+        )
 
     # Set re-entry guard and apply patches
     _run_engine_core_active = True

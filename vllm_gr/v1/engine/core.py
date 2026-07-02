@@ -120,11 +120,6 @@ def _handle_beam_fork(self, fork_req) -> None:
                 prompt_token_ids=child_token_ids,
                 sampling_params=fork_req.sampling_params,
                 pooling_params=None,
-                eos_token_id=(
-                    fork_req.eos_token_id
-                    if fork_req.eos_token_id is not None
-                    else cached_req.eos_token_id
-                ),
                 client_index=fork_req.client_index,
                 arrival_time=now,
                 lora_request=(fork_req.lora_request or cached_req.lora_request),

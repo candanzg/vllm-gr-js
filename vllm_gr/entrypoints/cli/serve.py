@@ -29,7 +29,8 @@ class GRServeSubcommand(CLISubcommand):
         if args.headless:
             raise ValueError("vllm-gr serve does not support --headless")
 
-        if getattr(args, "api_server_count", 1) != 1:
+        api_server_count = getattr(args, "api_server_count", None)
+        if api_server_count not in (None, 1):
             raise ValueError("vllm-gr serve currently supports api_server_count=1 only")
 
         uvloop.run(run_server(args))

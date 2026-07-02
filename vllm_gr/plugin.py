@@ -112,6 +112,7 @@ def initialize_runtime(*, strict_gr: bool = True) -> dict[str, int | bool]:
     config_registered = register_gr_configs()
     models_registered = register_gr_model_architectures()
 
+    import_module("vllm_gr.v1.attention.backends.beam_attn")
     _register_adapter_families()
 
     state = {

@@ -140,7 +140,6 @@ class GRInputProcessor(InputProcessor):
             mm_features=None,
             sampling_params=None,
             pooling_params=params,
-            eos_token_id=None,
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=cache_salt,

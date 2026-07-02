@@ -154,7 +154,6 @@ def register_beam_output_fn(
         mm_features=None,
         sampling_params=sampling_params,
         pooling_params=None,
-        eos_token_id=eos_token_id,
         arrival_time=time.time(),
         lora_request=lora_request,
         cache_salt=None,

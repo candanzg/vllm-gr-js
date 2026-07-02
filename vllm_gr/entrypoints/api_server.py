@@ -12,6 +12,7 @@ from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai import api_server as openai_api_server
+from vllm.entrypoints.openai.server_utils import load_log_config
 from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
@@ -198,7 +199,7 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
-    log_config = openai_api_server.load_log_config(args.log_config_file)
+    log_config = load_log_config(args.log_config_file)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
