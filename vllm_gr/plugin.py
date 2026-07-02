@@ -16,6 +16,7 @@ It is responsible only for:
 """
 
 import logging
+import os
 from importlib import import_module
 
 logger = logging.getLogger("vllm_gr.plugin")
@@ -68,7 +69,7 @@ def _register_adapter_families() -> None:
     for entry in sorted(adapters_dir.iterdir()):
         if not entry.is_dir():
             continue
-        if entry.name.startswith("_") or entry.name == "__pycache__":
+        if entry.name.startswith("_") or entry.name in {"__pycache__"}:
             continue
         if not (entry / "__init__.py").exists():
             continue
@@ -94,12 +95,16 @@ def _register_adapter_families() -> None:
                 raise
 
 
-def initialize_runtime() -> dict[str, int | bool]:
+def initialize_runtime(*, strict_gr: bool = True) -> dict[str, int | bool]:
     """Initialize the current process for vllm-GR runtime usage.
 
     Safe to call repeatedly. The underlying patch and registration helpers are
     idempotent, so this can be used both by the vLLM plugin loader and by
     explicit engine startup paths in the main process.
+
+    When ``strict_gr`` is False (default for the vLLM plugin entry point), GR
+    config/model registration failures are logged but do not abort startup so
+    causal-LM checkpoints can use LLM passthrough mode.
     """
     from vllm_gr.patch import re_apply_patches
 
@@ -113,6 +118,7 @@ def initialize_runtime() -> dict[str, int | bool]:
         "patch_count": patch_count,
         "config_registered": config_registered,
         "models_registered": models_registered,
+        "strict_gr": strict_gr,
     }
     if not config_registered:
         raise RuntimeError(
@@ -124,15 +130,24 @@ def initialize_runtime() -> dict[str, int | bool]:
             "GR model architecture registration did not succeed"
         )
     logger.debug(
-        "vllm-GR runtime initialized: patches=%d, config_registered=%s, models_registered=%s",
+        "vllm-GR runtime initialized: patches=%d, config_registered=%s, "
+        "models_registered=%s, strict_gr=%s",
         patch_count,
         config_registered,
         models_registered,
+        strict_gr,
     )
     return state
 
 
 def register() -> None:
-    """Entry point used by vLLM's general plugin loader."""
-    state = initialize_runtime()
+    """Entry point used by vLLM's general plugin loader.
+
+    Environment variables:
+        VLLM_GR_STRICT: When set to ``1``, GR config/model registration
+            failures abort startup. Default ``0`` allows LLM passthrough when
+            GR registrations are incomplete.
+    """
+    strict_gr = os.getenv("VLLM_GR_STRICT", "0") == "1"
+    state = initialize_runtime(strict_gr=strict_gr)
     logger.debug("vllm-GR plugin loaded (%d patches applied)", state["patch_count"])
