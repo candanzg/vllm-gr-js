@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 
-import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
@@ -20,6 +20,11 @@ catalog-constrained generation patches are loaded automatically via the vLLM
 general plugin. Useful for serving OneRec-style checkpoints.
 """
 
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
+
 
 class GRServeSubcommand(CLISubcommand):
     """The `serve` subcommand for vllm-gr CLI."""
@@ -31,7 +36,10 @@ class GRServeSubcommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        uvloop.run(run_server(args))
+        if uvloop is not None:
+            uvloop.run(run_server(args))
+        else:
+            asyncio.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)

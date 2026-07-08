@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.openai.serving_models import (
+from vllm.entrypoints.openai.models.serving import (
     BaseModelPath,
     LoRAModulePath,
     OpenAIServingModels,

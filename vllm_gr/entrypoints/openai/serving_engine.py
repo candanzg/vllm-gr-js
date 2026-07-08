@@ -7,9 +7,8 @@ from collections.abc import AsyncGenerator, Mapping
 
 import numpy as np
 from vllm.beam_search import BeamSearchSequence
-from vllm.entrypoints.openai.protocol import VLLMValidationError
-from vllm.inputs.data import PromptType, TokensPrompt
-from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
@@ -23,6 +22,10 @@ from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
+
+
+def _is_explicit_encoder_decoder_prompt(prompt: PromptType) -> bool:
+    return isinstance(prompt, Mapping) and "encoder_prompt" in prompt and "decoder_prompt" in prompt
 
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
@@ -284,7 +287,7 @@ async def beam_search(
                 value=end_token,
             )
 
-    if is_explicit_encoder_decoder_prompt(prompt):
+    if _is_explicit_encoder_decoder_prompt(prompt):
         raise NotImplementedError
 
     prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")

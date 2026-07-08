@@ -27,8 +27,6 @@ import threading
 import types
 from typing import Any
 
-from vllm_gr.ops.npu.split_qkv_rmsnorm_rope import apply_split_qkv_rmsnorm_rope_patch
-
 logger = logging.getLogger("vllm_gr.patch")
 
 _YUANRONG_PATCHES_APPLIED = False
@@ -348,6 +346,21 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
         return 0
 
     patch_count = 0
+
+    try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        import vllm_gr.v1.attention.backends.beam_attn  # noqa: F401
+
+        if AttentionBackendEnum.CUSTOM.is_overridden():
+            patch_count += 1
+            logger.debug("vllm_gr: Registered BeamAttentionBackend under CUSTOM")
+        else:
+            logger.debug(
+                "vllm_gr: beam_attn imported but CUSTOM backend is still unregistered"
+            )
+    except Exception as exc:
+        logger.debug("vllm_gr: Skipping BeamAttentionBackend registration: %s", exc)
 
     try:
         from vllm_gr.logprobs_patch import patch_flat_logprobs
@@ -734,7 +747,17 @@ def _apply_patches(force: bool = False) -> int:
     used by the OneRec beam-search path and the NPU runtime.
     """
     yuanrong_count = _apply_yuanrong_npu_patch(force=force)
-    qkv_rmsnorm_rope_count = apply_split_qkv_rmsnorm_rope_patch(force=force)
+    qkv_rmsnorm_rope_count = 0
+    if _is_npu_platform():
+        try:
+            from vllm_gr.ops import apply_split_qkv_rmsnorm_rope_patch
+
+            qkv_rmsnorm_rope_count = apply_split_qkv_rmsnorm_rope_patch(force=force)
+        except (ImportError, ModuleNotFoundError) as exc:
+            logger.debug(
+                "Skipping split_qkv_rmsnorm_rope monkey-patch because dependencies are unavailable: %s",
+                exc,
+            )
     kv_merge_count = _apply_kv_merge_patch(force=force)
     ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)

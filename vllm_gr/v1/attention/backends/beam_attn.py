@@ -8,31 +8,30 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionImpl,
+    AttentionMetadataBuilder,
     AttentionType,
     MultipleOf,
-    is_quantized_kv_cache,
 )
 from vllm.v1.attention.backends.fa_utils import (
-    flash_attn_supports_fp8,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
     CommonAttentionMetadata,
     get_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
@@ -43,6 +42,22 @@ from vllm_gr.v1.engine.engine_core_patch import _compute_beam_bounds
 
 logger = init_logger(__name__)
 BEAM_DATA_VAR = contextvars.ContextVar("beam_data", default=None)
+
+
+def _is_batch_invariant_enabled() -> bool:
+    """Compatibility helper for vLLM batch-invariant mode."""
+    return bool(getattr(envs, "VLLM_BATCH_INVARIANT", False))
+
+
+def _flash_attn_supports_fp8() -> bool:
+    """Compatibility helper for FP8 KV-cache support.
+
+    vLLM 0.22.x no longer exports ``flash_attn_supports_fp8`` from
+    ``fa_utils``. For the GPU path we only need a conservative gate before
+    enabling FP8 KV-cache logic, so treating CUDA + FlashAttention-varlen
+    availability as the supported condition is sufficient here.
+    """
+    return CUDA_DEVICE and is_flash_attn_varlen_func_available()
 
 # Device flag – must be checked after torch is loaded.
 NPU_DEVICE = is_npu_available()
@@ -207,7 +222,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         ):
             max_num_splits = self.max_num_splits
 
-        if CUDA_DEVICE and vllm_is_batch_invariant():
+        if CUDA_DEVICE and _is_batch_invariant_enabled():
             max_num_splits = 1
         return max_num_splits
 
@@ -802,12 +817,12 @@ class BeamAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.attn_type = attn_type
         self.vllm_flash_attn_version = get_flash_attn_version() if not NPU_DEVICE else 0
-        self.batch_invariant_enabled = vllm_is_batch_invariant() if CUDA_DEVICE else False
+        self.batch_invariant_enabled = _is_batch_invariant_enabled() if CUDA_DEVICE else False
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             if NPU_DEVICE:
                 raise NotImplementedError("BeamAttention does not support fp8 kv-cache on NPU.")
-            if not flash_attn_supports_fp8():
+            if not _flash_attn_supports_fp8():
                 raise NotImplementedError(
                     "BeamAttention does not support fp8 kv-cache on this device."
                 )
@@ -1215,7 +1230,7 @@ class BeamAttentionBackend(AttentionBackend):
         if kv_cache_dtype.startswith("fp8"):
             if NPU_DEVICE:
                 return False  # fp8 kv-cache not yet supported on NPU
-            return flash_attn_supports_fp8()
+            return _flash_attn_supports_fp8()
         return kv_cache_dtype in ["auto"]
 
     @classmethod
