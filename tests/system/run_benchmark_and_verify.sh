@@ -9,6 +9,20 @@ pass_32_th=0.2
 recall_32_th=0.04
 elapsed_time_online_th=15
 elapsed_time_offline_th=20
+ONEREC_MODEL_PATH="OpenOneRec/OneRec-1.7B"
+if [ -n "$REC_MODEL" ]; then
+    ONEREC_MODEL_PATH="$REC_MODEL"
+fi
+if [ -n "$REC_DATA" ]; then
+    DATASET_PATH="$REC_DATA"
+fi
+if [ -n "$REC_CATALOG" ]; then
+    CATALOG_PATH="$REC_CATALOG"
+fi
+
+echo "ONEREC_MODEL_PATH: $ONEREC_MODEL_PATH"
+echo "ONEREC_DATASET_PATH: $DATASET_PATH"
+echo "ONEREC_CATALOG_PATH: $CATALOG_PATH"
 device="gpu"
 #if exist npu-smi tune some threshold
 if command -v npu-smi &> /dev/null; then
@@ -76,7 +90,7 @@ echo "offline test"
 
 output=$( python -m benchmarks.open_one_rec.one_rec_acc_test \
 --gr \
---model OpenOneRec/OneRec-1.7B \
+--model "$ONEREC_MODEL_PATH" \
 --dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \
@@ -131,7 +145,7 @@ vllm-gr serve \
     --scheduling-policy priority \
     --catalog-path "$CATALOG_PATH" \
     --attention-backend CUSTOM \
-    OpenOneRec/OneRec-1.7B &
+    "$ONEREC_MODEL_PATH" &
 
 SERVER_PID=$!
 
@@ -152,7 +166,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
   --endpoint /v1/chat/completions \
   --backend openai-chat  \
-  --model OpenOneRec/OneRec-1.7B  \
+  --model "$ONEREC_MODEL_PATH"  \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
   --task-type video  \
@@ -167,7 +181,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_main \
   bench serve \
   --endpoint /v1/chat/completions \
   --backend openai-chat  \
-  --model OpenOneRec/OneRec-1.7B  \
+  --model "$ONEREC_MODEL_PATH"  \
   --dataset-name onerec \
   --dataset-path "$DATASET_PATH" \
   --task-type video  \
@@ -200,7 +214,7 @@ echo "Parsed P99 TPOT: ${p99_tpot} ms"
 validate_metric "P99 TPOT" "$p99_tpot" "$p99_tpot_th" "le"
 
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
---model OpenOneRec/OneRec-1.7B \
+--model "$ONEREC_MODEL_PATH" \
 --dataset-path "$DATASET_PATH" \
 --dataset-name  onerec \
 --num-prompts 100 \

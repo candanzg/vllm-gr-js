@@ -5,10 +5,12 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import threading
 import time
 from functools import partial
 from typing import Any
 
+import msgspec
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -25,16 +27,24 @@ logger = init_logger(__name__)
 # ------------------------------------------------------------------------------------
 
 
+def _ensure_beam_state(self) -> None:
+    if not hasattr(self, "beam_cache"):
+        self.beam_cache = {}
+    if not hasattr(self, "beam_cache_lock"):
+        self.beam_cache_lock = threading.Lock()
+
+
 def _cache_beam_request(self, request) -> None:
     """Cache Request state for later beam forking.
 
     Thread-safe: uses beam_cache_lock to prevent data races.
     """
+    _ensure_beam_state(self)
     with self.beam_cache_lock:
         self.beam_cache[request.request_id] = {
             "all_token_ids": list(request._all_token_ids),
             "block_hashes": list(request.block_hashes),
-            "eos_token_id": request.eos_token_id,
+            "eos_token_id": request.sampling_params.eos_token_id,
             "lora_request": request.lora_request,
             "cache_salt": request.cache_salt,
             "mm_features": request.mm_features,
@@ -47,6 +57,7 @@ def _handle_beam_request_step_update(self, update) -> None:
     """Apply a grouped step update using only the prefill cache entry."""
     from vllm.v1.request import Request
 
+    _ensure_beam_state(self)
     session_id = update.session_id
     beam_width = update.beam_width
 
@@ -124,6 +135,12 @@ def _handle_beam_request_step_update(self, update) -> None:
     prompt_embeds = session_cached["prompt_embeds"]
     eos = session_cached["eos_token_id"]
 
+    sampling_params = update.sampling_params.clone()
+    if eos is not None or update.eos_token_id is not None:
+        sampling_params.update_from_generation_config(
+            {}, update.eos_token_id if update.eos_token_id is not None else eos
+        )
+
     # Pack the shared prefill and all beam suffixes into a single contiguous Beam Request
     beam_token_ids = list(prefill_tokens)
     decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
@@ -134,9 +151,8 @@ def _handle_beam_request_step_update(self, update) -> None:
     req = Request(
         request_id=session_id,  # Single request ID representing all beams
         prompt_token_ids=beam_token_ids,
-        sampling_params=update.sampling_params,
+        sampling_params=sampling_params,
         pooling_params=None,
-        eos_token_id=(update.eos_token_id if update.eos_token_id is not None else eos),
         client_index=update.client_index,
         arrival_time=arrival,
         lora_request=(update.lora_request or lora_request),
@@ -190,16 +206,26 @@ def process_input_sockets(
 
     import zmq
     from vllm.utils.network_utils import make_zmq_socket
-    from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
+    from vllm.v1.engine import (
+        EngineCoreReadyResponse,
+        EngineCoreRequest,
+        EngineCoreRequestType,
+    )
     from vllm.v1.serial_utils import MsgpackDecoder
 
     from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
-    # Msgpack serialization decoding.
-    add_request_decoder = MsgpackDecoder(EngineCoreRequest)
-    add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest])
-    beam_request_decoder = MsgpackDecoder(BeamRequestStepUpdate)
-    generic_decoder = MsgpackDecoder()
+    # Msgpack serialization decoding with optional tensor IPC receiver.
+    add_request_decoder = MsgpackDecoder(
+        EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
+    )
+    add_batch_decoder = MsgpackDecoder(
+        list[EngineCoreRequest], oob_tensor_provider=self.tensor_ipc_receiver
+    )
+    beam_request_decoder = MsgpackDecoder(
+        BeamRequestStepUpdate, oob_tensor_provider=self.tensor_ipc_receiver
+    )
+    generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
     with ExitStack() as stack, zmq.Context() as ctx:
         input_sockets = [
@@ -225,12 +251,23 @@ def process_input_sockets(
 
         # Register sockets with poller.
         poller = zmq.Poller()
+        ready_response = EngineCoreReadyResponse(
+            max_model_len=self.vllm_config.model_config.max_model_len,
+            num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
+            dp_stats_address=self.frontend_stats_publish_address,
+            dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
+        )
+        ready_payload = msgspec.msgpack.encode(ready_response)
         for input_socket in input_sockets:
-            input_socket.send(b"")
+            input_socket.send(ready_payload)
             poller.register(input_socket, zmq.POLLIN)
 
         if coord_socket is not None:
-            assert coord_socket.recv() == b"READY"
+            coord_ready = coord_socket.recv()
+            if coord_ready != b"READY":
+                raise RuntimeError(
+                    f"Expected READY handshake from coordinator, but received {coord_ready!r}."
+                )
             poller.register(coord_socket, zmq.POLLIN)
 
         ready_event.set()
@@ -238,6 +275,10 @@ def process_input_sockets(
         while True:
             for input_socket, _ in poller.poll():
                 type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                if type_frame.buffer == b"READY":
+                    if input_socket != coord_socket:
+                        raise RuntimeError("Received READY frame from a non-coordinator socket.")
+                    continue
                 request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
                 request: Any

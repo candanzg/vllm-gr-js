@@ -198,20 +198,43 @@ _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN = None
 
 
+def _register_custom_attention_backend(force: bool = False) -> int:
+    """Register BeamAttentionBackend under vLLM's CUSTOM backend slot."""
+    try:
+        from vllm.v1.attention.backends.registry import (
+            AttentionBackendEnum,
+            register_backend,
+        )
+    except ImportError:
+        return 0
+
+    class_path = "vllm_gr.v1.attention.backends.beam_attn.BeamAttentionBackend"
+    current_path = None
+    if AttentionBackendEnum.CUSTOM.is_overridden():
+        try:
+            current_path = AttentionBackendEnum.CUSTOM.get_path()
+        except ValueError:
+            current_path = None
+
+    if not force and current_path == class_path:
+        return 0
+
+    register_backend(AttentionBackendEnum.CUSTOM, class_path)
+    logger.debug("vllm_gr: Registered CUSTOM attention backend: %s", class_path)
+    return 1
+
+
 def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
-    """Preserve CUSTOM attention backend on all platforms.
+    """Preserve CUSTOM attention backend on Ascend NPU.
 
     The vllm-ascend platform plugin ignores any user-specified attention
     backend (other than FLASH_ATTN) in its ``get_attn_backend_cls()``, so
     ``get_attn_backend`` would return an Ascend-specific backend even when the
     config explicitly requests ``AttentionBackendEnum.CUSTOM``.
 
-    To avoid relying on an environment variable, this patch is applied
-    **unconditionally** on every platform.  It is a no-op whenever
-    ``backend != AttentionBackendEnum.CUSTOM``, so on GPU the CUDA platform's
-    native handling is preserved.  When ``backend == CUSTOM`` the patch returns
-    ``BeamAttentionBackend`` directly, bypassing any platform-specific
-    ``get_attn_backend_cls``.
+    The platform plugin also resets ``attention_config.backend`` to ``None``
+    during config preparation, so we persist the user's intent in
+    ``additional_config`` and use that as a fallback in the selector patch.
     """
     global _ASCEND_ATTN_BACKEND_PATCH_APPLIED
     global _ASCEND_ORIGINAL_CACHED_GET_ATTN
@@ -224,17 +247,21 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
     except ImportError:
         return 0
 
-    # Ensure BeamAttentionBackend is registered under CUSTOM.
+    # force=True is used by unit tests and patch re-application paths that need
+    # to validate selector behavior even when the current host is not an NPU.
+    if not _is_npu_platform() and not force:
+        return 0
+
+    patch_count = _register_custom_attention_backend(force=force)
+
     try:
         import vllm_gr.v1.attention.backends.beam_attn  # noqa: F401
     except Exception:
-        return 0
+        return patch_count
 
     if not AttentionBackendEnum.CUSTOM.is_overridden():
         _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
-        return 0
-
-    patch_count = 0
+        return patch_count
 
     # --- Patch selector._cached_get_attn_backend -----------------------
     try:
@@ -248,8 +275,9 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
 
     original_cached_fn = _ASCEND_ORIGINAL_CACHED_GET_ATTN
 
-    def _patched_cached_get_attn_backend(backend, attn_selector_config):
+    def _patched_cached_get_attn_backend(*args, **kwargs):
         """Return BeamAttentionBackend when backend is CUSTOM."""
+        backend = args[0] if args else kwargs.get("backend")
         if backend == AttentionBackendEnum.CUSTOM:
             from vllm_gr.v1.attention.backends.beam_attn import (
                 BeamAttentionBackend,
@@ -267,7 +295,6 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
                 set_kv_cache_layout(required_layout)
 
             return BeamAttentionBackend
-
         # On Ascend NPU the platform plugin resets attention_config.backend to
         # None inside VllmConfig.__post_init__.  The reset happens before the
         # config is serialized to child processes, so EngineCore and Worker
@@ -301,7 +328,7 @@ def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
             except Exception:
                 pass
 
-        return original_cached_fn(backend, attn_selector_config)
+        return original_cached_fn(*args, **kwargs)
 
     selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
     patch_count += 1
@@ -321,7 +348,7 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
     if _GR_BEAM_PATCHES_APPLIED and not force:
         return 0
 
-    patch_count = 0
+    patch_count = _register_custom_attention_backend(force=force)
 
     try:
         from vllm_gr.logprobs_patch import patch_flat_logprobs

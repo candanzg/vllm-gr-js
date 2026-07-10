@@ -6,10 +6,8 @@ import time
 from collections.abc import AsyncGenerator, Mapping
 
 import numpy as np
-from vllm.beam_search import BeamSearchSequence
-from vllm.entrypoints.openai.protocol import VLLMValidationError
-from vllm.inputs.data import PromptType, TokensPrompt
-from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
@@ -21,6 +19,11 @@ from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_l
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
+
+try:
+    from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
+except ModuleNotFoundError:
+    from vllm_gr.beam_search_compat import BeamSearchSequence
 
 logger = init_logger(__name__)
 
@@ -220,7 +223,7 @@ def _extract_and_dedup_segment(
 
 async def beam_search(
     self,
-    prompt: PromptType,
+    prompt: EngineInput,
     request_id: str,
     params: BeamSearchParams,
     lora_request: LoRARequest | None = None,
@@ -286,13 +289,12 @@ async def beam_search(
                 value=end_token,
             )
 
-    if is_explicit_encoder_decoder_prompt(prompt):
-        raise NotImplementedError
+    if prompt["type"] == "embeds":
+        raise NotImplementedError("Embedding prompt not supported for beam search")
 
-    prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
-    prompt_token_ids = [] if isinstance(prompt, str) else prompt.get("prompt_token_ids", [])
-    multi_modal_data = None if isinstance(prompt, str) else prompt.get("multi_modal_data")
-    mm_processor_kwargs = None
+    decoder_prompt = prompt if prompt["type"] != "enc_dec" else prompt["decoder_prompt"]
+    prompt_text = decoder_prompt.get("prompt")
+    prompt_token_ids = decoder_prompt["prompt_token_ids"]
 
     tokenized_length = len(prompt_token_ids)
     logprobs_num = beam_width
@@ -318,11 +320,10 @@ async def beam_search(
 
     all_beams = [
         BeamSearchSequence(
+            orig_prompt=prompt,
             tokens=initial_tokens,
             cum_logprob=0,
             logprobs=initial_logprobs,
-            multi_modal_data=multi_modal_data,
-            mm_processor_kwargs=mm_processor_kwargs,
             lora_request=lora_request,
         )
     ]
@@ -360,17 +361,7 @@ async def beam_search(
             beam_search_start = time.perf_counter()
 
         prompts_batch, lora_req_batch = zip(
-            *[
-                (
-                    TokensPrompt(
-                        prompt_token_ids=beam.tokens,
-                        multi_modal_data=beam.multi_modal_data,
-                        mm_processor_kwargs=beam.mm_processor_kwargs,
-                    ),
-                    beam.lora_request,
-                )
-                for beam in all_beams
-            ]
+            *[(beam.get_prompt(), beam.lora_request) for beam in all_beams]
         )
         if token > 0:
             num_generation_tokens += len(all_beams)
@@ -570,6 +561,7 @@ async def beam_search(
                 cached = beam_flat_cache[idx // logprobs_num]
                 assert cached is not None
                 eos_beam = BeamSearchSequence(
+                    orig_prompt=current_beam.orig_prompt,
                     tokens=current_beam.tokens + [eos_token_id]
                     if include_stop_str_in_output
                     else current_beam.tokens,
@@ -598,12 +590,11 @@ async def beam_search(
             cached = beam_flat_cache[idx // logprobs_num]
             assert cached is not None
             new_beam = BeamSearchSequence(
+                orig_prompt=current_beam.orig_prompt,
                 tokens=current_beam.tokens + [token_id],
                 logprobs=initial_logprobs,
                 lora_request=current_beam.lora_request,
                 cum_logprob=float(all_beams_logprob[idx]),
-                multi_modal_data=current_beam.multi_modal_data,
-                mm_processor_kwargs=current_beam.mm_processor_kwargs,
             )
             new_beam._lp_parent = current_beam
             new_beam._lp_step_data = cached

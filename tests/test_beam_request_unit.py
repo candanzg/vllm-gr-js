@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -35,7 +36,10 @@ from vllm_gr.entrypoints.openai.serving_engine import (
     _beam_request_cleanup,
     _beam_request_step,
 )
-from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
+from vllm_gr.v1.engine.core import (
+    _cache_beam_request,
+    _handle_beam_request_step_update,
+)
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
@@ -51,12 +55,16 @@ from vllm_gr.v1.engine.core_client_patch import (
     sync_mp_add_requests,
     sync_mp_beam_request_step_update,
 )
-from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
+from vllm_gr.v1.engine.engine_core_patch import (
+    ADD_BATCH_WIRE_BYTE,
+    BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE,
+    _add_enum_member,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
 # Ensure custom enum members exist in this process for all tests below.
-_add_enum_member("ADD_BATCH", b"\x05")
-_add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+_add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+_add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
 
 # ---------------------------------------------------------------------------
 # Module-level picklable targets for subprocess tests (§6)
@@ -72,8 +80,8 @@ def _sub_patch_batch_fork_registers_enum() -> None:
     patch_batch_and_fork()
     assert hasattr(ERT, "ADD_BATCH"), "ADD_BATCH missing after patch"
     assert hasattr(ERT, "BEAM_REQUEST_STEP_UPDATE"), "BEAM_REQUEST_STEP_UPDATE missing after patch"
-    assert ERT.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
-    assert ERT.ADD_BATCH.value == b"\x05"
+    assert ERT.BEAM_REQUEST_STEP_UPDATE.value == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+    assert ERT.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
 
 
 def _sub_patch_batch_fork_wires_run_engine_core() -> None:
@@ -125,6 +133,8 @@ def _make_mock_request(
     m._all_token_ids = token_ids if token_ids is not None else [10, 20, 30]
     m.block_hashes = block_hashes if block_hashes is not None else [0xAA, 0xBB]
     m.eos_token_id = eos_token_id
+    m.sampling_params = _sampling_params()
+    m.sampling_params.update_from_generation_config({}, eos_token_id)
     m.lora_request = None
     m.cache_salt = None
     m.mm_features = None
@@ -147,6 +157,16 @@ def _make_engine_self(
         aborts_queue=queue.SimpleQueue(),
         engine_index=engine_index,
     )
+
+
+def test_cache_beam_request_lazily_initializes_beam_state():
+    self_obj = SimpleNamespace()
+    request = _make_mock_request(request_id="lazy-init")
+
+    _cache_beam_request(self_obj, request)
+
+    assert "lazy-init" in self_obj.beam_cache
+    assert hasattr(self_obj, "beam_cache_lock")
 
 
 def _session_entry(
@@ -352,41 +372,48 @@ class TestTypesSerialization:
 
 class TestEnumPatching:
     def test_add_enum_member_creates_member(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
         member = EngineCoreRequestType.ADD_BATCH
-        assert member.value == b"\x05"
+        assert member.value == ADD_BATCH_WIRE_BYTE
         assert member.name == "ADD_BATCH"
         # Must be accessible via reverse value lookup
-        assert EngineCoreRequestType(b"\x05") is member
+        assert EngineCoreRequestType(ADD_BATCH_WIRE_BYTE) is member
         # Must appear exactly once in the name list
         assert sum(1 for n in EngineCoreRequestType._member_names_ if n == "ADD_BATCH") == 1
 
     def test_add_enum_member_idempotent(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("ADD_BATCH", b"\x05")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
         count = sum(1 for name in EngineCoreRequestType._member_names_ if name == "ADD_BATCH")
         assert count == 1, "Duplicate member added"
         # Reverse lookup must still work after idempotent call
-        assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
+        assert EngineCoreRequestType(ADD_BATCH_WIRE_BYTE) is EngineCoreRequestType.ADD_BATCH
 
     def test_beam_request_step_update_enum_value(self) -> None:
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
         member = EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
-        assert member.value == b"\x06"
+        assert member.value == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
         assert member.name == "BEAM_REQUEST_STEP_UPDATE"
         # Must be accessible via reverse value lookup
-        assert EngineCoreRequestType(b"\x06") is member
+        assert EngineCoreRequestType(BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE) is member
         assert (
             sum(1 for n in EngineCoreRequestType._member_names_ if n == "BEAM_REQUEST_STEP_UPDATE")
             == 1
         )
 
     def test_enum_lookup_by_value(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
-        assert EngineCoreRequestType(b"\x05") is EngineCoreRequestType.ADD_BATCH
-        assert EngineCoreRequestType(b"\x06") is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
+        assert EngineCoreRequestType(ADD_BATCH_WIRE_BYTE) is EngineCoreRequestType.ADD_BATCH
+        assert (
+            EngineCoreRequestType(BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
+            is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
+        )
+
+    def test_add_enum_member_rejects_value_collision(self) -> None:
+        with pytest.raises(ValueError, match="already used"):
+            _add_enum_member("COLLIDING_MEMBER", EngineCoreRequestType.WAKEUP.value)
 
 
 # ===========================================================================
@@ -583,7 +610,7 @@ class TestBeamCache:
 
         assert not eng.input_queue.empty()
         _, kwargs = MockReq.call_args
-        assert kwargs["eos_token_id"] == 42
+        assert kwargs["sampling_params"].eos_token_id == 42
 
     def test_handle_overrides_eos_from_update(self) -> None:
         eng = _make_engine_self(beam_cache={"s0": _session_entry(eos_token_id=42)})
@@ -597,7 +624,7 @@ class TestBeamCache:
 
         assert not eng.input_queue.empty()
         _, kwargs = MockReq.call_args
-        assert kwargs["eos_token_id"] == 99
+        assert kwargs["sampling_params"].eos_token_id == 99
 
     def test_handle_missing_session_emits_error_outputs(self) -> None:
         eng = _make_engine_self(beam_cache={})
@@ -818,6 +845,83 @@ class TestBeamCache:
 class TestClientPatches:
     # ── add_requests_async ──────────────────────────────────────────────────
 
+    def test_prepare_request_does_not_import_removed_truncation_helper(self) -> None:
+        mock_self = MagicMock()
+        mock_self.errored = False
+        mock_self.log_requests = False
+        mock_self.vllm_config.cache_config.kv_sharing_fast_prefill = False
+        mock_self._supported_tasks = ("generate",)
+        mock_self.input_processor.process_inputs = MagicMock(
+            return_value=MagicMock(request_id="req-0")
+        )
+
+        params = _sampling_params()
+
+        original_import = __import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "vllm.entrypoints.utils" and "_validate_truncation_size" in fromlist:
+                raise AssertionError("prepare_request_fn imported removed helper")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            _, request = prepare_request_fn(
+                mock_self,
+                request_id="req-0",
+                prompt={"prompt": "hello"},
+                params=params,
+            )
+
+        assert request is mock_self.input_processor.process_inputs.return_value
+        mock_self.input_processor.process_inputs.assert_called_once_with(
+            request_id="req-0",
+            prompt={"prompt": "hello"},
+            params=params,
+            supported_tasks=("generate",),
+            arrival_time=None,
+            lora_request=None,
+            tokenization_kwargs={},
+            trace_headers=None,
+            priority=0,
+            data_parallel_rank=None,
+        )
+
+    def test_prepare_request_uses_cached_supported_tasks_without_engine_core_lookup(self) -> None:
+        mock_self = MagicMock()
+        mock_self.errored = False
+        mock_self.log_requests = False
+        mock_self.vllm_config.cache_config.kv_sharing_fast_prefill = False
+        mock_self._supported_tasks = ("generate",)
+        mock_self.engine_core.get_supported_tasks.side_effect = AssertionError(
+            "prepare_request_fn should not call engine_core.get_supported_tasks"
+        )
+        mock_self.input_processor.process_inputs = MagicMock(
+            return_value=MagicMock(request_id="req-0")
+        )
+
+        params = _sampling_params()
+
+        _, request = prepare_request_fn(
+            mock_self,
+            request_id="req-0",
+            prompt={"prompt": "hello"},
+            params=params,
+        )
+
+        assert request is mock_self.input_processor.process_inputs.return_value
+        mock_self.input_processor.process_inputs.assert_called_once_with(
+            request_id="req-0",
+            prompt={"prompt": "hello"},
+            params=params,
+            supported_tasks=("generate",),
+            arrival_time=None,
+            lora_request=None,
+            tokenization_kwargs={},
+            trace_headers=None,
+            priority=0,
+            data_parallel_rank=None,
+        )
+
     def test_add_requests_async_empty_is_noop(self) -> None:
         mock_self = _make_non_dp_client_mock()
         asyncio.run(add_requests_async(mock_self, []))
@@ -904,6 +1008,7 @@ class TestClientPatches:
         ec_req = mock_self.output_processor.add_request.call_args[0][0]
         assert ec_req.external_req_id == "child-beam-7"
         assert ec_req.data_parallel_rank is None  # not passed → default
+        assert ec_req.sampling_params.eos_token_id is None
 
     def test_register_beam_output_passes_data_parallel_rank(self) -> None:
         mock_self = MagicMock()
@@ -922,6 +1027,22 @@ class TestClientPatches:
         ec_req = mock_self.output_processor.add_request.call_args[0][0]
         assert ec_req.data_parallel_rank == 3
         assert ec_req.external_req_id == "child-0"
+
+    def test_register_beam_output_applies_eos_to_sampling_params(self) -> None:
+        mock_self = MagicMock()
+        mock_self.errored = False
+        mock_self.log_requests = False
+
+        register_beam_output_fn(
+            mock_self,
+            request_id="child-1",
+            prompt_token_ids=[1, 2],
+            sampling_params=_sampling_params(),
+            eos_token_id=9,
+        )
+
+        ec_req = mock_self.output_processor.add_request.call_args[0][0]
+        assert ec_req.sampling_params.eos_token_id == 9
 
     # ── _add_requests_batch_fn ───────────────────────────────────────────
 
@@ -1067,8 +1188,11 @@ class TestClientPatches:
         apply_batch_fork_patches()
         assert hasattr(EngineCoreRequestType, "ADD_BATCH")
         assert hasattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
+        assert (
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value
+            == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+        )
 
     def test_apply_batch_fork_patches_four_classes(self) -> None:
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -1456,20 +1580,24 @@ class TestPatchWiring:
 
 class TestIntegrationCrossProcess:
     def test_enum_values_no_collision(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
 
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE
+        assert (
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value
+            == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+        )
 
         # Our two values must not collide with any upstream member
         for name in EngineCoreRequestType._member_names_:
             if name in ("ADD_BATCH", "BEAM_REQUEST_STEP_UPDATE"):
                 continue
             member = getattr(EngineCoreRequestType, name)
-            assert member.value not in (b"\x05", b"\x06"), (
-                f"Collision: upstream member {name!r} already uses value {member.value!r}"
-            )
+            assert member.value not in (
+                ADD_BATCH_WIRE_BYTE,
+                BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE,
+            ), f"Collision: upstream member {name!r} already uses value {member.value!r}"
 
     def test_beam_request_step_update_encode_decode(self) -> None:
         from vllm.v1.serial_utils import MsgpackDecoder
@@ -1501,10 +1629,13 @@ class TestIntegrationCrossProcess:
         assert decoded.eos_token_id == 2
         assert decoded.data_parallel_rank == 1
 
-    def test_beam_request_step_update_wire_byte_is_x06(self) -> None:
-        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
-        assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x06"
+    def test_beam_request_step_update_wire_byte(self) -> None:
+        _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
+        assert (
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value
+            == BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE
+        )
 
-    def test_add_batch_wire_byte_is_x05(self) -> None:
-        _add_enum_member("ADD_BATCH", b"\x05")
-        assert EngineCoreRequestType.ADD_BATCH.value == b"\x05"
+    def test_add_batch_wire_byte(self) -> None:
+        _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+        assert EngineCoreRequestType.ADD_BATCH.value == ADD_BATCH_WIRE_BYTE

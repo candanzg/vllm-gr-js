@@ -17,6 +17,9 @@ from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
 
 logger = init_logger(__name__)
 
+ADD_BATCH_WIRE_BYTE = b"\x06"
+BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE = b"\x07"
+
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
@@ -24,6 +27,17 @@ logger = init_logger(__name__)
 
 def make_patched_engine_core_init(original_init):
     """Wrap EngineCore.__init__ to add beam state."""
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.beam_cache: dict[str, dict] = {}
+        self.beam_cache_lock = threading.Lock()
+
+    return patched_init
+
+
+def make_patched_engine_core_proc_init(original_init):
+    """Wrap EngineCoreProc.__init__ to add beam state for socket-thread helpers."""
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -53,13 +67,19 @@ def _add_enum_member(name: str, value: bytes) -> None:
 
     Args:
         name: The name of the new enum member (e.g., "ADD_BATCH")
-        value: The byte value for the enum member (e.g., b"\\x05")
+        value: The byte value for the enum member (e.g., b"\\x06")
 
     Raises:
         RuntimeError: If the enum's internal structure is incompatible
     """
     # Skip if already added
     if hasattr(EngineCoreRequestType, name):
+        existing_member = getattr(EngineCoreRequestType, name)
+        if existing_member.value != value:
+            raise ValueError(
+                f"EngineCoreRequestType.{name} already exists with value "
+                f"{existing_member.value!r}, cannot reassign to {value!r}"
+            )
         return
 
     # Validate that the enum has expected internal structure
@@ -80,6 +100,12 @@ def _add_enum_member(name: str, value: bytes) -> None:
                 f"Value type mismatch: expected {existing_value_type.__name__}, "
                 f"got {type(value).__name__}"
             )
+
+    existing_member = EngineCoreRequestType._value2member_map_.get(value)
+    if existing_member is not None:
+        raise ValueError(
+            f"EngineCoreRequestType value {value!r} is already used by {existing_member.name!r}"
+        )
 
     # Create the member instance bypassing enum's __new__
     # (This is the standard approach for runtime enum extension)
@@ -122,11 +148,12 @@ def apply_engine_core_child_patches():
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
 
     # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
-    _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", b"\x06")
+    _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
+    _add_enum_member("BEAM_REQUEST_STEP_UPDATE", BEAM_REQUEST_STEP_UPDATE_WIRE_BYTE)
 
-    # Wrap EngineCore.__init__ to add beam state
+    # Wrap EngineCore / EngineCoreProc.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
+    EngineCoreProc.__init__ = make_patched_engine_core_proc_init(EngineCoreProc.__init__)
 
     # Bind _cache_beam_request and _handle_beam_request_step_update on both classes
     EngineCore._cache_beam_request = _cache_beam_request
@@ -297,8 +324,21 @@ def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optiona
     gpu_positions = None
     cpu_positions = None
     if hasattr(runner, "positions") and runner.positions is not None:
-        gpu_positions = getattr(runner.positions, "gpu", None)
-        cpu_positions = getattr(runner.positions, "cpu", None)
+        positions = runner.positions
+        gpu_candidate = getattr(positions, "gpu", None)
+        cpu_candidate = getattr(positions, "cpu", None)
+
+        if isinstance(gpu_candidate, torch.Tensor):
+            gpu_positions = gpu_candidate
+        elif isinstance(positions, torch.Tensor):
+            gpu_positions = positions
+
+        if isinstance(cpu_candidate, torch.Tensor):
+            cpu_positions = cpu_candidate
+        elif hasattr(runner, "_positions_cpu_buf") and isinstance(
+            runner._positions_cpu_buf, torch.Tensor
+        ):
+            cpu_positions = runner._positions_cpu_buf
     return gpu_positions, cpu_positions
 
 
@@ -963,10 +1003,12 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
     """NPU ``_prepare_inputs`` wrapper.
 
     Signature: ``(scheduler_output, intermediate_tensors=None)``.
-    Returns the NPU 7-tuple
-    ``(attn_metadata, num_scheduled_tokens, num_input_tokens,
-    num_tokens_across_dp, logits_indices, spec_decode_metadata,
-    max_num_scheduled_tokens)``.
+
+    vLLM-Ascend changed the return shape of ``_prepare_inputs`` between
+    releases:
+
+    - ``0.14.x`` returned a 7-tuple whose 5th element is ``logits_indices``.
+    - ``0.22.1rc1`` returns a 4-tuple whose 1st element is ``logits_indices``.
 
     Two NPU-specific differences vs the GPU wrapper:
 
@@ -1001,28 +1043,27 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         if not beam_data:
             return out
 
-        (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
-            logits_indices,
-            spec_decode_metadata,
-            max_num_scheduled_tokens,
-        ) = out
+        if not isinstance(out, tuple):
+            raise TypeError(f"Unexpected NPU _prepare_inputs return type: {type(out).__name__}")
+
+        if len(out) == 7:
+            num_scheduled_tokens = out[1]
+            logits_index = 4
+        elif len(out) == 4:
+            req_ids = list(getattr(self.input_batch, "req_ids", []))
+            num_scheduled_tokens = [
+                scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids
+            ]
+            logits_index = 0
+        else:
+            raise ValueError(f"Unexpected NPU _prepare_inputs return tuple length: {len(out)}")
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
         logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
 
-        return (
-            attn_metadata,
-            num_scheduled_tokens,
-            num_input_tokens,
-            num_tokens_across_dp,
-            logits_indices,
-            spec_decode_metadata,
-            max_num_scheduled_tokens,
-        )
+        out_list = list(out)
+        out_list[logits_index] = logits_indices
+        return tuple(out_list)
 
     return patched_prepare_inputs
 
@@ -1095,11 +1136,26 @@ def apply_worker_patches():
 
     npu_available = is_npu_available()
     if npu_available:
-        try:
-            from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-        except ImportError:
-            logger.warning("Failed to import NPUModelRunner, skipping NPU patches.")
-            NPUModelRunner = None
+        NPUModelRunner = None
+        import_errors: list[tuple[str, Exception]] = []
+        for module_path in (
+            "vllm_ascend.worker.model_runner_v1",
+            "vllm_ascend.worker.worker",
+        ):
+            try:
+                module = __import__(module_path, fromlist=["NPUModelRunner"])
+                NPUModelRunner = getattr(module, "NPUModelRunner")
+                break
+            except (ImportError, AttributeError) as exc:
+                import_errors.append((module_path, exc))
+        if NPUModelRunner is None:
+            details = "; ".join(
+                f"{module_path}: {type(exc).__name__}: {exc}" for module_path, exc in import_errors
+            )
+            logger.warning(
+                "Failed to import NPUModelRunner, skipping NPU patches. Details: %s",
+                details,
+            )
     else:
         NPUModelRunner = None
 
