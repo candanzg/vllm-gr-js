@@ -58,6 +58,16 @@ if TYPE_CHECKING:
     from vllm.sampling_params import BeamSearchParams
 
 logger = init_logger(__name__)
+_BEAM_STEP_ANOMALY_LIMIT = 8
+_beam_step_anomaly_count = 0
+
+
+def _log_beam_step_anomaly(message: str, *args: Any) -> None:
+    global _beam_step_anomaly_count
+    if _beam_step_anomaly_count >= _BEAM_STEP_ANOMALY_LIMIT:
+        return
+    _beam_step_anomaly_count += 1
+    logger.warning("[OpenOneRec beam] " + message, *args)
 
 
 def _extract_and_dedup_segment(
@@ -215,7 +225,13 @@ def _prepare_beam_step_requests(
                 data_parallel_rank=None,
             )
             ec_req.external_req_id = session_id
-            llm_engine.output_processor.add_request(ec_req, None, None, 0)
+            # vLLM 0.22's output processor treats re-adding an existing
+            # request_id as a streaming-input update, which is not what GR beam
+            # decode wants here. The prefill step already registered the
+            # session_id, so decode steps should reuse that request state
+            # instead of re-registering it.
+            if session_id not in getattr(llm_engine.output_processor, "request_states", {}):
+                llm_engine.output_processor.add_request(ec_req, None, None, 0)
             used_parents = set(parent_beam_ids)
             pruned_ids = [
                 pid for pid in instance_prev_beam_internal_ids[j] if pid not in used_parents
@@ -268,22 +284,47 @@ def _step_engine_and_collect_outputs(
     instance_prefill_id: dict[int, str],
 ) -> dict[str, Any]:
     """Execute LLM engine step until outputs for all active instances are gathered."""
+    def _has_beam_step_payload(output: Any) -> bool:
+        outputs = getattr(output, "outputs", None)
+        if not outputs:
+            return False
+        first = outputs[0]
+        return getattr(first, "logprobs", None) is not None or getattr(
+            first, "finish_reason", None
+        ) == "error"
+
     active_indices = [j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0]
-    step_outputs_accumulated = []
+    outputs_map: dict[str, Any] = {}
     while active_indices:
         step_outputs = llm_engine.step()
-        step_outputs_accumulated.extend(step_outputs)
 
-        outputs_map = {out.request_id: out for out in step_outputs}
+        step_seen_ids = set()
+        for out in step_outputs:
+            request_id = out.request_id
+            step_seen_ids.add(request_id)
+            existing = outputs_map.get(request_id)
+            if existing is None:
+                outputs_map[request_id] = out
+                continue
+
+            if _has_beam_step_payload(existing):
+                continue
+            if _has_beam_step_payload(out):
+                outputs_map[request_id] = out
+                continue
+
+            outputs_map[request_id] = out
+
         new_active_indices = []
         for j in active_indices:
             session_id = instance_prefill_id.get(j)
             search_id = f"offline-beam-{prompt_start + j}-0" if token == 0 else session_id
-            if search_id not in outputs_map:
+            result = outputs_map.get(search_id)
+            if result is None or not _has_beam_step_payload(result):
                 new_active_indices.append(j)
         active_indices = new_active_indices
 
-    return {out.request_id: out for out in step_outputs_accumulated}
+    return outputs_map
 
 
 def _parse_step_logprobs(
@@ -302,7 +343,26 @@ def _parse_step_logprobs(
         all_beams_logprob: list of cumulative logprobs
         beam_flat_cache: list of parsed segments for each parent beam
     """
+    if not result.outputs:
+        _log_beam_step_anomaly(
+            "empty outputs request_id=%s token=%s beam_count=%s finished=%s",
+            getattr(result, "request_id", None),
+            token,
+            len(instance.beams),
+            getattr(result, "finished", None),
+        )
+        return True, [], [], []
+
     if result.outputs[0].finish_reason == "error":
+        first = result.outputs[0]
+        _log_beam_step_anomaly(
+            "error finish request_id=%s token=%s beam_count=%s text=%r stop_reason=%r",
+            getattr(result, "request_id", None),
+            token,
+            len(instance.beams),
+            getattr(first, "text", None),
+            getattr(first, "stop_reason", None),
+        )
         return True, [], [], []
 
     all_beams_token_id = []
@@ -311,6 +371,16 @@ def _parse_step_logprobs(
 
     flat = result.outputs[0].logprobs
     if flat is None:
+        first = result.outputs[0]
+        _log_beam_step_anomaly(
+            "missing logprobs request_id=%s token=%s beam_count=%s finish_reason=%r stop_reason=%r outputs=%s",
+            getattr(result, "request_id", None),
+            token,
+            len(instance.beams),
+            getattr(first, "finish_reason", None),
+            getattr(first, "stop_reason", None),
+            len(result.outputs),
+        )
         raise ValueError(
             "Beam search generation expected non-empty logprobs for each beam, but received 'None'."
         )
@@ -320,7 +390,6 @@ def _parse_step_logprobs(
     raw_ranks = getattr(flat, "ranks", None)
     raw_decoded = getattr(flat, "decoded_tokens", None)
     total_logprobs = len(raw_token_ids)
-
     if token > 0 and fork_info_j is not None:
         stride_k = total_logprobs // len(fork_info_j)
 
@@ -345,6 +414,14 @@ def _parse_step_logprobs(
                     lp if token_id in valid_tokens_set else -float("inf")
                     for token_id, lp in zip(token_ids_pos, logprobs_pos)
                 ]
+                if token_ids_pos and all(not np.isfinite(lp) for lp in logprobs_pos):
+                    _log_beam_step_anomaly(
+                        "all candidates masked by catalog request_id=%s token=%s beam_idx=%s candidate_count=%s",
+                        getattr(result, "request_id", None),
+                        token,
+                        b_idx,
+                        len(token_ids_pos),
+                    )
 
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
             all_beams_token_id.extend(token_ids_pos)
@@ -361,10 +438,26 @@ def _parse_step_logprobs(
                 lp if token_id in valid_tokens_set else -float("inf")
                 for token_id, lp in zip(token_ids_pos, logprobs_pos)
             ]
+            if token_ids_pos and all(not np.isfinite(lp) for lp in logprobs_pos):
+                _log_beam_step_anomaly(
+                    "all candidates masked by catalog request_id=%s token=%s candidate_count=%s",
+                    getattr(result, "request_id", None),
+                    token,
+                    len(token_ids_pos),
+                )
 
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
         all_beams_token_id.extend(token_ids_pos)
         all_beams_logprob.extend(instance.beams[0].cum_logprob + lp for lp in logprobs_pos)
+
+    if not all_beams_token_id:
+        _log_beam_step_anomaly(
+            "empty candidate set after parse request_id=%s token=%s beam_count=%s fork_count=%s",
+            getattr(result, "request_id", None),
+            token,
+            len(instance.beams),
+            0 if fork_info_j is None else len(fork_info_j),
+        )
 
     return False, all_beams_token_id, all_beams_logprob, beam_flat_cache
 
@@ -418,6 +511,13 @@ def _select_top_beams(
     else:
         topn_idx = np.arange(all_beams_logprob.size)
 
+    if topn_idx.size == 0:
+        _log_beam_step_anomaly(
+            "empty top-k selection beam_count=%s beam_width=%s",
+            len(instance.beams),
+            beam_width,
+        )
+
     new_beams = []
     for idx in topn_idx:
         beam_idx = idx // logprobs_num
@@ -437,6 +537,12 @@ def _select_top_beams(
         new_beams.append(new_beam)
 
     instance.beams = new_beams
+    if not new_beams:
+        _log_beam_step_anomaly(
+            "all beams pruned beam_count=%s beam_width=%s",
+            len(topn_idx),
+            beam_width,
+        )
 
     return [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
@@ -724,14 +830,6 @@ class GRLLM(LLM):
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
         )
-        # Keep offline beam search on the pre-upgrade per-beam decode path for
-        # now. After the vLLM 0.22.1 upgrade, the merged BEAM_REQUEST decode
-        # path can return only one candidate at step >= 1 even when the catalog
-        # reports many valid continuations, which corrupts SID structure and
-        # drops OpenOneRec accuracy to zero. The pre-upgrade non-merged path is
-        # the known-correct baseline and should remain the offline behavior
-        # until the merged path is fixed separately.
-        use_custom_attn = False
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
 

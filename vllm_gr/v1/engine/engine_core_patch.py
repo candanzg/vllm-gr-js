@@ -8,7 +8,10 @@ from __future__ import annotations
 import threading
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
+import os
+import sys
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
@@ -137,6 +140,7 @@ def apply_engine_core_child_patches():
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
     if getattr(EngineCore, "_patched_for_beam_requests", False):
+        _log_beam_debug("apply_engine_core_child_patches already applied")
         return
 
     from vllm_gr.v1.engine.core import (
@@ -146,6 +150,7 @@ def apply_engine_core_child_patches():
     )
 
     logger.info("[vllm-gr] apply_engine_core_child_patches called.")
+    _log_beam_debug("apply_engine_core_child_patches called")
 
     # Add new enum members: ADD_BATCH, BEAM_REQUEST_STEP_UPDATE
     _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_BYTE)
@@ -733,9 +738,152 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
     runner.input_batch = InputBatchProxy(
         runner.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx
     )
+
+    # vLLM 0.22.1 threads expanded-logits bookkeeping through explicit
+    # InputBatch fields. The old beam patch only had to rewrite
+    # logits_indices; now we must keep cu_num_logits / expanded_idx_mapping in
+    # sync so the sampler and logprob gather path can see every beam row.
+    cu_num_logits_np = np.empty(len(request_row_configs) + 1, dtype=np.int32)
+    cu_num_logits_np[0] = 0
+    expanded_req_state_indices: list[int] = []
+    expanded_local_pos: list[int] = []
+    orig_input_batch = object.__getattribute__(runner.input_batch, "_obj")
+    for req_pos, (_req_id, input_row_idx, beams_count_with_logits, _active_beams) in enumerate(
+        request_row_configs
+    ):
+        cu_num_logits_np[req_pos + 1] = cu_num_logits_np[req_pos] + beams_count_with_logits
+        if beams_count_with_logits <= 0:
+            continue
+        batch_idx = row_to_batch_idx[input_row_idx]
+        req_state_idx = int(orig_input_batch.idx_mapping_np[batch_idx])
+        expanded_req_state_indices.extend([req_state_idx] * beams_count_with_logits)
+        expanded_local_pos.extend(range(beams_count_with_logits))
+
+    runner.input_batch.cu_num_logits_np = cu_num_logits_np
+    runner.input_batch.cu_num_logits = torch.tensor(
+        cu_num_logits_np, dtype=torch.int32, device=runner.device
+    )
+    runner.input_batch.expanded_idx_mapping = torch.tensor(
+        expanded_req_state_indices,
+        dtype=torch.int32,
+        device=runner.device,
+    )
+    runner.input_batch.expanded_local_pos = torch.zeros(
+        len(expanded_local_pos),
+        dtype=torch.int32,
+        device=runner.device,
+    )
+    if expanded_local_pos:
+        runner.input_batch.expanded_local_pos.copy_(
+            torch.tensor(expanded_local_pos, dtype=torch.int32, device=runner.device)
+        )
     scheduler_output._gr_request_row_configs = request_row_configs
 
     return new_logits_indices
+
+
+def _beam_remap_inputs_v2(runner, input_batch, scheduler_output) -> None:
+    """Expand V2 ``InputBatch`` logits rows for merged beam decode.
+
+    Unlike the V1 runner, ModelRunner V2 does not expose a mutable
+    ``runner.input_batch`` with the legacy helper fields. The beam-search
+    scheduler output still carries the same logical request metadata, so we
+    rebuild only the sampling-facing pieces of ``InputBatch`` in place:
+    ``logits_indices``, ``cu_num_logits``, ``expanded_idx_mapping``,
+    ``expanded_local_pos``, and per-beam position ids.
+    """
+    beam_data = getattr(scheduler_output, "beam_data", {})
+    if not beam_data:
+        return
+
+    new_logits_indices: list[int] = []
+    request_row_configs: list[tuple[Any, int, int, list[int]]] = []
+    token_offset = 0
+    input_row_idx = 0
+    gpu_positions = input_batch.positions
+    row_to_batch_idx: list[int] = []
+
+    req_state_indices = input_batch.idx_mapping_np
+    num_computed_tokens_np = runner.req_states.num_computed_tokens_np
+    prompt_len_np = runner.req_states.prompt_len.np
+
+    for batch_idx, req_id in enumerate(input_batch.req_ids):
+        seq_len = int(input_batch.num_scheduled_tokens[batch_idx])
+        if req_id is None:
+            input_row_idx += 1
+            token_offset += seq_len
+            continue
+
+        mdata = beam_data.get(req_id)
+        if mdata and mdata.get("is_beam_decode", False):
+            beams_count, beams_count_with_logits, _next_offset, active_beam_ids = (
+                _process_beam_decode_request(
+                    mdata,
+                    seq_len,
+                    token_offset,
+                    gpu_positions,
+                    None,
+                    new_logits_indices,
+                )
+            )
+            request_row_configs.append(
+                (req_id, input_row_idx, beams_count_with_logits, active_beam_ids)
+            )
+            row_to_batch_idx.append(batch_idx)
+            input_row_idx += beams_count
+        else:
+            req_state_idx = int(req_state_indices[batch_idx])
+            num_computed_tokens = int(num_computed_tokens_np[req_state_idx])
+            num_prompt_tokens = int(prompt_len_np[req_state_idx])
+            is_last_chunk_prefill = bool(
+                num_computed_tokens < num_prompt_tokens
+                and num_computed_tokens + seq_len >= num_prompt_tokens
+            )
+            beams_count_with_logits = 1 if is_last_chunk_prefill else 0
+            if is_last_chunk_prefill:
+                new_logits_indices.append(token_offset + seq_len - 1)
+            request_row_configs.append((req_id, input_row_idx, beams_count_with_logits, []))
+            row_to_batch_idx.append(batch_idx)
+            input_row_idx += 1
+
+        token_offset += seq_len
+
+    cu_num_logits_np = np.empty(len(request_row_configs) + 1, dtype=np.int32)
+    cu_num_logits_np[0] = 0
+    expanded_req_state_indices: list[int] = []
+    expanded_local_pos: list[int] = []
+    per_req_num_sampled: list[int] = []
+    for req_pos, (_req_id, input_row_idx, beams_count_with_logits, _active_beams) in enumerate(
+        request_row_configs
+    ):
+        cu_num_logits_np[req_pos + 1] = cu_num_logits_np[req_pos] + beams_count_with_logits
+        per_req_num_sampled.append(1 if beams_count_with_logits > 0 else 0)
+        if beams_count_with_logits <= 0:
+            continue
+        batch_idx = row_to_batch_idx[req_pos]
+        req_state_idx = int(req_state_indices[batch_idx])
+        expanded_req_state_indices.extend([req_state_idx] * beams_count_with_logits)
+        expanded_local_pos.extend(range(beams_count_with_logits))
+
+    input_batch.logits_indices = torch.tensor(
+        new_logits_indices, dtype=torch.int32, device=runner.device
+    )
+    input_batch.cu_num_logits_np = cu_num_logits_np
+    input_batch.cu_num_logits = torch.tensor(
+        cu_num_logits_np, dtype=torch.int32, device=runner.device
+    )
+    input_batch.expanded_idx_mapping = torch.tensor(
+        expanded_req_state_indices,
+        dtype=torch.int32,
+        device=runner.device,
+    )
+    input_batch.expanded_local_pos = torch.tensor(
+        expanded_local_pos,
+        dtype=torch.int32,
+        device=runner.device,
+    )
+    input_batch._gr_request_row_configs = request_row_configs
+    input_batch._gr_num_sampled_per_req = per_req_num_sampled
 
 
 def _beam_collapse_bookkeeping(
@@ -891,6 +1039,145 @@ def _beam_collapse_bookkeeping(
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
 
 
+def _snapshot_beam_runner_state(orig_input_batch, request_row_configs, beam_data, requests):
+    """Capture mutable per-request state that merged beam decode must not persist.
+
+    vLLM's native bookkeeping assumes one sampled row per logical request and
+    mutates request/output-token state in place. Our merged beam decode expands
+    one logical request into multiple rows only for sampling/logprob
+    computation; the authoritative beam state still lives in GRLLM's external
+    beam-search loop. We therefore restore these fields after calling the
+    original bookkeeping implementation.
+    """
+    beam_batch_indices: list[int] = []
+    beam_req_ids: list[Any] = []
+    seen_batch_indices: set[int] = set()
+    seen_req_ids: set[Any] = set()
+
+    for req_id, input_row_idx, _logits_num, _active_beams in request_row_configs:
+        mdata = beam_data.get(req_id)
+        if not (mdata and mdata.get("is_beam_decode", False)):
+            continue
+        batch_idx = int(orig_input_batch.req_id_to_index[req_id])
+        if batch_idx not in seen_batch_indices:
+            seen_batch_indices.add(batch_idx)
+            beam_batch_indices.append(batch_idx)
+        if req_id not in seen_req_ids:
+            seen_req_ids.add(req_id)
+            beam_req_ids.append(req_id)
+
+    if not beam_batch_indices and not beam_req_ids:
+        return None
+
+    token_ids_cpu = orig_input_batch.token_ids_cpu
+    is_token_ids = getattr(orig_input_batch, "is_token_ids", None)
+
+    return {
+        "beam_batch_indices": beam_batch_indices,
+        "beam_req_ids": beam_req_ids,
+        "token_ids_cpu": {
+            batch_idx: token_ids_cpu[batch_idx].copy() for batch_idx in beam_batch_indices
+        },
+        "is_token_ids": (
+            {batch_idx: is_token_ids[batch_idx].copy() for batch_idx in beam_batch_indices}
+            if is_token_ids is not None
+            else None
+        ),
+        "num_tokens_no_spec": {
+            batch_idx: int(orig_input_batch.num_tokens_no_spec[batch_idx])
+            for batch_idx in beam_batch_indices
+        },
+        "num_tokens": (
+            {
+                batch_idx: int(orig_input_batch.num_tokens[batch_idx])
+                for batch_idx in beam_batch_indices
+            }
+            if hasattr(orig_input_batch, "num_tokens")
+            else None
+        ),
+        "request_output_token_ids": {
+            req_id: list(requests[req_id].output_token_ids) for req_id in beam_req_ids if req_id in requests
+        },
+    }
+
+
+def _restore_beam_runner_state(orig_input_batch, requests, snapshot) -> None:
+    if snapshot is None:
+        return
+
+    for batch_idx, saved in snapshot["token_ids_cpu"].items():
+        orig_input_batch.token_ids_cpu[batch_idx] = saved
+
+    saved_is_token_ids = snapshot.get("is_token_ids")
+    if saved_is_token_ids is not None:
+        is_token_ids = getattr(orig_input_batch, "is_token_ids", None)
+        if is_token_ids is not None:
+            for batch_idx, saved in saved_is_token_ids.items():
+                is_token_ids[batch_idx] = saved
+
+    for batch_idx, saved in snapshot["num_tokens_no_spec"].items():
+        orig_input_batch.num_tokens_no_spec[batch_idx] = saved
+
+    saved_num_tokens = snapshot.get("num_tokens")
+    if saved_num_tokens is not None and hasattr(orig_input_batch, "num_tokens"):
+        for batch_idx, saved in saved_num_tokens.items():
+            orig_input_batch.num_tokens[batch_idx] = saved
+
+    for req_id, saved in snapshot["request_output_token_ids"].items():
+        if req_id in requests:
+            requests[req_id].output_token_ids = list(saved)
+
+
+def _sampler_output_to_valid_token_lists(sampler_output) -> list[list[int]]:
+    if sampler_output is None or sampler_output.sampled_token_ids is None:
+        return []
+
+    sampled = sampler_output.sampled_token_ids
+    if sampled.ndim == 1:
+        sampled = sampled.unsqueeze(-1)
+
+    valid_sampled_token_ids: list[list[int]] = []
+    for row in sampled.tolist():
+        valid_sampled_token_ids.append([int(tok) for tok in row if int(tok) != -1])
+    return valid_sampled_token_ids
+
+
+def _beam_debug_enabled() -> bool:
+    return os.environ.get("VLLM_GR_BEAM_DEBUG", "0") == "1"
+
+
+def _log_beam_debug(message: str, *args: Any) -> None:
+    if not _beam_debug_enabled():
+        return
+
+    if args:
+        try:
+            rendered = message % args
+        except Exception:
+            rendered = " ".join([message, *[str(arg) for arg in args]])
+    else:
+        rendered = message
+
+    rendered = "[beam-debug] " + rendered
+    logger.warning(rendered)
+    try:
+        print(rendered, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _beam_trace_enabled() -> bool:
+    """Return whether verbose per-step beam trace logs are enabled."""
+    return os.environ.get("VLLM_GR_BEAM_TRACE", "0") == "1"
+
+
+def _log_beam_trace(message: str, *args: Any) -> None:
+    """Emit high-volume beam tracing only when explicitly requested."""
+    if not _beam_trace_enabled():
+        return
+    _log_beam_debug(message, *args)
+
+
 # ---------------------------------------------------------------------------
 # Factory functions (module-level so each captures its own original via
 # closure argument, avoiding late-binding bugs when patching multiple runners).
@@ -916,6 +1203,30 @@ def make_patched_execute_model(_orig_execute_model):
             self._current_beam_data = {}
             self._current_beam_info = None
             BEAM_DATA_VAR.reset(token)
+
+    return patched_execute_model
+
+
+def make_patched_execute_model_v2(_orig_execute_model):
+    """Wrap V2 ``execute_model`` without clearing beam state too early.
+
+    ModelRunner V2 splits execution into ``execute_model()`` and
+    ``sample_tokens()``. Unlike V1, sampling does not happen before
+    ``execute_model`` returns, so clearing ``_current_beam_data`` in the
+    execute-model wrapper drops the beam context before sampling/logprob
+    handling begins. Keep the context alive until the paired
+    ``sample_tokens()`` wrapper finishes.
+    """
+    from vllm_gr.v1.attention.backends.beam_attn import BEAM_DATA_VAR
+
+    @wraps(_orig_execute_model)
+    def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        self._current_beam_data = getattr(scheduler_output, "beam_data", {})
+        beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
+        token = BEAM_DATA_VAR.set(beam_info)
+        self._current_beam_info = beam_info
+        self._current_beam_var_token = token
+        return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     return patched_execute_model
 
@@ -965,10 +1276,17 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
         request_row_configs = scheduler_output._gr_request_row_configs
         orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
+        beam_state_snapshot = _snapshot_beam_runner_state(
+            orig_input_batch,
+            request_row_configs,
+            beam_data,
+            self.requests,
+        )
 
         try:
             res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
         finally:
+            _restore_beam_runner_state(orig_input_batch, self.requests, beam_state_snapshot)
             self.input_batch = orig_input_batch
 
         (
@@ -985,11 +1303,48 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
+        collapsed_logprobs_lists = None
+        if sampler_output is not None and sampler_output.logprobs_tensors is not None:
+            # After beam collapse we have exactly one flattened logprob row per
+            # logical request. The original cu_num_generated_tokens still
+            # describes the expanded per-beam sampler rows, so reusing it here
+            # makes downstream slice_request() index into the collapsed tensor
+            # with stale offsets and can attach another request's beam block.
+            collapsed_logprobs_lists = sampler_output.logprobs_tensors.tolists(list(range(n)))
+        collapsed_valid_sampled_token_ids = _sampler_output_to_valid_token_lists(sampler_output)
+        _log_beam_trace(
+            "gpu collapse reqs=%s rows=%s sampled_shape=%s logprobs_shape=%s cu_gen=%s",
+            collapsed_req_ids,
+            [cfg[2] for cfg in request_row_configs],
+            tuple(sampler_output.sampled_token_ids.shape)
+            if sampler_output is not None and sampler_output.sampled_token_ids is not None
+            else None,
+            tuple(sampler_output.logprobs_tensors.logprobs.shape)
+            if sampler_output is not None
+            and sampler_output.logprobs_tensors is not None
+            and sampler_output.logprobs_tensors.logprobs is not None
+            else None,
+            (
+                sampler_output.logprobs_tensors.cu_num_generated_tokens
+                if sampler_output is not None and sampler_output.logprobs_tensors is not None
+                else None
+            ),
+        )
+        if collapsed_logprobs_lists is not None:
+            _log_beam_trace(
+                "gpu collapsed lists token_ids_shape=%s logprobs_shape=%s ranks_shape=%s cu_gen=%s",
+                collapsed_logprobs_lists.logprob_token_ids.shape,
+                collapsed_logprobs_lists.logprobs.shape,
+                collapsed_logprobs_lists.sampled_token_ranks.shape,
+                collapsed_logprobs_lists.cu_num_generated_tokens,
+            )
 
         return (
             num_nans_in_logits,
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            collapsed_logprobs_lists,
+            collapsed_valid_sampled_token_ids
+            if collapsed_valid_sampled_token_ids
+            else [[] for _ in range(n)],
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,
@@ -997,6 +1352,150 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
         )
 
     return patched_bookkeeping_sync
+
+
+def make_patched_sample_gpu(_orig_sample):
+    """GPU ``sample`` wrapper for merged beam decode on vLLM 0.22.1.
+
+    vLLM 0.22.1 adds ``SamplerOutput.num_sampled`` and expects it to encode
+    the number of sampled logits rows per logical request. Beam remapping can
+    expand one logical request into multiple logits rows, so we derive
+    ``num_sampled`` from ``cu_num_logits`` when beam_data is active.
+    """
+
+    @wraps(_orig_sample)
+    def patched_sample(self, hidden_states, input_batch, grammar_output):
+        sampler_output, num_sampled, num_rejected = _orig_sample(
+            self, hidden_states, input_batch, grammar_output
+        )
+
+        beam_data = getattr(self, "_current_beam_data", {})
+        if not beam_data:
+            return sampler_output, num_sampled, num_rejected
+
+        request_row_configs = getattr(input_batch, "_gr_request_row_configs", None)
+        if request_row_configs is not None:
+            collapsed_req_ids, _collapsed_idx, n = _beam_collapse_bookkeeping(
+                self,
+                input_batch,
+                request_row_configs,
+                beam_data,
+                sampler_output,
+            )
+            per_req_num_sampled = getattr(
+                input_batch,
+                "_gr_num_sampled_per_req",
+                [1] * n,
+            )
+            logical_num_sampled = torch.tensor(
+                per_req_num_sampled,
+                dtype=num_sampled.dtype,
+                device=num_sampled.device,
+            )
+            sampler_output.num_sampled = logical_num_sampled
+            num_sampled = logical_num_sampled
+            num_rejected = torch.zeros_like(logical_num_sampled)
+            _log_beam_trace(
+                "gpu-v2 collapsed reqs=%s rows=%s sampled_shape=%s logprobs_shape=%s cu_gen=%s",
+                collapsed_req_ids,
+                [cfg[2] for cfg in request_row_configs],
+                tuple(sampler_output.sampled_token_ids.shape)
+                if sampler_output.sampled_token_ids is not None
+                else None,
+                tuple(sampler_output.logprobs_tensors.logprobs.shape)
+                if sampler_output.logprobs_tensors is not None
+                and sampler_output.logprobs_tensors.logprobs is not None
+                else None,
+                (
+                    sampler_output.logprobs_tensors.cu_num_generated_tokens
+                    if sampler_output.logprobs_tensors is not None
+                    else None
+                ),
+            )
+            return sampler_output, num_sampled, num_rejected
+
+        cu_num_logits = getattr(input_batch, "cu_num_logits", None)
+        if cu_num_logits is None or cu_num_logits.numel() <= 1:
+            return sampler_output, num_sampled, num_rejected
+
+        logical_num_sampled = (cu_num_logits[1:] - cu_num_logits[:-1]).to(
+            dtype=num_sampled.dtype, device=num_sampled.device
+        )
+        sampler_output.num_sampled = logical_num_sampled
+        num_sampled = logical_num_sampled
+        num_rejected = torch.zeros_like(logical_num_sampled)
+        return sampler_output, num_sampled, num_rejected
+
+    return patched_sample
+
+
+def make_patched_prepare_inputs_gpu_v2(_orig_prepare_inputs):
+    """GPU ModelRunner V2 ``prepare_inputs`` wrapper.
+
+    vLLM 0.22.1 can switch the GPU worker over to ModelRunner V2
+    (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``). The old GR beam patch
+    only targeted the V1 runner, which meant the real runtime path on newer
+    builds never published request ids to the beam attention context and never
+    emitted any beam-debug logs. Keep the patch narrow by reusing the existing
+    execute_model/sample wrappers and only bridging the request-id publication
+    point that moved from ``_prepare_inputs`` to ``prepare_inputs`` in V2.
+    """
+
+    @wraps(_orig_prepare_inputs)
+    def patched_prepare_inputs(self, scheduler_output, batch_desc):
+        input_batch = _orig_prepare_inputs(self, scheduler_output, batch_desc)
+
+        if getattr(self, "_current_beam_info", None) is not None:
+            self._current_beam_info["req_ids"] = input_batch.req_ids
+
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        if beam_data:
+            _beam_remap_inputs_v2(self, input_batch, scheduler_output)
+            _log_beam_trace(
+                "gpu-v2 prepare_inputs req_ids=%s beam_reqs=%s logits=%s cu=%s",
+                input_batch.req_ids,
+                list(beam_data.keys()),
+                input_batch.logits_indices,
+                input_batch.cu_num_logits_np.tolist(),
+            )
+
+        return input_batch
+
+    return patched_prepare_inputs
+
+
+def make_patched_sample_tokens_gpu_v2(_orig_sample_tokens):
+    """GPU ModelRunner V2 ``sample_tokens`` wrapper.
+
+    This wrapper is intentionally light-touch: it does not invent V2-specific
+    beam behavior, it only surfaces a positive signal that the actual 0.22.1
+    runtime path is executing under our GR beam patch so follow-up debugging and
+    any remaining fixes can target the correct runner.
+    """
+
+    @wraps(_orig_sample_tokens)
+    def patched_sample_tokens(self, grammar_output):
+        execute_model_state = getattr(self, "execute_model_state", None)
+        input_batch = getattr(execute_model_state, "input_batch", None)
+        if input_batch is not None and getattr(self, "_current_beam_data", {}):
+            _log_beam_trace(
+                "gpu-v2 sample_tokens req_ids=%s logits=%s",
+                getattr(input_batch, "req_ids", None),
+                getattr(input_batch, "logits_indices", None),
+            )
+        try:
+            return _orig_sample_tokens(self, grammar_output)
+        finally:
+            from vllm_gr.v1.attention.backends.beam_attn import BEAM_DATA_VAR
+
+            token = getattr(self, "_current_beam_var_token", None)
+            if token is not None:
+                BEAM_DATA_VAR.reset(token)
+                self._current_beam_var_token = None
+            self._current_beam_data = {}
+            self._current_beam_info = None
+
+    return patched_sample_tokens
 
 
 def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
@@ -1092,10 +1591,17 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
 
         request_row_configs = scheduler_output._gr_request_row_configs
         orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
+        beam_state_snapshot = _snapshot_beam_runner_state(
+            orig_input_batch,
+            request_row_configs,
+            beam_data,
+            self.requests,
+        )
 
         try:
             res = _orig_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
         finally:
+            _restore_beam_runner_state(orig_input_batch, self.requests, beam_state_snapshot)
             self.input_batch = orig_input_batch
 
         (
@@ -1111,10 +1617,47 @@ def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
         collapsed_req_ids, collapsed_idx, n = _beam_collapse_bookkeeping(
             self, orig_input_batch, request_row_configs, beam_data, sampler_output
         )
+        collapsed_logprobs_lists = None
+        if sampler_output is not None and sampler_output.logprobs_tensors is not None:
+            # After beam collapse we have exactly one flattened logprob row per
+            # logical request. The original cu_num_generated_tokens still
+            # describes the expanded per-beam sampler rows, so reusing it here
+            # makes downstream slice_request() index into the collapsed tensor
+            # with stale offsets and can attach another request's beam block.
+            collapsed_logprobs_lists = sampler_output.logprobs_tensors.tolists(list(range(n)))
+        collapsed_valid_sampled_token_ids = _sampler_output_to_valid_token_lists(sampler_output)
+        _log_beam_trace(
+            "npu collapse reqs=%s rows=%s sampled_shape=%s logprobs_shape=%s cu_gen=%s",
+            collapsed_req_ids,
+            [cfg[2] for cfg in request_row_configs],
+            tuple(sampler_output.sampled_token_ids.shape)
+            if sampler_output is not None and sampler_output.sampled_token_ids is not None
+            else None,
+            tuple(sampler_output.logprobs_tensors.logprobs.shape)
+            if sampler_output is not None
+            and sampler_output.logprobs_tensors is not None
+            and sampler_output.logprobs_tensors.logprobs is not None
+            else None,
+            (
+                sampler_output.logprobs_tensors.cu_num_generated_tokens
+                if sampler_output is not None and sampler_output.logprobs_tensors is not None
+                else None
+            ),
+        )
+        if collapsed_logprobs_lists is not None:
+            _log_beam_trace(
+                "npu collapsed lists token_ids_shape=%s logprobs_shape=%s ranks_shape=%s cu_gen=%s",
+                collapsed_logprobs_lists.logprob_token_ids.shape,
+                collapsed_logprobs_lists.logprobs.shape,
+                collapsed_logprobs_lists.sampled_token_ranks.shape,
+                collapsed_logprobs_lists.cu_num_generated_tokens,
+            )
 
         return (
-            [[] for _ in range(n)] if logprobs_lists is not None else None,
-            [[] for _ in range(n)],
+            collapsed_logprobs_lists,
+            collapsed_valid_sampled_token_ids
+            if collapsed_valid_sampled_token_ids
+            else [[] for _ in range(n)],
             prompt_logprobs_dict,
             collapsed_req_ids,
             collapsed_idx,
@@ -1128,11 +1671,18 @@ def apply_worker_patches():
     """Applies runtime overrides onto GPUModelRunner and NPUModelRunner execution entries."""
     from vllm_gr.utils.npu_adapter import is_npu_available
 
+    _log_beam_debug("apply_worker_patches called")
+
     try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
     except ImportError:
         logger.warning("Failed to import GPUModelRunner segments, skipping GPU patches.")
-        GPUModelRunner = None
+        GPUModelRunnerV1 = None
+
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+    except ImportError:
+        GPUModelRunnerV2 = None
 
     npu_available = is_npu_available()
     if npu_available:
@@ -1160,36 +1710,56 @@ def apply_worker_patches():
         NPUModelRunner = None
 
     # Return early if nothing to patch
-    if GPUModelRunner is None and NPUModelRunner is None:
+    if GPUModelRunnerV1 is None and GPUModelRunnerV2 is None and NPUModelRunner is None:
         logger.warning("No supported model runner found for patching.")
         return
 
     # Track which runners have already been patched
     runners_to_patch = []
-    if GPUModelRunner is not None and not getattr(
-        GPUModelRunner, "_patched_for_beam_pos_ids", False
+    if GPUModelRunnerV1 is not None and not getattr(
+        GPUModelRunnerV1, "_patched_for_beam_pos_ids", False
     ):
-        runners_to_patch.append(("GPUModelRunner", GPUModelRunner))
+        runners_to_patch.append(("GPUModelRunnerV1", GPUModelRunnerV1))
+    if GPUModelRunnerV2 is not None and not getattr(
+        GPUModelRunnerV2, "_patched_for_beam_pos_ids", False
+    ):
+        runners_to_patch.append(("GPUModelRunnerV2", GPUModelRunnerV2))
     if NPUModelRunner is not None and not getattr(
         NPUModelRunner, "_patched_for_beam_pos_ids", False
     ):
         runners_to_patch.append(("NPUModelRunner", NPUModelRunner))
 
     if not runners_to_patch:
+        _log_beam_debug("apply_worker_patches found no new runners to patch")
         return
 
     # Apply patches to each runner
     for runner_name, runner_class in runners_to_patch:
-        runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
-
-        if runner_name == "GPUModelRunner":
+        if runner_name == "GPUModelRunnerV1":
+            runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
             runner_class._prepare_inputs = make_patched_prepare_inputs_gpu(
                 runner_class._prepare_inputs
             )
+            if hasattr(runner_class, "sample"):
+                runner_class.sample = make_patched_sample_gpu(runner_class.sample)
+            elif hasattr(runner_class, "_sample"):
+                runner_class._sample = make_patched_sample_gpu(runner_class._sample)
             runner_class._bookkeeping_sync = make_patched_bookkeeping_sync_gpu(
                 runner_class._bookkeeping_sync
             )
+        elif runner_name == "GPUModelRunnerV2":
+            runner_class.execute_model = make_patched_execute_model_v2(
+                runner_class.execute_model
+            )
+            runner_class.prepare_inputs = make_patched_prepare_inputs_gpu_v2(
+                runner_class.prepare_inputs
+            )
+            runner_class.sample = make_patched_sample_gpu(runner_class.sample)
+            runner_class.sample_tokens = make_patched_sample_tokens_gpu_v2(
+                runner_class.sample_tokens
+            )
         elif runner_name == "NPUModelRunner":
+            runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
             runner_class._prepare_inputs = make_patched_prepare_inputs_npu(
                 runner_class._prepare_inputs
             )
@@ -1199,3 +1769,4 @@ def apply_worker_patches():
 
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)
+        _log_beam_debug("%s hooks patched successfully", runner_name)

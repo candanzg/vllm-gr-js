@@ -470,10 +470,9 @@ async def beam_search(
                 raw_ranks = getattr(flat, "ranks", None)
                 raw_decoded = getattr(flat, "decoded_tokens", None)
                 total_logprobs = len(raw_token_ids)
-
+                # Each logical beam block should extract its top choices natively
                 stride_k = total_logprobs // logprobs_num
 
-                # Each logical beam block should extract its top choices natively
                 for b_idx in range(len(fork_info)):
                     current_beam = all_beams[b_idx]
 

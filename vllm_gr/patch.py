@@ -18,6 +18,7 @@ The previous ``_apply_gr_core_patches`` that replaced vLLM core types
 variants has been removed together with the recommend runtime.
 """
 
+import asyncio
 import importlib
 import logging
 import math
@@ -39,6 +40,24 @@ _ASCEND_CONFIG_DATA_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend
 _ASCEND_MOONCAKE_MODULE = f"{_ASCEND_BACKEND_PACKAGE}.mooncake_backend"
 _ASCEND_YUANRONG_MODULE = f"{_ASCEND_BACKEND_PACKAGE}.yuanrong_backend"
 _LOCAL_YUANRONG_BACKEND_MODULE = "vllm_gr.distributed.kv_transfer.kv_pool.backend.yuanrong_backend"
+
+
+def _ensure_uvloop_importable() -> None:
+    """Provide a minimal uvloop shim for environments without uvloop.
+
+    Several vLLM 0.22.1 import paths used by GR beam patching import
+    ``uvloop`` unconditionally, even for offline paths that ultimately only
+    need a ``run(...)`` entrypoint. The benchmark-specific fallback in
+    OpenOneRec is too narrow for ``one_rec_acc_test.py`` because runtime patch
+    application happens through ``vllm_gr.patch`` before those benchmark
+    modules necessarily import the shim. Mirror the old behavior here so beam
+    runtime patches can still be installed in minimal CI / dev environments.
+    """
+
+    try:
+        import uvloop  # noqa: F401
+    except ModuleNotFoundError:
+        sys.modules["uvloop"] = types.SimpleNamespace(run=asyncio.run)
 
 
 def _is_npu_platform() -> bool:
@@ -347,6 +366,8 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     if _GR_BEAM_PATCHES_APPLIED and not force:
         return 0
+
+    _ensure_uvloop_importable()
 
     patch_count = _register_custom_attention_backend(force=force)
 

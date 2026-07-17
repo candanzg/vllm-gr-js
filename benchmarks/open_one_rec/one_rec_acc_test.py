@@ -238,6 +238,13 @@ def main():
     # 1. Load Configuration
     if args.gr:
         logger.info("Detected --gr flag, enabling vllm-gr mode for accuracy test.")
+        # one_rec_main.py explicitly reapplies runtime patches before entering
+        # the vLLM CLI path. The offline accuracy entrypoint constructs GRLLM
+        # directly, so it must do the same here; otherwise the real EngineCore /
+        # worker beam patches are never installed for this process.
+        from vllm_gr.patch import re_apply_patches
+
+        re_apply_patches()
 
     if args.task_type not in TASK_REGISTRY:
         print(f"Task {args.task_type} not found in configuration.")
@@ -339,8 +346,8 @@ def main():
         # Normalize beam_search outputs to match MockRequestOutput format
         outputs = []
         for i, raw_output in enumerate(raw_offline_outputs):
-            # beam_search returns BeamSearchOutput with .outputs containing BeamSearchSequence objects
-            # Each BeamSearchSequence has .text attribute
+            # beam_search returns BeamSearchOutput with .sequences containing
+            # BeamSearchSequence objects.
             mock_completions = []
             if hasattr(raw_output, "sequences"):
                 for beam_seq in raw_output.sequences:
@@ -352,6 +359,14 @@ def main():
             else:
                 # Fallback if format is different
                 mock_completions.append(MockCompletionOutput(str(raw_output)))
+
+            if not mock_completions:
+                logger.warning(
+                    "Beam search returned no sequences for prompt index %d; "
+                    "falling back to an empty completion to keep evaluation running.",
+                    i,
+                )
+                mock_completions.append(MockCompletionOutput(""))
 
             outputs.append(MockRequestOutput(prompts[i], mock_completions))
 
