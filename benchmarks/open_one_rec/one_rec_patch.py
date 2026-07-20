@@ -2,6 +2,7 @@ import atexit
 import json
 import logging
 import os
+import threading
 import sys
 import time
 import traceback
@@ -48,6 +49,26 @@ logger.setLevel(logging.INFO)
 HTTP_OK = 200
 DATASET_NAME = "onerec"
 DEFAULT_TASK_TYPES = "ad,product,label_cond,video,interactive,label_pred"
+CLIENT_STREAM_PROFILE_ENABLED = os.environ.get("VLLM_GR_CLIENT_STREAM_PROFILE", "1") != "0"
+SERVER_PERF_HEADERS = {
+    "server_entry_to_route_ms": "X-VLLM-Perf-Server-Entry-To-Route-Ms",
+    "server_handler_preprocess_ms": "X-VLLM-Perf-Server-Handler-Preprocess-Ms",
+    "server_route_wrapper_ms": "X-VLLM-Perf-Server-Route-Wrapper-Ms",
+    "server_route_return_to_http_start_ms": "X-VLLM-Perf-Server-Route-Return-To-Http-Start-Ms",
+    "server_entry_to_http_start_ms": "X-VLLM-Perf-Server-Entry-To-Http-Start-Ms",
+    "server_chat_check_model_ms": "X-VLLM-Perf-Server-Chat-Check-Model-Ms",
+    "server_chat_get_adapters_ms": "X-VLLM-Perf-Server-Chat-Get-Adapters-Ms",
+    "server_chat_get_tokenizer_ms": "X-VLLM-Perf-Server-Chat-Get-Tokenizer-Ms",
+    "server_chat_tool_setup_ms": "X-VLLM-Perf-Server-Chat-Tool-Setup-Ms",
+    "server_chat_validate_template_ms": "X-VLLM-Perf-Server-Chat-Validate-Template-Ms",
+    "server_chat_preprocess_chat_ms": "X-VLLM-Perf-Server-Chat-Preprocess-Chat-Ms",
+    "server_chat_build_request_id_ms": "X-VLLM-Perf-Server-Chat-Build-Request-Id-Ms",
+    "server_chat_sampling_params_ms": "X-VLLM-Perf-Server-Chat-Sampling-Params-Ms",
+    "server_chat_trace_headers_ms": "X-VLLM-Perf-Server-Chat-Trace-Headers-Ms",
+    "server_chat_generator_setup_ms": "X-VLLM-Perf-Server-Chat-Generator-Setup-Ms",
+}
+_CLIENT_STREAM_LOCK = threading.Lock()
+_CLIENT_STREAM_PROFILES: list[dict[str, float | int | str | None]] = []
 
 
 # ============================================================================
@@ -123,6 +144,196 @@ def _print_beam_search_delta(before: dict, after: dict):
     print(f"Avg Sort Time (ms):                      {avg_sort * 1000:.3f}")
     print(f"Total Beam Time (ms):                    {total * 1000:.2f}")
     print(f"Beam Search Requests:                    {int(num)}")
+    print("=" * 50)
+
+
+def _record_client_stream_profile(profile: dict[str, float | int | str | None]) -> None:
+    if not CLIENT_STREAM_PROFILE_ENABLED:
+        return
+    with _CLIENT_STREAM_LOCK:
+        _CLIENT_STREAM_PROFILES.append(profile)
+
+
+def _snapshot_client_stream_profiles() -> list[dict[str, float | int | str | None]]:
+    with _CLIENT_STREAM_LOCK:
+        return list(_CLIENT_STREAM_PROFILES)
+
+
+def _reset_client_stream_profiles() -> None:
+    with _CLIENT_STREAM_LOCK:
+        _CLIENT_STREAM_PROFILES.clear()
+
+
+def _mean_metric_ms(
+    profiles: list[dict[str, float | int | str | None]],
+    key: str,
+) -> float | None:
+    values = [
+        float(value)
+        for profile in profiles
+        if (value := profile.get(key)) is not None
+    ]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _parse_float_header(headers, key: str) -> float | None:
+    value = headers.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _client_stream_profile_summary() -> dict[str, float | int] | None:
+    profiles = _snapshot_client_stream_profiles()
+    if not profiles:
+        return None
+
+    with_beam = [profile for profile in profiles if profile.get("beam_total_ms") is not None]
+    if not with_beam:
+        return None
+
+    summary: dict[str, float | int] = {
+        "requests": len(with_beam),
+    }
+    for key in (
+        "beam_total_ms",
+        "beam_prefill_ms",
+        "beam_decode_ms",
+        "beam_sort_ms",
+        "request_to_headers_ms",
+        "server_entry_to_route_ms",
+        "server_handler_preprocess_ms",
+        "server_route_wrapper_ms",
+        "server_route_return_to_http_start_ms",
+        "server_entry_to_http_start_ms",
+        "server_chat_check_model_ms",
+        "server_chat_get_adapters_ms",
+        "server_chat_get_tokenizer_ms",
+        "server_chat_tool_setup_ms",
+        "server_chat_validate_template_ms",
+        "server_chat_preprocess_chat_ms",
+        "server_chat_build_request_id_ms",
+        "server_chat_sampling_params_ms",
+        "server_chat_trace_headers_ms",
+        "server_chat_generator_setup_ms",
+        "client_headers_residual_ms",
+        "headers_to_first_chunk_ms",
+        "first_chunk_to_first_visible_ms",
+        "first_visible_to_first_content_ms",
+        "first_content_to_last_choice_ms",
+        "last_choice_to_usage_ms",
+        "ttft_minus_beam_ms",
+        "tail_visible_ms",
+        "e2el_minus_beam_ms",
+        "first_visible_json_parse_ms",
+        "usage_json_parse_ms",
+        "json_parse_total_ms",
+    ):
+        value = _mean_metric_ms(with_beam, key)
+        if value is not None:
+            summary[key] = round(value, 3)
+
+    preprocess_split_keys = (
+        "server_chat_check_model_ms",
+        "server_chat_get_adapters_ms",
+        "server_chat_get_tokenizer_ms",
+        "server_chat_tool_setup_ms",
+        "server_chat_validate_template_ms",
+        "server_chat_preprocess_chat_ms",
+        "server_chat_build_request_id_ms",
+        "server_chat_sampling_params_ms",
+        "server_chat_trace_headers_ms",
+        "server_chat_generator_setup_ms",
+    )
+    if "server_handler_preprocess_ms" in summary:
+        split_total = sum(float(summary.get(key, 0.0)) for key in preprocess_split_keys)
+        summary["server_chat_preprocess_split_total_ms"] = round(split_total, 3)
+        summary["server_chat_preprocess_residual_ms"] = round(
+            max(0.0, float(summary["server_handler_preprocess_ms"]) - split_total),
+            3,
+        )
+    return summary
+
+
+def _print_client_stream_profile_summary() -> None:
+    summary = _client_stream_profile_summary()
+    if not summary:
+        return
+
+    print("----------- Client Stream Overhead ------------")
+    print(f"Profiled requests:                       {summary['requests']}")
+    for label, key in (
+        ("Avg Beam Total (ms):", "beam_total_ms"),
+        ("Avg Beam Prefill (ms):", "beam_prefill_ms"),
+        ("Avg Beam Decode (ms):", "beam_decode_ms"),
+        ("Avg Beam Sort (ms):", "beam_sort_ms"),
+        ("Avg TTFT - Beam (ms):", "ttft_minus_beam_ms"),
+        ("Avg E2EL - TTFT (ms):", "tail_visible_ms"),
+        ("Avg E2EL - Beam (ms):", "e2el_minus_beam_ms"),
+    ):
+        value = summary.get(key)
+        if value is not None:
+            print(f"{label:<40} {value:>10.3f}")
+
+    print("------ Pre-first-visible receive path --------")
+    for label, key in (
+        ("Request -> response headers (ms):", "request_to_headers_ms"),
+        ("Server entry -> route start (ms):", "server_entry_to_route_ms"),
+        ("Server handler preprocess (ms):", "server_handler_preprocess_ms"),
+        ("Server route wrapper (ms):", "server_route_wrapper_ms"),
+        ("Route return -> http.start (ms):", "server_route_return_to_http_start_ms"),
+        ("Server entry -> http.start (ms):", "server_entry_to_http_start_ms"),
+        ("Client/network residual to headers (ms):", "client_headers_residual_ms"),
+        ("Headers -> first chunk (ms):", "headers_to_first_chunk_ms"),
+        ("First chunk -> first visible (ms):", "first_chunk_to_first_visible_ms"),
+    ):
+        value = summary.get(key)
+        if value is not None:
+            print(f"{label:<40} {value:>10.3f}")
+
+    print("---- Server handler preprocess split -----")
+    for label, key in (
+        ("check_model (ms):", "server_chat_check_model_ms"),
+        ("get_adapters (ms):", "server_chat_get_adapters_ms"),
+        ("get_tokenizer (ms):", "server_chat_get_tokenizer_ms"),
+        ("tool_setup (ms):", "server_chat_tool_setup_ms"),
+        ("validate_template (ms):", "server_chat_validate_template_ms"),
+        ("preprocess_chat (ms):", "server_chat_preprocess_chat_ms"),
+        ("build_request_id (ms):", "server_chat_build_request_id_ms"),
+        ("sampling_params (ms):", "server_chat_sampling_params_ms"),
+        ("trace_headers (ms):", "server_chat_trace_headers_ms"),
+        ("generator_setup (ms):", "server_chat_generator_setup_ms"),
+        ("split total (ms):", "server_chat_preprocess_split_total_ms"),
+        ("preprocess residual (ms):", "server_chat_preprocess_residual_ms"),
+    ):
+        value = summary.get(key)
+        if value is not None:
+            print(f"{label:<40} {value:>10.3f}")
+
+    print("------ Post-first-visible receive path -------")
+    for label, key in (
+        ("First visible -> first content (ms):", "first_visible_to_first_content_ms"),
+        ("First content -> last content (ms):", "first_content_to_last_choice_ms"),
+        ("Last content -> usage/final (ms):", "last_choice_to_usage_ms"),
+    ):
+        value = summary.get(key)
+        if value is not None:
+            print(f"{label:<40} {value:>10.3f}")
+
+    print("----- Client parse CPU (excluded by E2EL) ----")
+    for label, key in (
+        ("First visible JSON parse (ms):", "first_visible_json_parse_ms"),
+        ("Usage JSON parse (ms):", "usage_json_parse_ms"),
+        ("All JSON parse total (ms):", "json_parse_total_ms"),
+    ):
+        value = summary.get(key)
+        if value is not None:
+            print(f"{label:<40} {value:>10.3f}")
     print("=" * 50)
 
 
@@ -263,14 +474,33 @@ async def patched_async_request_openai_chat_completions(
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
+    response_headers_ts = None
+    first_nonempty_chunk_ts = None
+    first_visible_ts = None
+    first_content_ts = None
+    last_choice_ts = None
+    usage_ts = None
+    first_visible_json_parse_ms = 0.0
+    usage_json_parse_ms = 0.0
+    json_parse_total_ms = 0.0
+    beam_perf: dict[str, float] = {}
+    server_header_perf: dict[str, float] = {}
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
+            response_headers_ts = time.perf_counter()
+            for perf_key, header_name in SERVER_PERF_HEADERS.items():
+                perf_value = _parse_float_header(response.headers, header_name)
+                if perf_value is not None:
+                    server_header_perf[perf_key] = perf_value
             if response.status == HTTP_OK:
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
+                    chunk_arrival_ts = time.perf_counter()
                     chunk_bytes = chunk_bytes.strip()
                     if not chunk_bytes:
                         continue
+                    if first_nonempty_chunk_ts is None:
+                        first_nonempty_chunk_ts = chunk_arrival_ts
 
                     messages = handler.add_chunk(chunk_bytes)
                     for message in messages:
@@ -283,13 +513,19 @@ async def patched_async_request_openai_chat_completions(
                         chunk = message.removeprefix("data: ")
 
                         if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
+                            timestamp = chunk_arrival_ts
+                            parse_start = time.perf_counter()
                             data = json.loads(chunk)
+                            parse_ms = (time.perf_counter() - parse_start) * 1000.0
+                            json_parse_total_ms += parse_ms
 
                             if choices := data.get("choices"):
                                 delta = choices[0]["delta"]
                                 content = delta.get("content")
                                 reasoning_content = delta.get("reasoning_content")
+                                if first_visible_ts is None:
+                                    first_visible_ts = timestamp
+                                    first_visible_json_parse_ms = parse_ms
                                 # First token
                                 if ttft == 0.0:
                                     ttft = timestamp - st
@@ -299,12 +535,24 @@ async def patched_async_request_openai_chat_completions(
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
 
+                                if (content or reasoning_content) and first_content_ts is None:
+                                    first_content_ts = timestamp
                                 if reasoning_content:
                                     generated_text += reasoning_content
                                 if content:
                                     generated_text += content
+                                last_choice_ts = timestamp
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                usage_ts = timestamp
+                                usage_json_parse_ms = parse_ms
+
+                            if isinstance(data.get("vllm_xperf"), dict):
+                                for perf_key, perf_value in data["vllm_xperf"].items():
+                                    try:
+                                        beam_perf[perf_key] = float(perf_value)
+                                    except (TypeError, ValueError):
+                                        continue
 
                             most_recent_timestamp = timestamp
 
@@ -321,6 +569,100 @@ async def patched_async_request_openai_chat_completions(
 
     if pbar:
         pbar.update(1)
+
+    if request_func_input.request_id and output.success:
+        beam_total_ms = beam_perf.get("beam_total_ms")
+        tail_visible_ms = max(0.0, (output.latency - output.ttft) * 1000.0)
+        profile = {
+            "request_id": request_func_input.request_id,
+            "beam_total_ms": beam_total_ms,
+            "beam_prefill_ms": beam_perf.get("beam_prefill_ms"),
+            "beam_decode_ms": beam_perf.get("beam_decode_ms"),
+            "beam_sort_ms": beam_perf.get("beam_sort_ms"),
+            "request_to_headers_ms": (
+                max(0.0, (response_headers_ts - st) * 1000.0) if response_headers_ts else None
+            ),
+            "server_entry_to_route_ms": server_header_perf.get("server_entry_to_route_ms"),
+            "server_handler_preprocess_ms": server_header_perf.get("server_handler_preprocess_ms"),
+            "server_route_wrapper_ms": server_header_perf.get("server_route_wrapper_ms"),
+            "server_route_return_to_http_start_ms": server_header_perf.get(
+                "server_route_return_to_http_start_ms"
+            ),
+            "server_entry_to_http_start_ms": server_header_perf.get("server_entry_to_http_start_ms"),
+            "server_chat_check_model_ms": server_header_perf.get("server_chat_check_model_ms"),
+            "server_chat_get_adapters_ms": server_header_perf.get("server_chat_get_adapters_ms"),
+            "server_chat_get_tokenizer_ms": server_header_perf.get("server_chat_get_tokenizer_ms"),
+            "server_chat_tool_setup_ms": server_header_perf.get("server_chat_tool_setup_ms"),
+            "server_chat_validate_template_ms": server_header_perf.get(
+                "server_chat_validate_template_ms"
+            ),
+            "server_chat_preprocess_chat_ms": server_header_perf.get(
+                "server_chat_preprocess_chat_ms"
+            ),
+            "server_chat_build_request_id_ms": server_header_perf.get(
+                "server_chat_build_request_id_ms"
+            ),
+            "server_chat_sampling_params_ms": server_header_perf.get(
+                "server_chat_sampling_params_ms"
+            ),
+            "server_chat_trace_headers_ms": server_header_perf.get(
+                "server_chat_trace_headers_ms"
+            ),
+            "server_chat_generator_setup_ms": server_header_perf.get(
+                "server_chat_generator_setup_ms"
+            ),
+            "client_headers_residual_ms": (
+                max(
+                    0.0,
+                    (response_headers_ts - st) * 1000.0
+                    - server_header_perf["server_entry_to_http_start_ms"],
+                )
+                if response_headers_ts
+                and server_header_perf.get("server_entry_to_http_start_ms") is not None
+                else None
+            ),
+            "headers_to_first_chunk_ms": (
+                max(0.0, (first_nonempty_chunk_ts - response_headers_ts) * 1000.0)
+                if first_nonempty_chunk_ts is not None and response_headers_ts is not None
+                else None
+            ),
+            "first_chunk_to_first_visible_ms": (
+                max(0.0, (first_visible_ts - first_nonempty_chunk_ts) * 1000.0)
+                if first_visible_ts is not None and first_nonempty_chunk_ts is not None
+                else None
+            ),
+            "first_visible_to_first_content_ms": (
+                max(0.0, (first_content_ts - first_visible_ts) * 1000.0)
+                if first_visible_ts is not None and first_content_ts is not None
+                else None
+            ),
+            "first_content_to_last_choice_ms": (
+                max(0.0, (last_choice_ts - first_content_ts) * 1000.0)
+                if first_content_ts is not None and last_choice_ts is not None
+                else None
+            ),
+            "last_choice_to_usage_ms": (
+                max(0.0, (usage_ts - last_choice_ts) * 1000.0)
+                if usage_ts is not None and last_choice_ts is not None
+                else None
+            ),
+            "ttft_minus_beam_ms": (
+                max(0.0, output.ttft * 1000.0 - beam_total_ms)
+                if beam_total_ms is not None
+                else None
+            ),
+            "tail_visible_ms": tail_visible_ms,
+            "e2el_minus_beam_ms": (
+                max(0.0, output.latency * 1000.0 - beam_total_ms)
+                if beam_total_ms is not None
+                else None
+            ),
+            "first_visible_json_parse_ms": first_visible_json_parse_ms,
+            "usage_json_parse_ms": usage_json_parse_ms,
+            "json_parse_total_ms": json_parse_total_ms,
+        }
+        _record_client_stream_profile(profile)
+
     return output
 
 
@@ -637,6 +979,13 @@ def patched_serve_main(args):
     if is_beam_search and metrics_url:
         metrics_after = _fetch_prometheus_metrics(metrics_url)
         _print_beam_search_delta(metrics_before, metrics_after)
+
+    if CLIENT_STREAM_PROFILE_ENABLED:
+        _print_client_stream_profile_summary()
+        if isinstance(result, dict):
+            summary = _client_stream_profile_summary()
+            if summary is not None:
+                result["client_stream_profile"] = summary
 
     return result
 

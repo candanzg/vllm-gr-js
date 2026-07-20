@@ -10,6 +10,7 @@ from functools import partial
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
 from vllm.v1.engine import (
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -30,146 +31,150 @@ def _cache_beam_request(self, request) -> None:
 
     Thread-safe: uses beam_cache_lock to prevent data races.
     """
-    with self.beam_cache_lock:
-        self.beam_cache[request.request_id] = {
-            "all_token_ids": list(request._all_token_ids),
-            "block_hashes": list(request.block_hashes),
-            "eos_token_id": request.eos_token_id,
-            "lora_request": request.lora_request,
-            "cache_salt": request.cache_salt,
-            "mm_features": request.mm_features,
-            "prompt_embeds": request.prompt_embeds,
-            "num_prompt_tokens": request.num_prompt_tokens,
-        }
+    with function_profile("vllm_gr.v1.engine.core", "_cache_beam_request"):
+        with self.beam_cache_lock:
+            self.beam_cache[request.request_id] = {
+                "all_token_ids": list(request._all_token_ids),
+                "block_hashes": list(request.block_hashes),
+                "eos_token_id": request.eos_token_id,
+                "lora_request": request.lora_request,
+                "cache_salt": request.cache_salt,
+                "mm_features": request.mm_features,
+                "prompt_embeds": request.prompt_embeds,
+                "num_prompt_tokens": request.num_prompt_tokens,
+            }
 
 
 def _handle_beam_request_step_update(self, update) -> None:
     """Apply a grouped step update using only the prefill cache entry."""
     from vllm.v1.request import Request
 
-    session_id = update.session_id
-    beam_width = update.beam_width
+    with function_profile(
+        "vllm_gr.v1.engine.core", "_handle_beam_request_step_update"
+    ):
+        session_id = update.session_id
+        beam_width = update.beam_width
 
-    # Clear the session completely upon generation termination / cleanup message
-    if beam_width == 0:
+        # Clear the session completely upon generation termination / cleanup message
+        if beam_width == 0:
+            with self.beam_cache_lock:
+                self.beam_cache.pop(session_id, None)
+
+            # We MUST abort the running beam-request session_id itself!
+            self.aborts_queue.put_nowait(session_id)
+            if update.pruned_ids:
+                for abort_id in update.pruned_ids:
+                    self.aborts_queue.put_nowait(abort_id)
+            return
+
+        # Validate parallel arrays
+        if (
+            len(update.beam_tokens) != beam_width
+            or len(update.parent_beam_ids) != beam_width
+            or len(update.child_beam_ids) != beam_width
+        ):
+            logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
+            for child_id in update.child_beam_ids:
+                self.output_queue.put_nowait(
+                    (
+                        update.client_index,
+                        EngineCoreOutputs(
+                            engine_index=self.engine_index,
+                            finished_requests={child_id},
+                            outputs=[
+                                EngineCoreOutput(
+                                    request_id=child_id,
+                                    new_token_ids=[],
+                                    finish_reason=FinishReason.ERROR,
+                                )
+                            ],
+                        ),
+                    )
+                )
+            return
+
+        # Fetch the shared prefill cache entry
         with self.beam_cache_lock:
-            self.beam_cache.pop(session_id, None)
+            session_cached = self.beam_cache.get(session_id)
 
-        # We MUST abort the running beam-request session_id itself!
-        self.aborts_queue.put_nowait(session_id)
+        if session_cached is None and update.beam_width > 0:
+            logger.error("BEAM_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
+            for child_id in update.child_beam_ids:
+                self.output_queue.put_nowait(
+                    (
+                        update.client_index,
+                        EngineCoreOutputs(
+                            engine_index=self.engine_index,
+                            finished_requests={child_id},
+                            outputs=[
+                                EngineCoreOutput(
+                                    request_id=child_id,
+                                    new_token_ids=[],
+                                    finish_reason=FinishReason.ERROR,
+                                )
+                            ],
+                        ),
+                    )
+                )
+            return
+
+        arrival = time.time()
+        inputs_to_push = []
+
+        prefill_tokens = session_cached["all_token_ids"]
+        prefill_block_hashes = list(session_cached["block_hashes"])
+        lora_request = session_cached["lora_request"]
+        cache_salt = session_cached["cache_salt"]
+        mm_features = session_cached["mm_features"]
+        prompt_embeds = session_cached["prompt_embeds"]
+        eos = session_cached["eos_token_id"]
+
+        # Pack the shared prefill and all beam suffixes into a single contiguous Beam Request
+        beam_token_ids = list(prefill_tokens)
+        decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
+        assert all(len(t) == decode_steps for t in update.beam_tokens)
+        for gen_tokens in update.beam_tokens:
+            beam_token_ids.extend(gen_tokens)
+
+        req = Request(
+            request_id=session_id,  # Single request ID representing all beams
+            prompt_token_ids=beam_token_ids,
+            sampling_params=update.sampling_params,
+            pooling_params=None,
+            eos_token_id=(update.eos_token_id if update.eos_token_id is not None else eos),
+            client_index=update.client_index,
+            arrival_time=arrival,
+            lora_request=(update.lora_request or lora_request),
+            cache_salt=update.cache_salt or cache_salt,
+            priority=update.priority,
+            trace_headers=update.trace_headers,
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+            block_hasher=None,
+        )
+
+        # Start with the prefill block hashes; block_hasher extends it incrementally
+        req.block_hashes = prefill_block_hashes
+        if self.request_block_hasher is not None:
+            req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
+            req.block_hashes.extend(req.get_hash_new_full_blocks())
+
+        # Metadata Enrichment
+        req.is_beam = True
+        req.beam_width = beam_width
+        req.is_beam_decode = True  # Flag indicating it's the decode stage
+        req.beam_decode_steps = decode_steps
+        req.prefix_len = update.prefix_len
+
+        inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
+
+        # Non-blocking concurrent queue pushes
+        for item in inputs_to_push:
+            self.input_queue.put_nowait(item)
+
         if update.pruned_ids:
             for abort_id in update.pruned_ids:
                 self.aborts_queue.put_nowait(abort_id)
-        return
-
-    # Validate parallel arrays
-    if (
-        len(update.beam_tokens) != beam_width
-        or len(update.parent_beam_ids) != beam_width
-        or len(update.child_beam_ids) != beam_width
-    ):
-        logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
-        for child_id in update.child_beam_ids:
-            self.output_queue.put_nowait(
-                (
-                    update.client_index,
-                    EngineCoreOutputs(
-                        engine_index=self.engine_index,
-                        finished_requests={child_id},
-                        outputs=[
-                            EngineCoreOutput(
-                                request_id=child_id,
-                                new_token_ids=[],
-                                finish_reason=FinishReason.ERROR,
-                            )
-                        ],
-                    ),
-                )
-            )
-        return
-
-    # Fetch the shared prefill cache entry
-    with self.beam_cache_lock:
-        session_cached = self.beam_cache.get(session_id)
-
-    if session_cached is None and update.beam_width > 0:
-        logger.error("BEAM_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
-        for child_id in update.child_beam_ids:
-            self.output_queue.put_nowait(
-                (
-                    update.client_index,
-                    EngineCoreOutputs(
-                        engine_index=self.engine_index,
-                        finished_requests={child_id},
-                        outputs=[
-                            EngineCoreOutput(
-                                request_id=child_id,
-                                new_token_ids=[],
-                                finish_reason=FinishReason.ERROR,
-                            )
-                        ],
-                    ),
-                )
-            )
-        return
-
-    arrival = time.time()
-    inputs_to_push = []
-
-    prefill_tokens = session_cached["all_token_ids"]
-    prefill_block_hashes = list(session_cached["block_hashes"])
-    lora_request = session_cached["lora_request"]
-    cache_salt = session_cached["cache_salt"]
-    mm_features = session_cached["mm_features"]
-    prompt_embeds = session_cached["prompt_embeds"]
-    eos = session_cached["eos_token_id"]
-
-    # Pack the shared prefill and all beam suffixes into a single contiguous Beam Request
-    beam_token_ids = list(prefill_tokens)
-    decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
-    assert all(len(t) == decode_steps for t in update.beam_tokens)
-    for gen_tokens in update.beam_tokens:
-        beam_token_ids.extend(gen_tokens)
-
-    req = Request(
-        request_id=session_id,  # Single request ID representing all beams
-        prompt_token_ids=beam_token_ids,
-        sampling_params=update.sampling_params,
-        pooling_params=None,
-        eos_token_id=(update.eos_token_id if update.eos_token_id is not None else eos),
-        client_index=update.client_index,
-        arrival_time=arrival,
-        lora_request=(update.lora_request or lora_request),
-        cache_salt=update.cache_salt or cache_salt,
-        priority=update.priority,
-        trace_headers=update.trace_headers,
-        prompt_embeds=prompt_embeds,
-        mm_features=mm_features,
-        block_hasher=None,
-    )
-
-    # Start with the prefill block hashes; block_hasher extends it incrementally
-    req.block_hashes = prefill_block_hashes
-    if self.request_block_hasher is not None:
-        req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
-        req.block_hashes.extend(req.get_hash_new_full_blocks())
-
-    # Metadata Enrichment
-    req.is_beam = True
-    req.beam_width = beam_width
-    req.is_beam_decode = True  # Flag indicating it's the decode stage
-    req.beam_decode_steps = decode_steps
-    req.prefix_len = update.prefix_len
-
-    inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
-
-    # Non-blocking concurrent queue pushes
-    for item in inputs_to_push:
-        self.input_queue.put_nowait(item)
-
-    if update.pruned_ids:
-        for abort_id in update.pruned_ids:
-            self.aborts_queue.put_nowait(abort_id)
 
 
 # ---------------------------------------------------------------------------
@@ -242,27 +247,51 @@ def process_input_sockets(
 
                 request: Any
                 if request_type == EngineCoreRequestType.ADD:
-                    req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                    with function_profile(
+                        "vllm_gr.v1.engine.core", "process_input_sockets_add_decode"
+                    ):
+                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                     try:
-                        request = self.preprocess_add_request(req)
+                        with function_profile(
+                            "vllm_gr.v1.engine.core",
+                            "process_input_sockets_add_preprocess",
+                        ):
+                            request = self.preprocess_add_request(req)
                     except Exception:
                         self._handle_request_preproc_error(req)
                         continue
 
                 elif request_type == EngineCoreRequestType.ADD_BATCH:
-                    batch: list[EngineCoreRequest] = add_batch_decoder.decode(data_frames)
+                    with function_profile(
+                        "vllm_gr.v1.engine.core",
+                        "process_input_sockets_add_batch_decode",
+                    ):
+                        batch: list[EngineCoreRequest] = add_batch_decoder.decode(data_frames)
                     for req in batch:
                         try:
-                            request = self.preprocess_add_request(req)
+                            with function_profile(
+                                "vllm_gr.v1.engine.core",
+                                "process_input_sockets_add_batch_preprocess",
+                            ):
+                                request = self.preprocess_add_request(req)
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
                         self._cache_beam_request(request[0])
-                        self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
+                        with function_profile(
+                            "vllm_gr.v1.engine.core", "process_input_sockets_enqueue_add"
+                        ):
+                            self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
                     continue
 
                 elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
-                    beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(data_frames)
+                    with function_profile(
+                        "vllm_gr.v1.engine.core",
+                        "process_input_sockets_beam_update_decode",
+                    ):
+                        beam_update: BeamRequestStepUpdate = beam_request_decoder.decode(
+                            data_frames
+                        )
                     self._handle_beam_request_step_update(beam_update)
                     continue
 
@@ -272,4 +301,7 @@ def process_input_sockets(
                     if request_type == EngineCoreRequestType.ABORT:
                         self.aborts_queue.put_nowait(request)
 
-                self.input_queue.put_nowait((request_type, request))
+                with function_profile(
+                    "vllm_gr.v1.engine.core", "process_input_sockets_enqueue_generic"
+                ):
+                    self.input_queue.put_nowait((request_type, request))

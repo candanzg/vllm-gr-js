@@ -6,6 +6,8 @@ per-element append."""
 import itertools
 from collections.abc import Iterable
 
+from vllm.v1.metrics.function_profile import profiled_function
+
 
 def append_fast(
     self,
@@ -53,6 +55,7 @@ def extract_and_dedup_flat_logprobs(flat, logprobs_num):
     return token_ids, lps, ranks, decoded
 
 
+@profiled_function("vllm_gr.logprobs", "reconstruct_beam_logprobs")
 def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
     """Walk parent-pointer chain to build full FlatLogprobs for a beam.
 
@@ -64,22 +67,33 @@ def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
     """
     from vllm.logprobs import FlatLogprobs
 
-    steps = []
-    ancestor = beam
-    while getattr(ancestor, "_lp_step_data", None) is not None:
-        steps.append(ancestor._lp_step_data)
-        ancestor = ancestor._lp_parent
-    steps.reverse()
-    lp = FlatLogprobs(
-        start_indices=list(initial_logprobs.start_indices),
-        end_indices=list(initial_logprobs.end_indices),
-        token_ids=list(initial_logprobs.token_ids),
-        logprobs=list(initial_logprobs.logprobs),
-        ranks=list(initial_logprobs.ranks),
-        decoded_tokens=list(initial_logprobs.decoded_tokens),
-    )
-    for sd in steps:
-        lp.append_fast(sd[0], sd[1], sd[2], sd[3])
+    from vllm.v1.metrics.function_profile import function_profile
+
+    with function_profile("vllm_gr.logprobs", "walk_parent_chain"):
+        steps = []
+        ancestor = beam
+        while getattr(ancestor, "_lp_step_data", None) is not None:
+            steps.append(ancestor._lp_step_data)
+            ancestor = ancestor._lp_parent
+        steps.reverse()
+
+    with function_profile("vllm_gr.logprobs", "clone_initial_flat_logprobs"):
+        lp = FlatLogprobs(
+            start_indices=list(initial_logprobs.start_indices),
+            end_indices=list(initial_logprobs.end_indices),
+            token_ids=list(initial_logprobs.token_ids),
+            logprobs=list(initial_logprobs.logprobs),
+            ranks=list(initial_logprobs.ranks),
+            decoded_tokens=list(initial_logprobs.decoded_tokens),
+        )
+
+    with function_profile("vllm_gr.logprobs", "append_step_logprobs"):
+        for sd in steps:
+            lp.append_fast(sd[0], sd[1], sd[2], sd[3])
+
     if sid_end_token_id is not None and beam.finish_reason != "stop":
-        lp.append_fast([sid_end_token_id], [0.0], [None], [None])
-    beam.logprobs = lp
+        with function_profile("vllm_gr.logprobs", "append_eos_logprobs"):
+            lp.append_fast([sid_end_token_id], [0.0], [None], [None])
+
+    with function_profile("vllm_gr.logprobs", "assign_final_logprobs"):
+        beam.logprobs = lp

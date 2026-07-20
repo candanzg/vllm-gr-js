@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 
 import torch
+from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -386,80 +387,115 @@ def split_qkv_rmsnorm_rope_gr_impl(
     cos_sin_cache: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not _helpers_available():
-        raise RuntimeError(
-            "split_qkv_rmsnorm_rope GR patch requires Triton + vllm_ascend Triton helpers"
-        )
-
-    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-
-    init_device_properties_triton()
-
-    if cos_sin_cache is None or positions is None:
-        if sin is None or cos is None:
-            raise ValueError(
-                "Expected either (cos_sin_cache, positions) or legacy (sin, cos) inputs for qkv_rmsnorm_rope"
+    with function_profile(
+        "vllm_gr.ops.npu.split_qkv_rmsnorm_rope", "split_qkv_rmsnorm_rope_gr_impl"
+    ):
+        if not _helpers_available():
+            raise RuntimeError(
+                "split_qkv_rmsnorm_rope GR patch requires Triton + vllm_ascend Triton helpers"
             )
-        cos_sin_cache, positions = _convert_sin_cos_to_cache_and_positions(sin=sin, cos=cos)
 
-    num_vectorcore = get_vectorcore_num()
-    rope_dim = cos_sin_cache.shape[-1]
-    batch_size = input.shape[0]
-    bias = q_bias is not None
-    is_partial_rope = rope_dim != head_dim
-    total_hidden_size = q_hidden_size + kv_hidden_size * 2
+        from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
-    q_output = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=input.dtype)
-    k_output = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
-    v_output = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
+        with function_profile(
+            "vllm_gr.ops.npu.split_qkv_rmsnorm_rope", "init_triton_device_props"
+        ):
+            init_device_properties_triton()
 
-    q_head_num = q_hidden_size // head_dim
-    kv_head_num = kv_hidden_size // head_dim
+        if cos_sin_cache is None or positions is None:
+            if sin is None or cos is None:
+                raise ValueError(
+                    "Expected either (cos_sin_cache, positions) or legacy (sin, cos) inputs for qkv_rmsnorm_rope"
+                )
+            with function_profile(
+                "vllm_gr.ops.npu.split_qkv_rmsnorm_rope", "convert_sin_cos_cache"
+            ):
+                cos_sin_cache, positions = _convert_sin_cos_to_cache_and_positions(
+                    sin=sin, cos=cos
+                )
 
-    ub_size = 87040
-    if is_partial_rope:
-        factor = 5 * q_hidden_size + 3 * kv_hidden_size + rope_dim * 4 + q_head_num * rope_dim
-        batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
-    else:
-        factor = 5 * q_hidden_size + 3 * kv_hidden_size + rope_dim * 2 + q_head_num * rope_dim // 2
-        batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
-    batch_size_per_iter_per_vec = max(1, batch_size_per_iter_per_vec)
-    qk_head_num_sum = int(q_head_num + kv_head_num)
-    qk_head_nums_per_iter_per_vec = batch_size_per_iter_per_vec * qk_head_num_sum
+        with function_profile(
+            "vllm_gr.ops.npu.split_qkv_rmsnorm_rope", "prepare_kernel_launch"
+        ):
+            num_vectorcore = get_vectorcore_num()
+            rope_dim = cos_sin_cache.shape[-1]
+            batch_size = input.shape[0]
+            bias = q_bias is not None
+            is_partial_rope = rope_dim != head_dim
+            total_hidden_size = q_hidden_size + kv_hidden_size * 2
 
-    grid = (num_vectorcore, 1, 1)
-    v_batch_size_per_iter_per_vec = ub_size / torch.bfloat16.itemsize // (kv_hidden_size + 1)
+            q_output = torch.empty(
+                batch_size, q_hidden_size, device=input.device, dtype=input.dtype
+            )
+            k_output = torch.empty(
+                batch_size, kv_hidden_size, device=input.device, dtype=input.dtype
+            )
+            v_output = torch.empty(
+                batch_size, kv_hidden_size, device=input.device, dtype=input.dtype
+            )
 
-    split_qkv_rmsnorm_rope_kernel[grid](
-        input,
-        q_output,
-        k_output,
-        v_output,
-        q_weight,
-        q_bias,
-        k_weight,
-        k_bias,
-        batch_size,
-        q_hidden_size,
-        kv_hidden_size,
-        total_hidden_size,
-        eps,
-        bias,
-        head_dim,
-        rope_dim,
-        rope_dim // 2,
-        is_partial_rope,
-        num_vectorcore,
-        int(batch_size_per_iter_per_vec),
-        int(qk_head_nums_per_iter_per_vec),
-        q_head_num,
-        kv_head_num,
-        qk_head_num_sum,
-        int(v_batch_size_per_iter_per_vec),
-        positions,
-        cos_sin_cache,
-    )
-    return q_output, k_output, v_output
+            q_head_num = q_hidden_size // head_dim
+            kv_head_num = kv_hidden_size // head_dim
+
+            ub_size = 87040
+            if is_partial_rope:
+                factor = (
+                    5 * q_hidden_size
+                    + 3 * kv_hidden_size
+                    + rope_dim * 4
+                    + q_head_num * rope_dim
+                )
+                batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
+            else:
+                factor = (
+                    5 * q_hidden_size
+                    + 3 * kv_hidden_size
+                    + rope_dim * 2
+                    + q_head_num * rope_dim // 2
+                )
+                batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
+            batch_size_per_iter_per_vec = max(1, batch_size_per_iter_per_vec)
+            qk_head_num_sum = int(q_head_num + kv_head_num)
+            qk_head_nums_per_iter_per_vec = batch_size_per_iter_per_vec * qk_head_num_sum
+
+            grid = (num_vectorcore, 1, 1)
+            v_batch_size_per_iter_per_vec = (
+                ub_size / torch.bfloat16.itemsize // (kv_hidden_size + 1)
+            )
+
+        with function_profile(
+            "vllm_gr.ops.npu.split_qkv_rmsnorm_rope", "launch_split_qkv_rmsnorm_rope_kernel"
+        ):
+            split_qkv_rmsnorm_rope_kernel[grid](
+                input,
+                q_output,
+                k_output,
+                v_output,
+                q_weight,
+                q_bias,
+                k_weight,
+                k_bias,
+                batch_size,
+                q_hidden_size,
+                kv_hidden_size,
+                total_hidden_size,
+                eps,
+                bias,
+                head_dim,
+                rope_dim,
+                rope_dim // 2,
+                is_partial_rope,
+                num_vectorcore,
+                int(batch_size_per_iter_per_vec),
+                int(qk_head_nums_per_iter_per_vec),
+                q_head_num,
+                kv_head_num,
+                qk_head_num_sum,
+                int(v_batch_size_per_iter_per_vec),
+                positions,
+                cos_sin_cache,
+            )
+        return q_output, k_output, v_output
 
 
 def split_qkv_rmsnorm_rope_gr_impl_fake(

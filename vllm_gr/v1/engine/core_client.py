@@ -3,6 +3,7 @@
 
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
 
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
@@ -40,14 +41,22 @@ async def add_requests_async(self, requests, force_batch=False):
         if hasattr(self, "reqs_in_flight"):
             for request in requests[1:]:
                 self.reqs_in_flight[request.request_id] = chosen_engine
-        to_await = self._send_input(EngineCoreRequestType.ADD_BATCH, requests, chosen_engine)
+        with function_profile(
+            "vllm_gr.v1.engine.core_client", "add_requests_async_send_batch"
+        ):
+            to_await = self._send_input(
+                EngineCoreRequestType.ADD_BATCH, requests, chosen_engine
+            )
         # Notify coordinator when engines are idle (mirrors DPAsyncMPClient.add_request_async).
         if hasattr(self, "first_req_send_socket") and not self.engines_running:
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
             await self.first_req_send_socket.send(req_msg)
         await to_await
     else:
-        await self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
+        with function_profile(
+            "vllm_gr.v1.engine.core_client", "add_requests_async_send_batch"
+        ):
+            await self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
     self._ensure_output_queue_task()
 
 
@@ -74,7 +83,12 @@ async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) ->
             for pruned_id in update.pruned_ids:
                 self.reqs_in_flight.pop(pruned_id, None)
 
-    to_await = self._send_input(EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update, engine)
+    with function_profile(
+        "vllm_gr.v1.engine.core_client", "beam_request_step_update_async_send"
+    ):
+        to_await = self._send_input(
+            EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, update, engine
+        )
     if hasattr(self, "first_req_send_socket") and not self.engines_running:
         req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
         await self.first_req_send_socket.send(req_msg)

@@ -1,0 +1,1332 @@
+From 57f0f10b9c5af8c0def678e12cef5e998f7458cf Mon Sep 17 00:00:00 2001
+From: zhangshucheng <zhangshucheng@huawei.com>
+Date: Mon, 20 Jul 2026 19:43:11 +0800
+Subject: [PATCH] performance-vllm-ascend-v0.14
+
+Signed-off-by: zhangshucheng <zhangshucheng@huawei.com>
+---
+ vllm_ascend/attention/attention_v1.py |  71 ++-
+ vllm_ascend/sample/sampler.py         |  84 +--
+ vllm_ascend/utils.py                  |  33 ++
+ vllm_ascend/worker/model_runner_v1.py | 716 ++++++++++++++++++--------
+ vllm_ascend/worker/worker.py          |  98 ++--
+ 5 files changed, 679 insertions(+), 323 deletions(-)
+
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index 5a8f6a10..fca31853 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -25,6 +25,7 @@ import vllm.envs as envs_vllm
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.forward_context import ForwardContext, get_forward_context
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
+ from vllm.v1.attention.backend import (  # type: ignore
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -861,21 +862,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         attn_metadata: AscendMetadata,
+     ):
+         if len(kv_cache) > 1:
+-            if self.is_kv_producer:
+-                attn_metadata.reshape_cache_event = torch.npu.Event()
+-            if self.key_cache is None:
+-                self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+-            slots = attn_metadata.slot_mapping
+-            encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+-            DeviceOperator.reshape_and_cache(
+-                key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
+-                value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
+-                key_cache=self.key_cache,
+-                value_cache=self.value_cache,
+-                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots,
+-            )
+-            if self.is_kv_producer:
+-                attn_metadata.reshape_cache_event.record()
++            with function_profile(
++                "vllm_ascend.attention.attention_v1", "reshape_and_cache"
++            ):
++                if self.is_kv_producer:
++                    attn_metadata.reshape_cache_event = torch.npu.Event()
++                if self.key_cache is None:
++                    self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
++                slots = attn_metadata.slot_mapping
++                encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
++                DeviceOperator.reshape_and_cache(
++                    key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
++                    value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
++                    key_cache=self.key_cache,
++                    value_cache=self.value_cache,
++                    slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots,
++                )
++                if self.is_kv_producer:
++                    attn_metadata.reshape_cache_event.record()
+         return key, value
+ 
+     def forward_impl(
+@@ -893,9 +897,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             and using_paged_attention(num_tokens, self.vllm_config)
+             and self.sliding_window is None
+         ):
+-            output = self.forward_paged_attention(query, attn_metadata, output)
++            with function_profile(
++                "vllm_ascend.attention.attention_v1", "forward_paged_attention"
++            ):
++                output = self.forward_paged_attention(query, attn_metadata, output)
+         else:
+-            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output)
++            with function_profile(
++                "vllm_ascend.attention.attention_v1", "forward_fused_infer_attention"
++            ):
++                output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output)
+ 
+         return output
+ 
+@@ -929,14 +939,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
+ 
+         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
+         num_tokens = query.shape[0]
+-        if attn_metadata is None:
+-            return output.fill_(0)
+-        if key is not None and value is not None:
+-            key, value = self.reshape_and_cache(key, value, kv_cache, attn_metadata)
+-        # pooling model branch
+-        if attn_metadata.model_runner_type == "pooling":
+-            attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
+-            output[:num_tokens] = attn_output[:num_tokens]
+-            return output
+-        output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
++        with function_profile(
++            "vllm_ascend.attention.attention_v1", "attention_forward"
++        ):
++            if attn_metadata is None:
++                return output.fill_(0)
++            if key is not None and value is not None:
++                key, value = self.reshape_and_cache(key, value, kv_cache, attn_metadata)
++            # pooling model branch
++            if attn_metadata.model_runner_type == "pooling":
++                with function_profile(
++                    "vllm_ascend.attention.attention_v1",
++                    "forward_encoder_attention"
++                ):
++                    attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
++                output[:num_tokens] = attn_output[:num_tokens]
++                return output
++            output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
+         return output
+diff --git a/vllm_ascend/sample/sampler.py b/vllm_ascend/sample/sampler.py
+index 62410cdb..5354bd01 100644
+--- a/vllm_ascend/sample/sampler.py
++++ b/vllm_ascend/sample/sampler.py
+@@ -1,6 +1,7 @@
+ import torch
+ from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+ from vllm.v1.sample.sampler import Sampler
++from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
+@@ -21,17 +22,18 @@ def random_sample(
+     # which is the common case, we first assume that every request does
+     # not have its own seed. Then, we overwrite the values for the requests
+     # that have their own seeds.
+-    with npu_stream_switch(global_stream()):
+-        q = torch.empty_like(probs)
+-        if len(generators) != probs.shape[0]:
+-            q.exponential_()
+-        if generators:
+-            # TODO(woosuk): This can be slow because we handle each request
+-            # one by one. Optimize this.
+-            for i, generator in generators.items():
+-                q[i].exponential_(generator=generator)
+-    torch.npu.current_stream().wait_stream(global_stream())
+-    return probs.div_(q).argmax(dim=-1).view(-1)
++    with function_profile("vllm_ascend.sample.sampler", "random_sample"):
++        with npu_stream_switch(global_stream()):
++            q = torch.empty_like(probs)
++            if len(generators) != probs.shape[0]:
++                q.exponential_()
++            if generators:
++                # TODO(woosuk): This can be slow because we handle each request
++                # one by one. Optimize this.
++                for i, generator in generators.items():
++                    q[i].exponential_(generator=generator)
++        torch.npu.current_stream().wait_stream(global_stream())
++        return probs.div_(q).argmax(dim=-1).view(-1)
+ 
+ 
+ class AscendSampler(Sampler):
+@@ -48,16 +50,17 @@ class AscendSampler(Sampler):
+     def do_async_exponential(self, b_s, head_dim, generators):
+         # Calculating exponential randoms in a different stream
+         # and overlapping with model executing.
+-        with torch.npu.stream(global_stream()):
+-            global_stream().wait_stream(torch.npu.current_stream())
+-            q = torch.empty((b_s, head_dim), device="npu", dtype=torch.float32)
+-            # Goes to async exponential with AI-CPU exponential or default exponential.
+-            if len(generators) != q.shape[0]:
+-                q.exponential_()
+-            if generators:
+-                for i, generator in generators.items():
+-                    q[i].exponential_(generator=generator)
+-            self.async_exponential_event.record()
++        with function_profile("vllm_ascend.sample.sampler", "do_async_exponential"):
++            with torch.npu.stream(global_stream()):
++                global_stream().wait_stream(torch.npu.current_stream())
++                q = torch.empty((b_s, head_dim), device="npu", dtype=torch.float32)
++                # Goes to async exponential with AI-CPU exponential or default exponential.
++                if len(generators) != q.shape[0]:
++                    q.exponential_()
++                if generators:
++                    for i, generator in generators.items():
++                        q[i].exponential_(generator=generator)
++                self.async_exponential_event.record()
+         self.set_q_event(q, self.async_exponential_event)
+ 
+ 
+@@ -75,19 +78,30 @@ class AscendTopKTopPSampler(TopKTopPSampler):
+ 
+     def forward_native(self, logits, generators, k, p):
+         """Override pytorch native implementation to torch_npu"""
+-        logits = self.apply_top_k_top_p(logits, k, p)
+-        logits_to_return = None
+-        if self.logprobs_mode == "processed_logits":
+-            logits_to_return = logits
+-        elif self.logprobs_mode == "processed_logprobs":
+-            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+-
+-        probs = logits.softmax(dim=-1, dtype=torch.float32)
+-        if get_ascend_config().enable_async_exponential:
+-            # Add synchronize to prevent synchronize error.
+-            self.async_event.synchronize()
+-            return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
+-        return random_sample(probs, generators), logits_to_return
++        with function_profile("vllm_ascend.sample.sampler", "forward_native"):
++            with function_profile(
++                "vllm_ascend.sample.sampler", "apply_top_k_top_p"
++            ):
++                logits = self.apply_top_k_top_p(logits, k, p)
++            logits_to_return = None
++            if self.logprobs_mode == "processed_logits":
++                logits_to_return = logits
++            elif self.logprobs_mode == "processed_logprobs":
++                with function_profile(
++                    "vllm_ascend.sample.sampler", "logits_log_softmax"
++                ):
++                    logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
++
++            with function_profile("vllm_ascend.sample.sampler", "softmax_probs"):
++                probs = logits.softmax(dim=-1, dtype=torch.float32)
++            if get_ascend_config().enable_async_exponential:
++                # Add synchronize to prevent synchronize error.
++                with function_profile(
++                    "vllm_ascend.sample.sampler", "wait_async_exponential"
++                ):
++                    self.async_event.synchronize()
++                return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
++            return random_sample(probs, generators), logits_to_return
+ 
+ 
+ def _apply_top_k_top_p_pytorch(
+@@ -135,4 +149,4 @@ def _apply_top_k_top_p_ascendc(
+         return logits
+     return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
+ 
+-apply_top_k_top_p = _apply_top_k_top_p_ascendc if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3] else _apply_top_k_top_p_pytorch
+\ No newline at end of file
++apply_top_k_top_p = _apply_top_k_top_p_ascendc if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3] else _apply_top_k_top_p_pytorch
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index eb88afdd..44828fcb 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -21,6 +21,7 @@ from __future__ import annotations
+ 
+ import atexit
+ import functools
++import json
+ import math
+ import os
+ from contextlib import contextmanager, nullcontext
+@@ -609,6 +610,38 @@ def dispose_tensor(x: torch.Tensor):
+     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
+ 
+ 
++def perf_logging_enabled() -> bool:
++    raw_value = os.getenv("VLLM_GR_PERF_LOG", "").strip().lower()
++    return raw_value in {"1", "true", "yes", "on"}
++
++
++def log_perf_event(
++    module: str,
++    func: str,
++    elapsed_s: float,
++    *,
++    event: str = "function",
++    phase: str | None = None,
++    request_id: str | None = None,
++    **fields: Any,
++) -> None:
++    if not perf_logging_enabled():
++        return
++
++    payload: dict[str, Any] = {
++        "event": event,
++        "module": module,
++        "func": func,
++        "duration_ms": round(elapsed_s * 1000.0, 3),
++    }
++    if phase is not None:
++        payload["phase"] = phase
++    if request_id is not None:
++        payload["request_id"] = request_id
++    payload.update({key: value for key, value in fields.items() if value is not None})
++    logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
++
++
+ class ProfileExecuteDuration:
+     _instance = None
+     _observations: list[tuple[str, Event, Event]] = []
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 6d823721..5cf66ae3 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -19,6 +19,7 @@
+ 
+ import math
+ import sys
++import time
+ from collections import defaultdict
+ from contextlib import contextmanager, nullcontext
+ from copy import copy, deepcopy
+@@ -60,6 +61,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
+                                         FullAttentionSpec, KVCacheConfig,
+                                         KVCacheGroupSpec, KVCacheSpec,
+                                         MambaSpec, UniformTypeKVCacheSpecs)
++from vllm.v1.metrics.function_profile import function_profile, profiled_function
+ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
+                              LogprobsLists, LogprobsTensors, ModelRunnerOutput,
+                              SamplerOutput, ECConnectorOutput,
+@@ -102,7 +104,7 @@ from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
+ from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
+                                enable_sp, get_ascend_device_type,
+                                is_drafter_moe_model, is_moe_model,
+-                               lmhead_tp_enable, maybe_trans_nz,
++                               lmhead_tp_enable, log_perf_event, maybe_trans_nz,
+                                set_weight_prefetch_method)
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ from vllm_ascend.worker.pcp_utils import PCPManager
+@@ -182,6 +184,18 @@ class ExecuteModelState(NamedTuple):
+     attn_metadata: dict[str, Any]
+     positions: torch.Tensor
+     ec_connector_output: ECConnectorOutput | None
++    perf_wall_ms: dict[str, float]
++
++
++@contextmanager
++def _wall_stage_timer(stage_ms: dict[str, float], name: str):
++    start = time.perf_counter()
++    try:
++        yield
++    finally:
++        stage_ms[name] = stage_ms.get(name, 0.0) + (
++            (time.perf_counter() - start) * 1000.0
++        )
+ 
+ 
+ class NPUModelRunner(GPUModelRunner):
+@@ -494,6 +508,7 @@ class NPUModelRunner(GPUModelRunner):
+             return self.model.unwrap()
+         return self.model
+ 
++    @profiled_function("vllm_ascend.worker.model_runner_v1", "_prepare_inputs")
+     def _prepare_inputs(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1011,30 +1026,58 @@ class NPUModelRunner(GPUModelRunner):
+                         hidden_states[1]))
+         return NPUModelRunner._all_gather_hidden_states(hidden_states)
+ 
++    @profiled_function(
++        "vllm_ascend.worker.model_runner_v1", "_generate_process_reqs_hidden_states"
++    )
+     def _generate_process_reqs_hidden_states(self, num_input_tokens,
+                                              input_ids, positions,
+                                              intermediate_tensors,
+                                              inputs_embeds, model_kwargs):
+         assert self.model is not None
+-        hidden_states = self.model(input_ids=input_ids,
+-                                   positions=positions,
+-                                   intermediate_tensors=intermediate_tensors,
+-                                   inputs_embeds=inputs_embeds,
+-                                   **model_kwargs)
++        model_cls = type(self.model)
++        with function_profile(
++            "vllm_ascend.worker.model_runner_v1", "execute_model_call"
++        ):
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "execute_model_call_forward"
++            ):
++                with function_profile(
++                    model_cls.__module__, f"{model_cls.__name__}.forward"
++                ):
++                    hidden_states = self.model(input_ids=input_ids,
++                                               positions=positions,
++                                               intermediate_tensors=intermediate_tensors,
++                                               inputs_embeds=inputs_embeds,
++                                               **model_kwargs)
+ 
+         forward_context = get_forward_context()
+         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL \
+             and not self.use_sparse:
+-            update_full_graph_params(self.attn_backend, self.update_stream, forward_context,
+-                                     num_input_tokens, self.vllm_config,
+-                                     self.vllm_config.speculative_config)
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "execute_update_full_graph_params"
++            ):
++                update_full_graph_params(self.attn_backend, self.update_stream,
++                                         forward_context, num_input_tokens,
++                                         self.vllm_config,
++                                         self.vllm_config.speculative_config)
+ 
+         if get_forward_context().sp_enabled and not isinstance(
+                 hidden_states, IntermediateTensors):
+-            hidden_states = self._all_gather_hidden_states_and_aux(
+-                hidden_states)
+-        return hidden_states if self.pcp_size == 1 else self.pcp_manager.get_restore_hidden_states(
+-            hidden_states)
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "execute_all_gather_hidden_states"
++            ):
++                hidden_states = self._all_gather_hidden_states_and_aux(
++                    hidden_states)
++        if self.pcp_size == 1:
++            return hidden_states
++        with function_profile(
++            "vllm_ascend.worker.model_runner_v1",
++            "execute_restore_hidden_states"
++        ):
++            return self.pcp_manager.get_restore_hidden_states(hidden_states)
+ 
+     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
+                           num_valid_tokens):
+@@ -1329,17 +1372,26 @@ class NPUModelRunner(GPUModelRunner):
+         return None, None
+ 
+     @torch.inference_mode()
++    @profiled_function("vllm_ascend.worker.model_runner_v1", "execute_model")
+     def execute_model(
+         self,
+         scheduler_output: "SchedulerOutput",
+         intermediate_tensors: Optional[IntermediateTensors] = None,
+     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
++        execute_wall_ms: dict[str, float] = {}
++        execute_start = time.perf_counter()
+         if self.execute_model_state is not None:
+             raise RuntimeError("State error: sample_tokens() must be called "
+                                "after execute_model() returns None.")
+ 
+-        with ProfileExecuteDuration().capture_async("prepare input"):
++        with function_profile(
++            "vllm_ascend.worker.model_runner_v1", "execute_update_states"
++        ):
+             self._update_states(scheduler_output)
++
++        with ProfileExecuteDuration().capture_async("prepare input"), _wall_stage_timer(
++            execute_wall_ms, "prepare_input"
++        ):
+             if has_ec_transfer() and get_ec_transfer().is_producer:
+                 with self.maybe_get_ec_connector_output(
+                         scheduler_output,
+@@ -1362,16 +1414,25 @@ class NPUModelRunner(GPUModelRunner):
+             if self.dynamic_eplb:
+                 self.eplb_updator.forward_before()
+ 
+-            (attn_metadata, num_scheduled_tokens_np, num_input_tokens,
+-             num_tokens_across_dp, logits_indices, spec_decode_metadata,
+-             max_query_len) = self._prepare_inputs(scheduler_output)
+-
+-            (input_ids, inputs_embeds, positions, intermediate_tensors,
+-             model_kwargs, ec_connector_output) = self._preprocess(scheduler_output,
+-                                              num_input_tokens,
+-                                              intermediate_tensors)
+-
+-            # update global cos, sin
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "execute_prepare_inputs"
++            ):
++                (attn_metadata, num_scheduled_tokens_np, num_input_tokens,
++                 num_tokens_across_dp, logits_indices, spec_decode_metadata,
++                 max_query_len) = self._prepare_inputs(scheduler_output)
++
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "execute_preprocess"
++            ):
++                (input_ids, inputs_embeds, positions, intermediate_tensors,
++                 model_kwargs, ec_connector_output) = self._preprocess(scheduler_output,
++                                                  num_input_tokens,
++                                                  intermediate_tensors)
++
++        # update global cos, sin
++        with function_profile(
++            "vllm_ascend.worker.model_runner_v1", "execute_update_cos_sin"
++        ):
+             update_cos_sin(positions)
+             
+             if self.dynamic_eplb:
+@@ -1392,17 +1453,28 @@ class NPUModelRunner(GPUModelRunner):
+             scheduler_output.total_num_scheduled_tokens
+             == self.input_batch.num_reqs * max_query_len)
+         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
+-        aclgraph_runtime_mode, batch_descriptor = \
+-            self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
++        with function_profile(
++            "vllm_ascend.worker.model_runner_v1", "execute_dispatch_cudagraph"
++        ):
++            aclgraph_runtime_mode, batch_descriptor = \
++                self.cudagraph_dispatcher.dispatch(
++                    num_tokens=num_input_tokens,
++                    uniform_decode=uniform_decode,
++                    has_lora=has_lora)
+ 
+         if self.ascend_config.enable_async_exponential:
+-            self.sampler.do_async_exponential(
+-                b_s=logits_indices.shape[0],
+-                head_dim=self.model_config.get_vocab_size(),
+-                generators=self.input_batch.sampling_metadata.generators)
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "execute_async_exponential"
++            ):
++                self.sampler.do_async_exponential(
++                    b_s=logits_indices.shape[0],
++                    head_dim=self.model_config.get_vocab_size(),
++                    generators=self.input_batch.sampling_metadata.generators)
+ 
+         # Run forward pass
+-        with ProfileExecuteDuration().capture_async("forward"):
++        with ProfileExecuteDuration().capture_async("forward"), _wall_stage_timer(
++            execute_wall_ms, "forward"
++        ):
+             with set_ascend_forward_context(
+                     attn_metadata,
+                     self.vllm_config,
+@@ -1413,15 +1485,27 @@ class NPUModelRunner(GPUModelRunner):
+                     num_actual_tokens=scheduler_output.
+                     total_num_scheduled_tokens,
+                     model_instance=self.model):
+-                self.maybe_setup_kv_connector(scheduler_output)
+-
+-                hidden_states = self._generate_process_reqs_hidden_states(
+-                    num_input_tokens, input_ids, positions,
+-                    intermediate_tensors, inputs_embeds, model_kwargs)
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "execute_setup_kv_connector"
++                ):
++                    self.maybe_setup_kv_connector(scheduler_output)
+ 
+-            self.maybe_wait_for_kv_save()
+-            finished_sending, finished_recving = self.get_finished_kv_transfer(
+-                scheduler_output)
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "execute_forward"
++                ):
++                    hidden_states = self._generate_process_reqs_hidden_states(
++                        num_input_tokens, input_ids, positions,
++                        intermediate_tensors, inputs_embeds, model_kwargs)
++
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "execute_wait_kv_save"
++            ):
++                self.maybe_wait_for_kv_save()
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "execute_get_finished_kv_transfer"
++            ):
++                finished_sending, finished_recving = self.get_finished_kv_transfer(
++                    scheduler_output)
+ 
+             aux_hidden_states = None
+             if self.use_aux_hidden_state_outputs:
+@@ -1432,7 +1516,9 @@ class NPUModelRunner(GPUModelRunner):
+             finished_recving=finished_recving)
+         finished_sending = None
+         finished_recving = None
+-        with ProfileExecuteDuration().capture_async("post process"):
++        with ProfileExecuteDuration().capture_async("post process"), _wall_stage_timer(
++            execute_wall_ms, "post_process"
++        ):
+             # Broadcast PP output for external_launcher (torchrun)
+             # to make sure we are synced across pp ranks
+             # TODO: Support overlapping mirco-batches
+@@ -1450,50 +1536,74 @@ class NPUModelRunner(GPUModelRunner):
+                         self.debugger.step()
+                     return hidden_states
+                 assert isinstance(hidden_states, IntermediateTensors)
+-                get_pp_group().send_tensor_dict(
+-                    hidden_states.tensors, all_gather_group=get_tp_group())
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "execute_send_tensor_dict"
++                ):
++                    get_pp_group().send_tensor_dict(
++                        hidden_states.tensors, all_gather_group=get_tp_group())
+                 logits = None
+             else:
+                 if self.input_batch.pooling_params:
+-                    pool_output = self._pool(
+-                        hidden_states,
+-                        scheduler_output.total_num_scheduled_tokens,
+-                        num_scheduled_tokens_np, kv_connector_output)
++                    with function_profile(
++                        "vllm_ascend.worker.model_runner_v1", "execute_pool"
++                    ):
++                        pool_output = self._pool(
++                            hidden_states,
++                            scheduler_output.total_num_scheduled_tokens,
++                            num_scheduled_tokens_np, kv_connector_output)
+                     if self.debugger is not None:
+                         self.debugger.stop()
+                         self.debugger.step()
+                     return pool_output
+-                sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "execute_slice_sample_hidden_states"
++                ):
++                    sample_hidden_states = hidden_states[logits_indices]
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "execute_compute_logits"
++                ):
++                    logits = self.model.compute_logits(sample_hidden_states)
+             if broadcast_pp_output:
+                 model_output_broadcast_data = {
+                     "logits": logits.contiguous(),
+                 } if logits is not None else {}
+-                model_output_broadcast_data = get_pp_group(
+-                ).broadcast_tensor_dict(model_output_broadcast_data,
+-                                        src=len(get_pp_group().ranks) - 1)
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "execute_broadcast_tensor_dict"
++                ):
++                    model_output_broadcast_data = get_pp_group(
++                    ).broadcast_tensor_dict(model_output_broadcast_data,
++                                            src=len(get_pp_group().ranks) - 1)
+                 assert model_output_broadcast_data is not None
+                 logits = model_output_broadcast_data["logits"]
+ 
+             # Apply structured output bitmasks if present
+-            self.execute_model_state = ExecuteModelState(
+-                scheduler_output,
+-                logits,
+-                spec_decode_metadata,
+-                hidden_states,
+-                sample_hidden_states,
+-                aux_hidden_states,
+-                attn_metadata,
+-                positions,
+-                ec_connector_output
+-            )
+-            self.kv_connector_output = kv_connector_output
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "execute_store_state"
++            ):
++                self.execute_model_state = ExecuteModelState(
++                    scheduler_output,
++                    logits,
++                    spec_decode_metadata,
++                    hidden_states,
++                    sample_hidden_states,
++                    aux_hidden_states,
++                    attn_metadata,
++                    positions,
++                    ec_connector_output,
++                    execute_wall_ms,
++                )
++                self.kv_connector_output = kv_connector_output
++        execute_wall_ms["execute_model_total"] = (
++            time.perf_counter() - execute_start
++        ) * 1000.0
+         return None
+ 
+     @torch.inference_mode
++    @profiled_function("vllm_ascend.worker.model_runner_v1", "sample_tokens")
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
++        sample_start = time.perf_counter()
+         kv_connector_output = self.kv_connector_output
+         self.kv_connector_output = None
+ 
+@@ -1520,22 +1630,29 @@ class NPUModelRunner(GPUModelRunner):
+             aux_hidden_states,
+             attn_metadata,
+             positions,
+-            ec_connector_output
++            ec_connector_output,
++            execute_wall_ms,
+         ) = self.execute_model_state
+         # Clear ephemeral state.
+         self.execute_model_state = None
++        wall_ms = dict(execute_wall_ms)
+ 
+         # Apply structured output bitmasks if present.
+         if grammar_output is not None:
+-            # here we are different from gpu_model_runner,
+-            # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
+-            logits_dtype = logits.dtype
+-            logits = logits.to("cpu").float()
+-            apply_grammar_bitmask(scheduler_output, grammar_output,
+-                                  self.input_batch, logits)
+-            logits = logits.to(self.device).to(logits_dtype)
+-
+-        with ProfileExecuteDuration().capture_async("Sample"):
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "apply_grammar_bitmask"
++            ):
++                # here we are different from gpu_model_runner,
++                # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
++                logits_dtype = logits.dtype
++                logits = logits.to("cpu").float()
++                apply_grammar_bitmask(scheduler_output, grammar_output,
++                                      self.input_batch, logits)
++                logits = logits.to(self.device).to(logits_dtype)
++
++        with ProfileExecuteDuration().capture_async("Sample"), _wall_stage_timer(
++            wall_ms, "sample"
++        ):
+             sampler_output = self._sample(logits, spec_decode_metadata)
+ 
+         def propose_draft_token_ids(sampled_token_ids):
+@@ -1554,59 +1671,97 @@ class NPUModelRunner(GPUModelRunner):
+             )
+             self._copy_draft_token_ids_to_cpu(scheduler_output)
+ 
+-        (
+-            logprobs_lists,
+-            valid_sampled_token_ids,
+-            prompt_logprobs_dict,
+-            req_ids_output_copy,
+-            req_id_to_index_output_copy,
+-            invalid_req_indices,
+-        ) = self._bookkeeping_sync(
+-            scheduler_output,
+-            sampler_output,
+-            logits,
+-            hidden_states,
+-            scheduler_output.total_num_scheduled_tokens,
+-            spec_decode_metadata,
+-        )
++        with _wall_stage_timer(wall_ms, "bookkeeping"):
++            (
++                logprobs_lists,
++                valid_sampled_token_ids,
++                prompt_logprobs_dict,
++                req_ids_output_copy,
++                req_id_to_index_output_copy,
++                invalid_req_indices,
++            ) = self._bookkeeping_sync(
++                scheduler_output,
++                sampler_output,
++                logits,
++                hidden_states,
++                scheduler_output.total_num_scheduled_tokens,
++                spec_decode_metadata,
++            )
+ 
+-        with ProfileExecuteDuration().capture_async("Draft"):
+-            if self.speculative_config:
+-                use_padded_batch_for_eagle = self.speculative_config and \
+-                    self.speculative_config.use_eagle() and \
+-                    not self.speculative_config.disable_padded_drafter_batch
+-                if use_padded_batch_for_eagle:
+-                    # EAGLE speculative decoding can use the GPU sampled tokens
+-                    # as inputs, and does not need to wait for bookkeeping to finish.
+-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+-                if self.speculative_config and not use_padded_batch_for_eagle:
+-                    # ngram and other speculative decoding methods use the sampled
+-                    # tokens on the CPU, so they are run after bookkeeping.
+-                    propose_draft_token_ids(valid_sampled_token_ids)
+-
+-            if has_kv_transfer_group():
+-                get_kv_transfer_group().clear_connector_metadata()
+-
+-        model_runner_output = ModelRunnerOutput(
+-            req_ids=req_ids_output_copy,
+-            req_id_to_index=req_id_to_index_output_copy,
+-            sampled_token_ids=valid_sampled_token_ids,
+-            logprobs=logprobs_lists,
+-            prompt_logprobs_dict=prompt_logprobs_dict,
+-            ec_connector_output=ec_connector_output,
+-            kv_connector_output=kv_connector_output,
+-            pooler_output=[],
+-        )
++        with ProfileExecuteDuration().capture_async("Draft"), _wall_stage_timer(
++            wall_ms, "draft"
++        ):
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "draft_processing"
++            ):
++                if self.speculative_config:
++                    use_padded_batch_for_eagle = self.speculative_config and \
++                        self.speculative_config.use_eagle() and \
++                        not self.speculative_config.disable_padded_drafter_batch
++                    if use_padded_batch_for_eagle:
++                        # EAGLE speculative decoding can use the GPU sampled tokens
++                        # as inputs, and does not need to wait for bookkeeping to finish.
++                        propose_draft_token_ids(sampler_output.sampled_token_ids)
++                    if self.speculative_config and not use_padded_batch_for_eagle:
++                        # ngram and other speculative decoding methods use the sampled
++                        # tokens on the CPU, so they are run after bookkeeping.
++                        propose_draft_token_ids(valid_sampled_token_ids)
++
++                if has_kv_transfer_group():
++                    get_kv_transfer_group().clear_connector_metadata()
++
++        with _wall_stage_timer(wall_ms, "build_output"):
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "build_model_runner_output"
++            ):
++                model_runner_output = ModelRunnerOutput(
++                    req_ids=req_ids_output_copy,
++                    req_id_to_index=req_id_to_index_output_copy,
++                    sampled_token_ids=valid_sampled_token_ids,
++                    logprobs=logprobs_lists,
++                    prompt_logprobs_dict=prompt_logprobs_dict,
++                    ec_connector_output=ec_connector_output,
++                    kv_connector_output=kv_connector_output,
++                    pooler_output=[],
++                )
++
++        wall_ms["sample_tokens_body"] = (
++            time.perf_counter() - sample_start
++        ) * 1000.0
+ 
++        profile_sync_start = time.perf_counter()
+         durations = ProfileExecuteDuration().pop_captured_sync()
++        wall_ms["profile_event_sync"] = (
++            time.perf_counter() - profile_sync_start
++        ) * 1000.0
++        captured_name = "Decode" if self.attn_state == AscendAttentionState.DecodeOnly else "Prefill"
++        phase_prefix = captured_name.lower()
+         if durations:
+             dr_str = [
+                 f"[{tag}]:{duration:.2f}ms"
+                 for tag, duration in durations.items()
+             ]
+-            captured_name = "Decode" if self.attn_state == AscendAttentionState.DecodeOnly else "Prefill"
+             logger.info("Profile execute duration [%s]:%s", captured_name,
+                         " ".join(dr_str))
++            phase_map = {
++                "prepare input": f"{phase_prefix}_stage_prepare_input",
++                "forward": f"{phase_prefix}_stage_forward",
++                "post process": f"{phase_prefix}_stage_post_process",
++                "Sample": f"{phase_prefix}_stage_sample",
++                "Draft": f"{phase_prefix}_stage_draft",
++            }
++            for tag, duration_ms in durations.items():
++                phase_name = phase_map.get(tag)
++                if phase_name is None:
++                    continue
++                log_perf_event(
++                    "vllm_ascend.worker.model_runner_v1",
++                    phase_name,
++                    duration_ms / 1000.0,
++                    attn_state=getattr(self.attn_state, "name", str(self.attn_state)),
++                    total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
++                    num_reqs=self.input_batch.num_reqs,
++                )
+         if self.dynamic_eplb:
+             self.eplb_updator.forward_end()
+         if not self.use_async_scheduling:
+@@ -1614,48 +1769,147 @@ class NPUModelRunner(GPUModelRunner):
+                 assert self.debugger is not None
+                 self.debugger.stop()
+                 self.debugger.step()
+-            return model_runner_output
++            async_output = None
++        else:
++            if self.debugger is not None:
++                assert self.debugger is not None
++                self.debugger.stop()
++                self.debugger.step()
++            with _wall_stage_timer(wall_ms, "async_output_wrap"):
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1", "build_async_output"
++                ):
++                    async_output = AsyncGPUModelRunnerOutput(
++                        model_runner_output=model_runner_output,
++                        sampled_token_ids=sampler_output.sampled_token_ids,
++                        logprobs_tensors=sampler_output.logprobs_tensors,
++                        invalid_req_indices=invalid_req_indices,
++                        async_output_copy_stream=self.async_output_copy_stream,
++                        vocab_size=self.input_batch.vocab_size,
++                    )
+ 
+-        if self.debugger is not None:
+-            assert self.debugger is not None
+-            self.debugger.stop()
+-            self.debugger.step()
+-        return AsyncGPUModelRunnerOutput(
+-            model_runner_output=model_runner_output,
+-            sampled_token_ids=sampler_output.sampled_token_ids,
+-            logprobs_tensors=sampler_output.logprobs_tensors,
+-            invalid_req_indices=invalid_req_indices,
+-            async_output_copy_stream=self.async_output_copy_stream,
+-            vocab_size=self.input_batch.vocab_size,
++        wall_ms["sample_tokens_total"] = (
++            time.perf_counter() - sample_start
++        ) * 1000.0
++        wall_ms["prefill_wall_total"] = (
++            wall_ms.get("execute_model_total", 0.0) + wall_ms["sample_tokens_total"]
+         )
++        if self.attn_state != AscendAttentionState.DecodeOnly:
++            model_runner_output.perf_metrics_ms = {
++                "prefill_worker_total_ms": wall_ms.get("prefill_wall_total", 0.0),
++                "prefill_worker_execute_model_ms": wall_ms.get(
++                    "execute_model_total", 0.0
++                ),
++                "prefill_worker_forward_ms": wall_ms.get("forward", 0.0),
++                "prefill_worker_sample_tokens_body_ms": wall_ms.get(
++                    "sample_tokens_body", 0.0
++                ),
++                "prefill_worker_profile_event_sync_ms": wall_ms.get(
++                    "profile_event_sync", 0.0
++                ),
++                "prefill_worker_sample_tokens_total_ms": wall_ms.get(
++                    "sample_tokens_total", 0.0
++                ),
++                "prefill_worker_sample_ms": wall_ms.get("sample", 0.0),
++                "prefill_worker_bookkeeping_ms": wall_ms.get("bookkeeping", 0.0),
++                "prefill_worker_build_output_ms": wall_ms.get("build_output", 0.0),
++                "prefill_worker_async_output_wrap_ms": wall_ms.get(
++                    "async_output_wrap", 0.0
++                ),
++            }
++
++        wall_log_start = time.perf_counter()
++        wall_phase_map = {
++            "prepare_input": f"{phase_prefix}_wall_prepare_input",
++            "forward": f"{phase_prefix}_wall_forward",
++            "post_process": f"{phase_prefix}_wall_post_process",
++            "sample": f"{phase_prefix}_wall_sample",
++            "bookkeeping": f"{phase_prefix}_wall_bookkeeping",
++            "draft": f"{phase_prefix}_wall_draft",
++            "build_output": f"{phase_prefix}_wall_build_output",
++            "sample_tokens_body": f"{phase_prefix}_wall_sample_tokens_body",
++            "profile_event_sync": f"{phase_prefix}_wall_profile_event_sync",
++            "async_output_wrap": f"{phase_prefix}_wall_async_output_wrap",
++            "execute_model_total": f"{phase_prefix}_wall_execute_model_total",
++            "sample_tokens_total": f"{phase_prefix}_wall_sample_tokens_total",
++            "prefill_wall_total": f"{phase_prefix}_wall_total",
++        }
++        for key, phase_name in wall_phase_map.items():
++            value_ms = wall_ms.get(key)
++            if value_ms is None:
++                continue
++            log_perf_event(
++                "vllm_ascend.worker.model_runner_v1",
++                phase_name,
++                value_ms / 1000.0,
++                attn_state=getattr(self.attn_state, "name", str(self.attn_state)),
++                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
++                num_reqs=self.input_batch.num_reqs,
++            )
++        wall_ms["perf_log_emit"] = (
++            time.perf_counter() - wall_log_start
++        ) * 1000.0
++        log_perf_event(
++            "vllm_ascend.worker.model_runner_v1",
++            f"{phase_prefix}_wall_perf_log_emit",
++            wall_ms["perf_log_emit"] / 1000.0,
++            attn_state=getattr(self.attn_state, "name", str(self.attn_state)),
++            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
++            num_reqs=self.input_batch.num_reqs,
++        )
++        if async_output is None:
++            return model_runner_output
++        return async_output
+ 
+     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
++    @profiled_function("vllm_ascend.worker.model_runner_v1", "_sample")
+     def _sample(self, logits, spec_decode_metadata):
+         # Sample the next token and get logprobs if needed.
+         sampling_metadata = self.input_batch.sampling_metadata
+         if spec_decode_metadata is None:
+             if lmhead_tp_enable() and logits is not None:
+-                logits = logits[:self.input_batch.num_reqs]
+-            return self.sampler(
+-                logits=logits,
+-                sampling_metadata=sampling_metadata,
+-            )
++                with function_profile(
++                    "vllm_ascend.worker.model_runner_v1",
++                    "sample_prepare_logits"
++                ):
++                    logits = logits[:self.input_batch.num_reqs]
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "sample_main_sampler"
++            ):
++                return self.sampler(
++                    logits=logits,
++                    sampling_metadata=sampling_metadata,
++                )
+ 
+         if lmhead_tp_enable() and logits is not None:
+-            logits = logits[:len(spec_decode_metadata.logits_indices)]
+-        sampler_output = self.rejection_sampler(
+-            spec_decode_metadata,
+-            None,  # draft_probs
+-            logits,
+-            sampling_metadata,
+-        )
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "sample_prepare_spec_logits"
++            ):
++                logits = logits[:len(spec_decode_metadata.logits_indices)]
++        with function_profile(
++            "vllm_ascend.worker.model_runner_v1",
++            "sample_rejection_sampler"
++        ):
++            sampler_output = self.rejection_sampler(
++                spec_decode_metadata,
++                None,  # draft_probs
++                logits,
++                sampling_metadata,
++            )
+         if self.need_accepted_tokens:  # TODO remove this if
+-            self._update_states_after_model_execute(
+-                sampler_output.sampled_token_ids)
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "sample_update_accepted_tokens"
++            ):
++                self._update_states_after_model_execute(
++                    sampler_output.sampled_token_ids)
+         return sampler_output
+ 
+     # TODO: remove this func after eagle_proposer is refactored and
+     #  _bookkeeping_sync is moved after propose_draft_token_ids
++    @profiled_function("vllm_ascend.worker.model_runner_v1", "_bookkeeping_sync")
+     def _bookkeeping_sync(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1690,86 +1944,108 @@ class NPUModelRunner(GPUModelRunner):
+         logprobs_tensors = sampler_output.logprobs_tensors
+         invalid_req_indices = []
+         cu_num_tokens: list[int] | None = None
+-        if not self.use_async_scheduling:
+-            # Get the valid generated tokens.
+-            max_gen_len = sampled_token_ids.shape[-1]
+-            if max_gen_len == 1:
+-                # No spec decode tokens.
+-                valid_sampled_token_ids = self._to_list(sampled_token_ids)
+-                # Mask out the sampled tokens that should not be sampled.
+-                for i in discard_sampled_tokens_req_indices:
+-                    valid_sampled_token_ids[int(i)].clear()
++        with function_profile("vllm_ascend.worker.model_runner_v1", "parse_output"):
++            if not self.use_async_scheduling:
++                # Get the valid generated tokens.
++                max_gen_len = sampled_token_ids.shape[-1]
++                if max_gen_len == 1:
++                    # No spec decode tokens.
++                    valid_sampled_token_ids = self._to_list(sampled_token_ids)
++                    # Mask out the sampled tokens that should not be sampled.
++                    for i in discard_sampled_tokens_req_indices:
++                        valid_sampled_token_ids[int(i)].clear()
++                else:
++                    # Includes spec decode tokens.
++                    valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
++                        sampled_token_ids,
++                        self.input_batch.vocab_size,
++                        discard_sampled_tokens_req_indices,
++                        logprobs_tensors=logprobs_tensors,
++                    )
+             else:
+-                # Includes spec decode tokens.
+-                valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+-                    sampled_token_ids,
+-                    self.input_batch.vocab_size,
+-                    discard_sampled_tokens_req_indices,
+-                    logprobs_tensors=logprobs_tensors,
++                valid_sampled_token_ids = []
++                invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
++                invalid_req_indices_set = set(invalid_req_indices)
++
++                if self.num_spec_tokens <= 0:
++                    assert sampled_token_ids.shape[-1] == 1
++                    # Cache the sampled tokens on the NPU and avoid CPU sync.
++                    # These will be copied into input_ids in the next step
++                    # when preparing inputs.
++                    self.input_batch.prev_sampled_token_ids = sampled_token_ids
++
++                self.input_batch.prev_req_id_to_index = {
++                    req_id: i
++                    for i, req_id in enumerate(self.input_batch.req_ids)
++                    if i not in invalid_req_indices_set
++                }
++
++        with function_profile("vllm_ascend.worker.model_runner_v1", "writeback_tokens"):
++            # Cache the sampled tokens in the model runner, so that the scheduler
++            # doesn't need to send them back.
++            # NOTE(woosuk): As an exception, when using PP, the scheduler sends
++            # the sampled tokens back, because there's no direct communication
++            # between the first-stage worker and the last-stage worker.
++            req_ids = self.input_batch.req_ids
++            sampled_updates: list[tuple[int, list[int]]] = []
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "collect_sampled_updates"
++            ):
++                for req_idx in range(num_sampled_tokens):
++                    if self.use_async_scheduling:
++                        sampled_ids = [
++                            -1
++                        ] if req_idx not in invalid_req_indices_set else None
++                    else:
++                        sampled_ids = valid_sampled_token_ids[req_idx]
++
++                    if sampled_ids:
++                        sampled_updates.append((req_idx, sampled_ids))
++
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "writeback_token_arrays"
++            ):
++                for req_idx, sampled_ids in sampled_updates:
++                    num_sampled_ids: int = len(sampled_ids)
++                    start_idx = self.input_batch.num_tokens_no_spec[req_idx]
++                    end_idx = start_idx + num_sampled_ids
++                    assert end_idx <= self.max_model_len, (
++                        "Sampled token IDs exceed the max model length. "
++                        f"Total number of tokens: {end_idx} > max_model_len: "
++                        f"{self.max_model_len}")
++
++                    self.input_batch.token_ids_cpu[req_idx,
++                                                   start_idx:end_idx] = sampled_ids
++                    self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
++                    self.input_batch.num_tokens_no_spec[req_idx] = end_idx
++                    self.input_batch.num_tokens[req_idx] = end_idx
++
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1", "writeback_request_state"
++            ):
++                for req_idx, sampled_ids in sampled_updates:
++                    req_id = req_ids[req_idx]
++                    req_state = self.requests[req_id]
++                    req_state.output_token_ids.extend(sampled_ids)
++
++        with function_profile("vllm_ascend.worker.model_runner_v1", "prompt_logprobs"):
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "materialize_logprobs_lists"
++            ):
++                logprobs_lists = (logprobs_tensors.tolists(cu_num_tokens)
++                                  if not self.use_async_scheduling
++                                  and logprobs_tensors is not None else None)
++
++            # Compute prompt logprobs if needed.
++            with function_profile(
++                "vllm_ascend.worker.model_runner_v1",
++                "compute_prompt_logprobs"
++            ):
++                prompt_logprobs_dict = self._get_prompt_logprobs_dict(
++                    hidden_states[:num_scheduled_tokens],
++                    scheduler_output.num_scheduled_tokens,
+                 )
+-        else:
+-            valid_sampled_token_ids = []
+-            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+-            invalid_req_indices_set = set(invalid_req_indices)
+-
+-            if self.num_spec_tokens <= 0:
+-                assert sampled_token_ids.shape[-1] == 1
+-                # Cache the sampled tokens on the NPU and avoid CPU sync.
+-                # These will be copied into input_ids in the next step
+-                # when preparing inputs.
+-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
+-
+-            self.input_batch.prev_req_id_to_index = {
+-                req_id: i
+-                for i, req_id in enumerate(self.input_batch.req_ids)
+-                if i not in invalid_req_indices_set
+-            }
+-
+-        # Cache the sampled tokens in the model runner, so that the scheduler
+-        # doesn't need to send them back.
+-        # NOTE(woosuk): As an exception, when using PP, the scheduler sends
+-        # the sampled tokens back, because there's no direct communication
+-        # between the first-stage worker and the last-stage worker.
+-        req_ids = self.input_batch.req_ids
+-        for req_idx in range(num_sampled_tokens):
+-            if self.use_async_scheduling:
+-                sampled_ids = [
+-                    -1
+-                ] if req_idx not in invalid_req_indices_set else None
+-            else:
+-                sampled_ids = valid_sampled_token_ids[req_idx]
+-
+-            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
+-
+-            if not sampled_ids:
+-                continue
+-
+-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+-            end_idx = start_idx + num_sampled_ids
+-            assert end_idx <= self.max_model_len, (
+-                "Sampled token IDs exceed the max model length. "
+-                f"Total number of tokens: {end_idx} > max_model_len: "
+-                f"{self.max_model_len}")
+-
+-            self.input_batch.token_ids_cpu[req_idx,
+-                                           start_idx:end_idx] = sampled_ids
+-            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+-            self.input_batch.num_tokens[req_idx] = end_idx
+-
+-            req_id = req_ids[req_idx]
+-            req_state = self.requests[req_id]
+-            req_state.output_token_ids.extend(sampled_ids)
+-
+-        logprobs_lists = (logprobs_tensors.tolists(cu_num_tokens)
+-                          if not self.use_async_scheduling
+-                          and logprobs_tensors is not None else None)
+-
+-        # Compute prompt logprobs if needed.
+-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+-            hidden_states[:num_scheduled_tokens],
+-            scheduler_output.num_scheduled_tokens,
+-        )
+ 
+         return (
+             logprobs_lists,
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index b1ccb74c..76f15840 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -44,6 +44,10 @@ from vllm.utils.mem_constants import GiB_bytes
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
++from vllm.v1.metrics.function_profile import (
++    function_profile_end,
++    function_profile_start,
++)
+ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
+                              DraftTokenIds, ModelRunnerOutput)
+ from vllm.v1.worker.worker_base import WorkerBase
+@@ -297,58 +301,70 @@ class NPUWorker(WorkerBase):
+         self,
+         scheduler_output: "SchedulerOutput",
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+-        # enable msMonitor to monitor the performance of vllm-ascend
+-        if envs_ascend.MSMONITOR_USE_DAEMON:
+-            dp.step()
+-
+-        intermediate_tensors = None
+-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+-        if forward_pass and not get_pp_group().is_first_rank:
++        profile_start = function_profile_start()
++        try:
++            # enable msMonitor to monitor the performance of vllm-ascend
++            if envs_ascend.MSMONITOR_USE_DAEMON:
++                dp.step()
++
++            intermediate_tensors = None
++            forward_pass = scheduler_output.total_num_scheduled_tokens > 0
++            if forward_pass and not get_pp_group().is_first_rank:
++                # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise it will conflict with the all-gather operation in flashcomm1.
++                if enable_sp():
++                    all_gather_group = None
++                else:
++                    all_gather_group = get_tp_group()
++                intermediate_tensors = IntermediateTensors(
++                    get_pp_group().recv_tensor_dict(
++                        all_gather_group=all_gather_group))
++
++            output = self.model_runner.execute_model(scheduler_output,
++                                                     intermediate_tensors)
++            if isinstance(output,
++                          (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
++                return output
++
++            assert isinstance(output, IntermediateTensors)
++            parallel_config = self.vllm_config.parallel_config
++            assert parallel_config.distributed_executor_backend != (
++                "external_launcher") and not get_pp_group().is_last_rank
+             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise it will conflict with the all-gather operation in flashcomm1.
+             if enable_sp():
+                 all_gather_group = None
+             else:
+                 all_gather_group = get_tp_group()
+-            intermediate_tensors = IntermediateTensors(
+-                get_pp_group().recv_tensor_dict(
+-                    all_gather_group=all_gather_group))
+-
+-        output = self.model_runner.execute_model(scheduler_output,
+-                                                 intermediate_tensors)
+-        if isinstance(output,
+-                      (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
++            get_pp_group().send_tensor_dict(output.tensors,
++                                            all_gather_group=all_gather_group)
++
++            kv_connector_output = output.kv_connector_output
++            if not kv_connector_output:
++                return None
++
++            # In case of PP with kv transfer, we need to pass through the
++            # kv_connector_output
++            if (not kv_connector_output.finished_sending
++                    and not kv_connector_output.finished_recving):
++                return EMPTY_MODEL_RUNNER_OUTPUT
++            output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
++            output.kv_connector_output = kv_connector_output
+             return output
+-
+-        assert isinstance(output, IntermediateTensors)
+-        parallel_config = self.vllm_config.parallel_config
+-        assert parallel_config.distributed_executor_backend != (
+-            "external_launcher") and not get_pp_group().is_last_rank
+-        # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise it will conflict with the all-gather operation in flashcomm1.
+-        if enable_sp():
+-            all_gather_group = None
+-        else:
+-            all_gather_group = get_tp_group()
+-        get_pp_group().send_tensor_dict(output.tensors,
+-                                        all_gather_group=all_gather_group)
+-
+-        kv_connector_output = output.kv_connector_output
+-        if not kv_connector_output:
+-            return None
+-
+-        # In case of PP with kv transfer, we need to pass through the
+-        # kv_connector_output
+-        if (not kv_connector_output.finished_sending
+-                and not kv_connector_output.finished_recving):
+-            return EMPTY_MODEL_RUNNER_OUTPUT
+-        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+-        output.kv_connector_output = kv_connector_output
+-        return output
++        finally:
++            function_profile_end(
++                "vllm_ascend.worker.worker", "execute_model", profile_start
++            )
+ 
+     @torch.inference_mode()
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+-        return self.model_runner.sample_tokens(grammar_output)
++        profile_start = function_profile_start()
++        try:
++            return self.model_runner.sample_tokens(grammar_output)
++        finally:
++            function_profile_end(
++                "vllm_ascend.worker.worker", "sample_tokens", profile_start
++            )
+ 
+     def load_model(self) -> None:
+         if self.vllm_config.model_config.enable_sleep_mode:
+-- 
+2.53.0.windows.1
+

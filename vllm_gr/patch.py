@@ -27,6 +27,7 @@ import types
 from typing import Any
 
 from vllm_gr.ops.npu.split_qkv_rmsnorm_rope import apply_split_qkv_rmsnorm_rope_patch
+from vllm_gr.utils.perf import perf_logging_enabled, wrap_timed_method
 
 logger = logging.getLogger("vllm_gr.patch")
 
@@ -196,6 +197,7 @@ _KV_MERGE_PATCHES_APPLIED = False
 _GR_BEAM_PATCHES_APPLIED = False
 _ASCEND_ATTN_BACKEND_PATCH_APPLIED = False
 _ASCEND_ORIGINAL_CACHED_GET_ATTN = None
+_PERF_PATCHES_APPLIED = False
 
 
 def _apply_ascend_attention_backend_patch(force: bool = False) -> int:
@@ -740,6 +742,118 @@ def _patch_npu_worker_init_device() -> int:
     return 1
 
 
+def _apply_perf_logging_patch(force: bool = False) -> int:
+    """Wrap hot runtime functions with structured timing logs."""
+    global _PERF_PATCHES_APPLIED
+
+    if _PERF_PATCHES_APPLIED and not force:
+        return 0
+    if not perf_logging_enabled():
+        return 0
+
+    try:
+        from vllm.v1.metrics.function_profile import function_profile_output_dir
+
+        vllm_mod = importlib.import_module("vllm")
+        vllm_ascend_mod = importlib.import_module("vllm_ascend")
+        logger.info(
+            "vllm_gr: function profiling enabled, output_dir=%s, vllm=%s, vllm_ascend=%s",
+            function_profile_output_dir(),
+            getattr(vllm_mod, "__file__", "unknown"),
+            getattr(vllm_ascend_mod, "__file__", "unknown"),
+        )
+    except Exception as exc:
+        logger.info("vllm_gr: function profiling enabled, but startup probe failed: %s", exc)
+
+    patch_count = 0
+
+    try:
+        from vllm.v1.engine.llm_engine import LLMEngine
+
+        if not getattr(LLMEngine, "_perf_timing_patched", False):
+            LLMEngine.step = wrap_timed_method(
+                LLMEngine.step,
+                module="vllm.v1.engine.llm_engine",
+                func="step",
+            )
+            LLMEngine._perf_timing_patched = True
+            patch_count += 1
+    except ImportError:
+        pass
+
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        if not getattr(Scheduler, "_perf_timing_patched", False):
+            Scheduler.schedule = wrap_timed_method(
+                Scheduler.schedule,
+                module="vllm.v1.core.sched.scheduler",
+                func="schedule",
+            )
+            Scheduler._perf_timing_patched = True
+            patch_count += 1
+    except ImportError:
+        pass
+
+    try:
+        from vllm.v1.worker.gpu.async_utils import AsyncOutput
+
+        if not getattr(AsyncOutput, "_perf_timing_patched", False):
+            AsyncOutput.get_output = wrap_timed_method(
+                AsyncOutput.get_output,
+                module="vllm.v1.worker.gpu.async_utils",
+                func="get_output",
+            )
+            AsyncOutput._perf_timing_patched = True
+            patch_count += 1
+    except ImportError:
+        pass
+
+    try:
+        from vllm_ascend.worker.worker import NPUWorker
+
+        if not getattr(NPUWorker, "_perf_timing_patched", False):
+            NPUWorker.execute_model = wrap_timed_method(
+                NPUWorker.execute_model,
+                module="vllm_ascend.worker.worker",
+                func="execute_model",
+            )
+            NPUWorker.sample_tokens = wrap_timed_method(
+                NPUWorker.sample_tokens,
+                module="vllm_ascend.worker.worker",
+                func="sample_tokens",
+            )
+            NPUWorker._perf_timing_patched = True
+            patch_count += 1
+    except ImportError:
+        pass
+
+    try:
+        from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
+        from vllm_ascend.core.scheduler_dynamic_batch import SchedulerDynamicBatch
+
+        for cls, module_name in (
+            (SchedulerDynamicBatch, "vllm_ascend.core.scheduler_dynamic_batch"),
+            (RecomputeScheduler, "vllm_ascend.core.recompute_scheduler"),
+        ):
+            if getattr(cls, "_perf_timing_patched", False):
+                continue
+            cls.schedule = wrap_timed_method(
+                cls.schedule,
+                module=module_name,
+                func="schedule",
+            )
+            cls._perf_timing_patched = True
+            patch_count += 1
+    except ImportError:
+        pass
+
+    _PERF_PATCHES_APPLIED = True
+    if patch_count > 0:
+        logger.info("vllm_gr: Applied %d performance timing patch(es)", patch_count)
+    return patch_count
+
+
 def _apply_patches(force: bool = False) -> int:
     """Apply all runtime patches needed by vllm-gr.
 
@@ -752,6 +866,7 @@ def _apply_patches(force: bool = False) -> int:
     kv_merge_count = _apply_kv_merge_patch(force=force)
     ascend_attn_count = _apply_ascend_attention_backend_patch(force=force)
     beam_count = _apply_gr_beam_patches(force=force)
+    perf_count = _apply_perf_logging_patch(force=force)
     npu_worker_count = _patch_npu_worker_init_device()
     return (
         yuanrong_count
@@ -759,6 +874,7 @@ def _apply_patches(force: bool = False) -> int:
         + kv_merge_count
         + ascend_attn_count
         + beam_count
+        + perf_count
         + npu_worker_count
     )
 

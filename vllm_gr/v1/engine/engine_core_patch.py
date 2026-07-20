@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 
 from vllm_gr.v1.attention.backends.beam_attn import _compute_beam_bounds
+from vllm_gr.utils.perf import wrap_timed_method
 
 logger = init_logger(__name__)
 
@@ -1140,6 +1141,31 @@ def apply_worker_patches():
             runner_class._bookkeeping_sync = make_patched_bookkeeping_sync_npu(
                 runner_class._bookkeeping_sync
             )
+
+        if not getattr(runner_class, "_perf_timing_patched", False):
+            runner_class.execute_model = wrap_timed_method(
+                runner_class.execute_model,
+                module=runner_class.__module__,
+                func="execute_model",
+            )
+            if hasattr(runner_class, "sample_tokens"):
+                runner_class.sample_tokens = wrap_timed_method(
+                    runner_class.sample_tokens,
+                    module=runner_class.__module__,
+                    func="sample_tokens",
+                )
+            if runner_name == "NPUModelRunner":
+                runner_class._prepare_inputs = wrap_timed_method(
+                    runner_class._prepare_inputs,
+                    module=runner_class.__module__,
+                    func="_prepare_inputs",
+                )
+                runner_class._bookkeeping_sync = wrap_timed_method(
+                    runner_class._bookkeeping_sync,
+                    module=runner_class.__module__,
+                    func="_bookkeeping_sync",
+                )
+            runner_class._perf_timing_patched = True
 
         runner_class._patched_for_beam_pos_ids = True
         logger.info("%s hooks patched successfully.", runner_name)

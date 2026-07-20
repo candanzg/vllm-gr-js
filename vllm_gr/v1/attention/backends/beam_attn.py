@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
 
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
@@ -640,97 +641,114 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
         seq_lens_cpu_list = common_attn_metadata.seq_lens.cpu().tolist()
 
-        (
-            std_reqs,
-            beam_req_idxs,
-            beam_prefix_lens,
-            beam_widths,
-            beam_decode_steps,
-            beam_cache_lens,
-            beam_q_start_offsets,
-        ) = self._segment_requests(num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list)
+        with function_profile(
+            "vllm_gr.v1.attention.backends.beam_attn", "segment_requests"
+        ):
+            (
+                std_reqs,
+                beam_req_idxs,
+                beam_prefix_lens,
+                beam_widths,
+                beam_decode_steps,
+                beam_cache_lens,
+                beam_q_start_offsets,
+            ) = self._segment_requests(
+                num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list
+            )
 
-        (
-            std_indices,
-            std_seqlens_q_cpu,
-            std_seqlens_kv_cpu,
-            std_req_idxs,
-            std_cu_seqlens_q_cpu,
-            std_cu_seqlens_kv_cpu,
-        ) = self._build_std_mappings(std_reqs, q_starts)
+        with function_profile(
+            "vllm_gr.v1.attention.backends.beam_attn", "build_std_mappings"
+        ):
+            (
+                std_indices,
+                std_seqlens_q_cpu,
+                std_seqlens_kv_cpu,
+                std_req_idxs,
+                std_cu_seqlens_q_cpu,
+                std_cu_seqlens_kv_cpu,
+            ) = self._build_std_mappings(std_reqs, q_starts)
 
-        (
-            prefix_indices,
-            prefix_seqlens_q_cpu,
-            prefix_seqlens_kv_cpu,
-            suffix_seqlens_q_cpu,
-            suffix_seqlens_kv_cpu,
-            prefix_req_idxs_cpu,
-            suffix_slot_mapping_out_list,
-            prefix_cu_seqlens_q_cpu,
-            prefix_cu_seqlens_kv_cpu,
-            suffix_cu_seqlens_q_cpu,
-            suffix_cu_seqlens_kv_cpu,
-            max_prefix_blocks_count,
-        ) = self._build_beam_mappings(
-            beam_req_idxs,
-            beam_prefix_lens,
-            beam_widths,
-            beam_decode_steps,
-            beam_cache_lens,
-            beam_q_start_offsets,
-            q_starts,
-            common_attn_metadata,
-        )
+        with function_profile(
+            "vllm_gr.v1.attention.backends.beam_attn", "build_beam_mappings"
+        ):
+            (
+                prefix_indices,
+                prefix_seqlens_q_cpu,
+                prefix_seqlens_kv_cpu,
+                suffix_seqlens_q_cpu,
+                suffix_seqlens_kv_cpu,
+                prefix_req_idxs_cpu,
+                suffix_slot_mapping_out_list,
+                prefix_cu_seqlens_q_cpu,
+                prefix_cu_seqlens_kv_cpu,
+                suffix_cu_seqlens_q_cpu,
+                suffix_cu_seqlens_kv_cpu,
+                max_prefix_blocks_count,
+            ) = self._build_beam_mappings(
+                beam_req_idxs,
+                beam_prefix_lens,
+                beam_widths,
+                beam_decode_steps,
+                beam_cache_lens,
+                beam_q_start_offsets,
+                q_starts,
+                common_attn_metadata,
+            )
 
-        (
-            std_indices_tensor,
-            std_cu_seqlens_q_device,
-            std_seqlens_kv_device,
-            std_max_q_len,
-            std_max_seq_len,
-            std_block_table,
-        ) = self._create_std_tensors(
-            std_indices,
-            std_seqlens_q_cpu,
-            std_cu_seqlens_q_cpu,
-            std_seqlens_kv_cpu,
-            std_req_idxs,
-            common_attn_metadata,
-            device,
-        )
+        with function_profile(
+            "vllm_gr.v1.attention.backends.beam_attn", "create_std_tensors"
+        ):
+            (
+                std_indices_tensor,
+                std_cu_seqlens_q_device,
+                std_seqlens_kv_device,
+                std_max_q_len,
+                std_max_seq_len,
+                std_block_table,
+            ) = self._create_std_tensors(
+                std_indices,
+                std_seqlens_q_cpu,
+                std_cu_seqlens_q_cpu,
+                std_seqlens_kv_cpu,
+                std_req_idxs,
+                common_attn_metadata,
+                device,
+            )
 
-        (
-            prefix_indices_tensor,
-            prefix_seqlens_kv_device,
-            prefix_max_seq_len,
-            prefix_cu_seqlens_q_device,
-            prefix_max_q_len,
-            prefix_block_table,
-            suffix_seqlens_kv_device,
-            suffix_slot_mapping_out,
-            suffix_max_seq_len,
-            suffix_total_tokens,
-            suffix_cu_seqlens_q_device,
-            suffix_cu_seqlens_k_device,
-            suffix_max_q_len,
-            prefix_scheduler_metadata,
-        ) = self._create_beam_tensors(
-            common_attn_metadata,
-            prefix_indices,
-            prefix_seqlens_q_cpu,
-            prefix_cu_seqlens_q_cpu,
-            prefix_seqlens_kv_cpu,
-            suffix_seqlens_q_cpu,
-            suffix_cu_seqlens_q_cpu,
-            suffix_cu_seqlens_kv_cpu,
-            suffix_seqlens_kv_cpu,
-            suffix_slot_mapping_out_list,
-            prefix_req_idxs_cpu,
-            max_prefix_blocks_count,
-            device,
-            max_num_splits,
-        )
+        with function_profile(
+            "vllm_gr.v1.attention.backends.beam_attn", "create_beam_tensors"
+        ):
+            (
+                prefix_indices_tensor,
+                prefix_seqlens_kv_device,
+                prefix_max_seq_len,
+                prefix_cu_seqlens_q_device,
+                prefix_max_q_len,
+                prefix_block_table,
+                suffix_seqlens_kv_device,
+                suffix_slot_mapping_out,
+                suffix_max_seq_len,
+                suffix_total_tokens,
+                suffix_cu_seqlens_q_device,
+                suffix_cu_seqlens_k_device,
+                suffix_max_q_len,
+                prefix_scheduler_metadata,
+            ) = self._create_beam_tensors(
+                common_attn_metadata,
+                prefix_indices,
+                prefix_seqlens_q_cpu,
+                prefix_cu_seqlens_q_cpu,
+                prefix_seqlens_kv_cpu,
+                suffix_seqlens_q_cpu,
+                suffix_cu_seqlens_q_cpu,
+                suffix_cu_seqlens_kv_cpu,
+                suffix_seqlens_kv_cpu,
+                suffix_slot_mapping_out_list,
+                prefix_req_idxs_cpu,
+                max_prefix_blocks_count,
+                device,
+                max_num_splits,
+            )
 
         meta = BeamAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -890,22 +908,25 @@ class BeamAttentionImpl(AttentionImpl):
                 std_query = query[: attn_metadata.num_std_indices]
             else:
                 std_query = query[attn_metadata.std_indices]
-            std_out = flash_attn_varlen_func(
-                q=std_query,
-                k=key_cache,
-                v=value_cache,
-                cu_seqlens_q=attn_metadata.std_cu_seqlens_q_device,
-                max_seqlen_q=attn_metadata.std_max_q_len,
-                seqused_k=attn_metadata.std_seqlens_kv_device,
-                max_seqlen_k=attn_metadata.std_max_seq_len,
-                softmax_scale=scale,
-                causal=attn_metadata.causal,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=attn_metadata.std_block_table,
-                softcap=logits_soft_cap,
-                fa_version=vllm_flash_attn_version,
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_gpu_std_attention"
+            ):
+                std_out = flash_attn_varlen_func(
+                    q=std_query,
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=attn_metadata.std_cu_seqlens_q_device,
+                    max_seqlen_q=attn_metadata.std_max_q_len,
+                    seqused_k=attn_metadata.std_seqlens_kv_device,
+                    max_seqlen_k=attn_metadata.std_max_seq_len,
+                    softmax_scale=scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=attn_metadata.std_block_table,
+                    softcap=logits_soft_cap,
+                    fa_version=vllm_flash_attn_version,
+                )
             if attn_metadata.prefix_indices is None:
                 output[: attn_metadata.num_std_indices] = std_out
             else:
@@ -917,53 +938,62 @@ class BeamAttentionImpl(AttentionImpl):
             else:
                 beam_query = query[attn_metadata.prefix_indices]
 
-            prefix_out, prefix_lse = flash_attn_varlen_func(
-                q=beam_query,
-                k=key_cache,
-                v=value_cache,
-                cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
-                seqused_k=attn_metadata.prefix_seqlens_kv_device,
-                max_seqlen_q=attn_metadata.prefix_max_q_len,
-                max_seqlen_k=attn_metadata.prefix_max_seq_len,
-                softmax_scale=scale,
-                causal=False,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=attn_metadata.prefix_block_table,
-                softcap=logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=vllm_flash_attn_version,
-                scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-                num_splits=attn_metadata.max_num_splits,
-                s_aux=s_aux,
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_gpu_prefix_attention"
+            ):
+                prefix_out, prefix_lse = flash_attn_varlen_func(
+                    q=beam_query,
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=attn_metadata.prefix_cu_seqlens_q_device,
+                    seqused_k=attn_metadata.prefix_seqlens_kv_device,
+                    max_seqlen_q=attn_metadata.prefix_max_q_len,
+                    max_seqlen_k=attn_metadata.prefix_max_seq_len,
+                    softmax_scale=scale,
+                    causal=False,
+                    alibi_slopes=alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=attn_metadata.prefix_block_table,
+                    softcap=logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=vllm_flash_attn_version,
+                    scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+                    num_splits=attn_metadata.max_num_splits,
+                    s_aux=s_aux,
+                )
 
-            contig_k, contig_v = extract_suffix_kv(
-                key_cache,
-                value_cache,
-                attn_metadata.suffix_slot_mapping_out,
-                attn_metadata.suffix_total_tokens,
-                attn_metadata.block_size,
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_gpu_extract_suffix_kv"
+            ):
+                contig_k, contig_v = extract_suffix_kv(
+                    key_cache,
+                    value_cache,
+                    attn_metadata.suffix_slot_mapping_out,
+                    attn_metadata.suffix_total_tokens,
+                    attn_metadata.block_size,
+                )
 
-            suffix_out, suffix_lse = flash_attn_varlen_func(
-                q=beam_query,
-                k=contig_k,
-                v=contig_v,
-                cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
-                cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
-                seqused_k=None,
-                max_seqlen_q=attn_metadata.suffix_max_q_len,
-                max_seqlen_k=attn_metadata.suffix_max_seq_len,
-                softmax_scale=scale,
-                causal=True,
-                alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=None,
-                softcap=logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=vllm_flash_attn_version,
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_gpu_suffix_attention"
+            ):
+                suffix_out, suffix_lse = flash_attn_varlen_func(
+                    q=beam_query,
+                    k=contig_k,
+                    v=contig_v,
+                    cu_seqlens_q=attn_metadata.suffix_cu_seqlens_q_device,
+                    cu_seqlens_k=attn_metadata.suffix_cu_seqlens_k_device,
+                    seqused_k=None,
+                    max_seqlen_q=attn_metadata.suffix_max_q_len,
+                    max_seqlen_k=attn_metadata.suffix_max_seq_len,
+                    softmax_scale=scale,
+                    causal=True,
+                    alibi_slopes=alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=None,
+                    softcap=logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=vllm_flash_attn_version,
+                )
             group_size = attn_metadata.num_heads // attn_metadata.num_kv_heads
             if (
                 attn_metadata.suffix_max_q_len == 1
@@ -979,7 +1009,10 @@ class BeamAttentionImpl(AttentionImpl):
                 )
 
             out = torch.empty_like(beam_query)
-            merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_gpu_merge_attention"
+            ):
+                merge_attn_states(out, prefix_out, prefix_lse, suffix_out, suffix_lse)
             if attn_metadata.std_indices is None:
                 output[: attn_metadata.num_prefix_indices] = out
             else:
@@ -1005,21 +1038,24 @@ class BeamAttentionImpl(AttentionImpl):
                 std_query = query[: attn_metadata.num_std_indices]
             else:
                 std_query = query[attn_metadata.std_indices]
-            std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                query=std_query,
-                key=key_cache.view(*key_cache.shape[:-2], -1),
-                value=value_cache.view(*value_cache.shape[:-2], -1),
-                atten_mask=attn_metadata.npu_causal_atten_mask if attn_metadata.causal else None,
-                block_table=attn_metadata.std_block_table,
-                input_layout="TND",
-                block_size=attn_metadata.block_size,
-                actual_seq_qlen=attn_metadata.std_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.std_seqlens_kv_cpu,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                num_query_heads=attn_metadata.num_heads,
-                softmax_scale=scale,
-                sparse_mode=3 if attn_metadata.causal else 0,
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_npu_std_attention"
+            ):
+                std_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query=std_query,
+                    key=key_cache.view(*key_cache.shape[:-2], -1),
+                    value=value_cache.view(*value_cache.shape[:-2], -1),
+                    atten_mask=attn_metadata.npu_causal_atten_mask if attn_metadata.causal else None,
+                    block_table=attn_metadata.std_block_table,
+                    input_layout="TND",
+                    block_size=attn_metadata.block_size,
+                    actual_seq_qlen=attn_metadata.std_cu_seqlens_q_cpu,
+                    actual_seq_kvlen=attn_metadata.std_seqlens_kv_cpu,
+                    num_key_value_heads=attn_metadata.num_kv_heads,
+                    num_query_heads=attn_metadata.num_heads,
+                    softmax_scale=scale,
+                    sparse_mode=3 if attn_metadata.causal else 0,
+                )
             if attn_metadata.prefix_indices is None:
                 output[: attn_metadata.num_std_indices] = std_out
             else:
@@ -1030,45 +1066,59 @@ class BeamAttentionImpl(AttentionImpl):
                 beam_query = query[: attn_metadata.num_prefix_indices]
             else:
                 beam_query = query[attn_metadata.prefix_indices]
-            prefix_out, prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                query=beam_query,
-                key=key_cache.view(*key_cache.shape[:-2], -1),
-                value=value_cache.view(*value_cache.shape[:-2], -1),
-                block_table=attn_metadata.prefix_block_table,
-                input_layout="TND",
-                atten_mask=None,
-                block_size=attn_metadata.block_size,
-                actual_seq_qlen=attn_metadata.prefix_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.prefix_seqlens_kv_cpu,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                num_query_heads=attn_metadata.num_heads,
-                softmax_scale=scale,
-                return_softmax_lse=True,
-                sparse_mode=0,  # prefix attention is non-causal (full)
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_npu_prefix_attention"
+            ):
+                prefix_out, prefix_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                    query=beam_query,
+                    key=key_cache.view(*key_cache.shape[:-2], -1),
+                    value=value_cache.view(*value_cache.shape[:-2], -1),
+                    block_table=attn_metadata.prefix_block_table,
+                    input_layout="TND",
+                    atten_mask=None,
+                    block_size=attn_metadata.block_size,
+                    actual_seq_qlen=attn_metadata.prefix_cu_seqlens_q_cpu,
+                    actual_seq_kvlen=attn_metadata.prefix_seqlens_kv_cpu,
+                    num_key_value_heads=attn_metadata.num_kv_heads,
+                    num_query_heads=attn_metadata.num_heads,
+                    softmax_scale=scale,
+                    return_softmax_lse=True,
+                    sparse_mode=0,  # prefix attention is non-causal (full)
+                )
 
-            contig_k, contig_v = extract_suffix_kv_pytorch(
-                key_cache, value_cache, attn_metadata.suffix_slot_mapping_out
-            )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_npu_extract_suffix_kv"
+            ):
+                contig_k, contig_v = extract_suffix_kv_pytorch(
+                    key_cache, value_cache, attn_metadata.suffix_slot_mapping_out
+                )
 
-            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
-                beam_query,
-                contig_k,
-                contig_v,
-                num_query_heads=attn_metadata.num_heads,
-                num_key_value_heads=attn_metadata.num_kv_heads,
-                actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
-                actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
-                softmax_scale=scale,
-                atten_mask=attn_metadata.npu_causal_atten_mask,
-                block_table=None,
-                block_size=0,
-                sparse_mode=3,
-                inner_precise=0,
-                input_layout="TND",
-                return_softmax_lse=True,
-            )
-            out, _ = merge_tnd_attention_outputs(prefix_out, prefix_lse, suffix_out, suffix_lse)
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_npu_suffix_attention"
+            ):
+                suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                    beam_query,
+                    contig_k,
+                    contig_v,
+                    num_query_heads=attn_metadata.num_heads,
+                    num_key_value_heads=attn_metadata.num_kv_heads,
+                    actual_seq_qlen=attn_metadata.suffix_cu_seqlens_q_cpu,
+                    actual_seq_kvlen=attn_metadata.suffix_cu_seqlens_kv_cpu,
+                    softmax_scale=scale,
+                    atten_mask=attn_metadata.npu_causal_atten_mask,
+                    block_table=None,
+                    block_size=0,
+                    sparse_mode=3,
+                    inner_precise=0,
+                    input_layout="TND",
+                    return_softmax_lse=True,
+                )
+            with function_profile(
+                "vllm_gr.v1.attention.backends.beam_attn", "cascade_npu_merge_attention"
+            ):
+                out, _ = merge_tnd_attention_outputs(
+                    prefix_out, prefix_lse, suffix_out, suffix_lse
+                )
             if attn_metadata.std_indices is None:
                 output[: attn_metadata.num_prefix_indices] = out
             else:
@@ -1129,67 +1179,81 @@ class BeamAttentionImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert output is not None, "Output tensor must be provided."
-        if CUDA_DEVICE:
-            assert self.vllm_flash_attn_version is not None, "FlashAttention version not detected."
+        with function_profile("vllm_gr.v1.attention.backends.beam_attn", "attention_forward"):
+            assert output is not None, "Output tensor must be provided."
+            if CUDA_DEVICE:
+                assert self.vllm_flash_attn_version is not None, (
+                    "FlashAttention version not detected."
+                )
 
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "fused output quantization is not yet supported for BeamAttentionImpl"
+            if output_scale is not None or output_block_scale is not None:
+                raise NotImplementedError(
+                    "fused output quantization is not yet supported for BeamAttentionImpl"
+                )
+            if attn_metadata is None:
+                return output.fill_(0)
+
+            # NPU provides kv_cache as a tuple (key_cache, value_cache);
+            # GPU provides a stacked tensor [2, num_blocks, ...]
+            if isinstance(kv_cache, tuple):
+                key_cache, value_cache = kv_cache[0], kv_cache[1]
+            else:
+                key_cache, value_cache = kv_cache.unbind(0)
+
+            if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
+                if NPU_DEVICE:
+                    with function_profile(
+                        "vllm_gr.v1.attention.backends.beam_attn", "reshape_and_cache_npu"
+                    ):
+                        torch_npu._npu_reshape_and_cache(
+                            key,
+                            value,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.slot_mapping,
+                        )
+                elif CUDA_DEVICE:
+                    with function_profile(
+                        "vllm_gr.v1.attention.backends.beam_attn", "reshape_and_cache_gpu"
+                    ):
+                        reshape_and_cache_flash(
+                            key,
+                            value,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.slot_mapping,
+                            self.kv_cache_dtype,
+                            layer._k_scale,
+                            layer._v_scale,
+                        )
+
+            if self.kv_cache_dtype.startswith("fp8"):
+                with function_profile(
+                    "vllm_gr.v1.attention.backends.beam_attn", "view_fp8_kv_cache"
+                ):
+                    dtype = BeamAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
+                    key_cache = key_cache.view(dtype)
+                    value_cache = value_cache.view(dtype)
+
+            sliding_window_size = (
+                list(self.sliding_window) if self.sliding_window is not None else None
             )
-        if attn_metadata is None:
-            return output.fill_(0)
 
-        # NPU provides kv_cache as a tuple (key_cache, value_cache);
-        # GPU provides a stacked tensor [2, num_blocks, ...]
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = kv_cache[0], kv_cache[1]
-        else:
-            key_cache, value_cache = kv_cache.unbind(0)
+            BeamAttentionImpl.cascade_attention(
+                output=output,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                attn_metadata=attn_metadata,
+                sliding_window_size=sliding_window_size,
+                scale=self.scale,
+                logits_soft_cap=self.logits_soft_cap,
+                vllm_flash_attn_version=self.vllm_flash_attn_version,
+                s_aux=self.sinks,
+                alibi_slopes=self.alibi_slopes,
+            )
 
-        if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
-            if NPU_DEVICE:
-                torch_npu._npu_reshape_and_cache(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                )
-            elif CUDA_DEVICE:
-                reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
-
-        if self.kv_cache_dtype.startswith("fp8"):
-            dtype = BeamAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
-            key_cache = key_cache.view(dtype)
-            value_cache = value_cache.view(dtype)
-
-        sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
-
-        BeamAttentionImpl.cascade_attention(
-            output=output,
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            attn_metadata=attn_metadata,
-            sliding_window_size=sliding_window_size,
-            scale=self.scale,
-            logits_soft_cap=self.logits_soft_cap,
-            vllm_flash_attn_version=self.vllm_flash_attn_version,
-            s_aux=self.sinks,
-            alibi_slopes=self.alibi_slopes,
-        )
-
-        return output
+            return output
 
 
 @register_backend(AttentionBackendEnum.CUSTOM)

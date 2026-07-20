@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.v1.metrics.function_profile import runtime_function_profile as function_profile
 
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
@@ -67,11 +68,14 @@ def prepare_request_fn(
         tokenization_kwargs = {}
     from vllm.entrypoints.utils import _validate_truncation_size
 
-    _validate_truncation_size(
-        self.model_config.max_model_len,
-        params.truncate_prompt_tokens,
-        tokenization_kwargs,
-    )
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "prepare_request_validate_truncation"
+    ):
+        _validate_truncation_size(
+            self.model_config.max_model_len,
+            params.truncate_prompt_tokens,
+            tokenization_kwargs,
+        )
 
     # Convert Input --> Request.
     if isinstance(prompt, EngineCoreRequest):
@@ -79,36 +83,54 @@ def prepare_request_fn(
     else:
         if prompt_text is not None:
             raise ValueError("should only provide prompt_text with EngineCoreRequest")
-        request = self.input_processor.process_inputs(
-            request_id,
-            prompt,
-            params,
-            arrival_time or time.time(),
-            lora_request,
-            tokenization_kwargs,
-            trace_headers,
-            priority,
-            data_parallel_rank,
-        )
-        if isinstance(prompt, str):
-            prompt_text = prompt
-        elif isinstance(prompt, Mapping):
-            # Get the value, and if it's not a string, default to an empty string
-            value = prompt.get("prompt")
-            prompt_text = value if isinstance(value, str) else ""
-        else:
-            prompt_text = ""
+        with function_profile(
+            "vllm_gr.v1.engine.async_llm", "prepare_request_process_inputs"
+        ):
+            request = self.input_processor.process_inputs(
+                request_id,
+                prompt,
+                params,
+                arrival_time or time.time(),
+                lora_request,
+                tokenization_kwargs,
+                trace_headers,
+                priority,
+                data_parallel_rank,
+            )
+        with function_profile(
+            "vllm_gr.v1.engine.async_llm", "prepare_request_prompt_text"
+        ):
+            if isinstance(prompt, str):
+                prompt_text = prompt
+            elif isinstance(prompt, Mapping):
+                # Get the value, and if it's not a string, default to an empty string
+                value = prompt.get("prompt")
+                prompt_text = value if isinstance(value, str) else ""
+            else:
+                prompt_text = ""
 
-    self.input_processor.assign_request_id(request)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "prepare_request_assign_request_id"
+    ):
+        self.input_processor.assign_request_id(request)
 
-    self._run_output_handler()
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "prepare_request_run_output_handler"
+    ):
+        self._run_output_handler()
 
-    # Create a new output collector for the request.
-    queue = RequestOutputCollector(params.output_kind, request.request_id)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "prepare_request_create_output_collector"
+    ):
+        # Create a new output collector for the request.
+        queue = RequestOutputCollector(params.output_kind, request.request_id)
 
-    # Register the request in OutputProcessor (this process) but
-    # do NOT send to EngineCore yet.
-    self.output_processor.add_request(request, prompt_text, None, 0, queue)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "prepare_request_add_output_request"
+    ):
+        # Register the request in OutputProcessor (this process) but
+        # do NOT send to EngineCore yet.
+        self.output_processor.add_request(request, prompt_text, None, 0, queue)
 
     if self.log_requests:
         logger.info("Prepared request %s.", request.request_id)
@@ -125,9 +147,12 @@ async def _add_requests_batch_fn(
 
     Args:
         use_batch_message: If True, always send as ADD_BATCH (needed for
-            beam cache). If False, send individual ADD messages.
+        beam cache). If False, send individual ADD messages.
     """
-    await self.engine_core.add_requests_async(requests, force_batch=use_batch_message)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "add_requests_batch"
+    ):
+        await self.engine_core.add_requests_async(requests, force_batch=use_batch_message)
 
 
 def register_beam_output_fn(
@@ -148,30 +173,45 @@ def register_beam_output_fn(
     from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.output_processor import RequestOutputCollector
 
-    ec_request = EngineCoreRequest(
-        request_id=request_id,
-        prompt_token_ids=prompt_token_ids,
-        mm_features=None,
-        sampling_params=sampling_params,
-        pooling_params=None,
-        eos_token_id=eos_token_id,
-        arrival_time=time.time(),
-        lora_request=lora_request,
-        cache_salt=None,
-        data_parallel_rank=data_parallel_rank,
-        trace_headers=trace_headers,
-        priority=priority,
-    )
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "register_beam_output_create_request"
+    ):
+        ec_request = EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            eos_token_id=eos_token_id,
+            arrival_time=time.time(),
+            lora_request=lora_request,
+            cache_salt=None,
+            data_parallel_rank=data_parallel_rank,
+            trace_headers=trace_headers,
+            priority=priority,
+        )
     # Set external_req_id directly (skip assign_request_id which
     # would mangle the ID that EngineCore already knows about).
     ec_request.external_req_id = request_id
 
-    self._run_output_handler()
-    queue = RequestOutputCollector(sampling_params.output_kind, request_id)
-    self.output_processor.add_request(ec_request, None, None, 0, queue)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "register_beam_output_run_output_handler"
+    ):
+        self._run_output_handler()
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "register_beam_output_create_output_collector"
+    ):
+        queue = RequestOutputCollector(sampling_params.output_kind, request_id)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "register_beam_output_add_request"
+    ):
+        self.output_processor.add_request(ec_request, None, None, 0, queue)
     return queue
 
 
 async def beam_request_step_update_fn(self, update: BeamRequestStepUpdate) -> None:
     """Send BEAM_REQUEST_STEP_UPDATE to EngineCore to grouped processing."""
-    await self.engine_core.beam_request_step_update_async(update)
+    with function_profile(
+        "vllm_gr.v1.engine.async_llm", "beam_request_step_update"
+    ):
+        await self.engine_core.beam_request_step_update_async(update)
