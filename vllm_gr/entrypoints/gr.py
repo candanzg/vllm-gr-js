@@ -561,7 +561,27 @@ class GRLLM(LLM):
         if concurrency_limit is None:
             concurrency_limit = len(prompts)
 
+        # With a catalog, obtain the complete per-beam vocabulary distribution;
+        # filtering a beam_width-sized upstream Top-K is not equivalent to
+        # constrained Top-K and can discard valid candidates.
         logprobs_num = beam_width
+        if self.catalog is not None:
+            # Full-vocabulary logprobs require max_logprobs=-1 in vLLM.  When
+            # a deployment intentionally caps this value, request that cap so
+            # parameter validation succeeds while still widening the Catalog
+            # candidate window as far as the runtime permits.
+            vllm_config = getattr(self.llm_engine, "vllm_config", None)
+            model_config = getattr(vllm_config, "model_config", None)
+            if model_config is None:
+                input_processor = getattr(self.llm_engine, "input_processor", None)
+                model_config = getattr(input_processor, "model_config", None)
+            max_logprobs = getattr(model_config, "max_logprobs", None)
+            if max_logprobs is None:
+                # Keep compatibility with wrappers that do not expose the
+                # model config instead of requesting an unvalidated full-vocab
+                # logprob set.
+                max_logprobs = beam_width
+            logprobs_num = -1 if max_logprobs == -1 else max(beam_width, max_logprobs)
         # generate beam_width candidates at each step
         beam_search_params = SamplingParams(
             logprobs=logprobs_num,

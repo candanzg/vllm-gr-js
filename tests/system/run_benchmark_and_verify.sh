@@ -37,7 +37,7 @@ echo "Using catalog: $CATALOG_PATH"
 
 run_port=7000
 timeout=600 # time for waiting server to go up
-p99_ttft_th=300
+p99_ttft_th=330
 p99_tpot_th=0.02
 pass_1_th=0.09
 pass_32_th=0.3

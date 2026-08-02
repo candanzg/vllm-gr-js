@@ -268,7 +268,30 @@ async def beam_search(
     prompt_text = prompt if isinstance(prompt, str) else prompt.get("prompt")
     prompt_token_ids = [] if isinstance(prompt, str) else prompt.get("prompt_token_ids", [])
     tokenized_length = len(prompt_token_ids)
+    # Catalog-constrained decoding must rank *after* applying the constraint.
+    # Requesting only beam_width alternatives lets invalid high-probability
+    # tokens consume the upstream Top-K window.  ``-1`` makes vLLM return the
+    # complete vocabulary so valid lower-ranked tokens remain available.
     logprobs_num = beam_width
+    if self.models.catalog is not None:
+        # ``-1`` means full vocabulary, but vLLM validates the expanded value
+        # against model_config.max_logprobs.  Respect a finite deployment cap
+        # (for example 1024) while using full vocabulary when explicitly
+        # enabled with max_logprobs=-1.
+        model_config = getattr(self.engine_client, "model_config", None)
+        if model_config is None:
+            vllm_config = getattr(self.engine_client, "vllm_config", None)
+            model_config = getattr(vllm_config, "model_config", None)
+        if model_config is None:
+            input_processor = getattr(self.engine_client, "input_processor", None)
+            model_config = getattr(input_processor, "model_config", None)
+        max_logprobs = getattr(model_config, "max_logprobs", None)
+        if max_logprobs is None:
+            # Older engine wrappers and lightweight test doubles may not
+            # expose model_config.  A finite fallback keeps request validation
+            # safe; real AsyncLLM clients take the configured runtime cap.
+            max_logprobs = beam_width
+        logprobs_num = -1 if max_logprobs == -1 else max(beam_width, max_logprobs)
 
     beam_search_params = SamplingParams(
         logprobs=logprobs_num,
@@ -465,7 +488,15 @@ async def beam_search(
                 raw_decoded = getattr(flat, "decoded_tokens", None)
                 total_logprobs = len(raw_token_ids)
 
-                stride_k = total_logprobs // logprobs_num
+                # Full-vocabulary logprobs are still emitted as equal-sized
+                # blocks, but ``logprobs_num`` is -1 and cannot be used as a
+                # divisor.  Derive the physical block width from the remuxed
+                # response in that mode.
+                stride_k = (
+                    total_logprobs // len(fork_info)
+                    if logprobs_num == -1
+                    else total_logprobs // logprobs_num
+                )
 
                 # Each logical beam block should extract its top choices natively
                 for b_idx in range(len(fork_info)):

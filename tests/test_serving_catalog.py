@@ -324,7 +324,7 @@ async def _uniqueness_impl() -> None:
             trust_remote_code=True,
             enforce_eager=True,
             enable_log_requests=False,
-            max_logprobs=1024,
+            max_logprobs=beam_width,
         )
         setattr(engine_args, "catalog_path", catalog_path)
 

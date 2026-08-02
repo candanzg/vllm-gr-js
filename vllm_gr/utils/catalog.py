@@ -199,11 +199,25 @@ class Catalog:
         if decoded_pos is not None:
             new_decoded = [decoded_pos[i] if i < len(decoded_pos) else None for i in range(n)]
         fill_used = 0
+        used_token_ids = set(new_tids)
         for j, tid in enumerate(token_ids_pos):
             if tid not in valid_tokens_set:
-                ft = valid_list[fill_used % n_valid]
+                if len(used_token_ids) < n_valid:
+                    # Prefer a token that does not already exist in this
+                    # candidate window, so the fill path does not create
+                    # duplicate outputs within the same beam block.
+                    while valid_list[fill_used % n_valid] in used_token_ids:
+                        fill_used += 1
+                    ft = valid_list[fill_used % n_valid]
+                else:
+                    # Fallback: all valid tokens are already present in this
+                    # window, so keep the previous deterministic cycling
+                    # behavior.
+                    ft = valid_list[fill_used % n_valid]
+
                 new_tids[j] = ft
                 new_lps[j] = -10000.0 - (fill_used % n_valid) * 0.1
+                used_token_ids.add(ft)
                 fill_used += 1
                 if new_ranks is not None:
                     new_ranks[j] = None

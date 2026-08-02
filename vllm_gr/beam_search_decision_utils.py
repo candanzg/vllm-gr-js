@@ -66,7 +66,22 @@ def extract_and_dedup_segment(
     ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
     decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
 
-    if len(token_ids_pos) > logprobs_num:
+    # ``logprobs=-1`` asks vLLM for the complete vocabulary.  In that mode
+    # there is no Top-K truncation to apply; only remove the sampled token's
+    # duplicate from the alternatives (when present), preserving rank order.
+    if logprobs_num == -1:
+        if len(token_ids_pos) > 1 and any(
+            token_ids_pos[0] == token_ids_pos[j] for j in range(1, len(token_ids_pos))
+        ):
+            duplicate_index = next(
+                j for j in range(1, len(token_ids_pos)) if token_ids_pos[0] == token_ids_pos[j]
+            )
+            keep = [j for j in range(len(token_ids_pos)) if j != duplicate_index]
+            token_ids_pos = [token_ids_pos[j] for j in keep]
+            logprobs_pos = [logprobs_pos[j] for j in keep]
+            ranks_pos = [ranks_pos[j] for j in keep] if ranks_pos is not None else None
+            decoded_pos = [decoded_pos[j] for j in keep] if decoded_pos is not None else None
+    elif len(token_ids_pos) > logprobs_num:
         if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
             selected = slice(1, logprobs_num + 1)
         else:
