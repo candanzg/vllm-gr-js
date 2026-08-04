@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 from vllm_gr.v1.beam.context import BEAM_DATA_VAR
 from vllm_gr.v1.beam.geometry import _compute_beam_bounds
 
@@ -271,11 +272,12 @@ class Mock2DArray:
 
 
 class InputBatchProxy:
-    def __init__(self, obj, req_map, idx_map, logits_map):
+    def __init__(self, obj, req_map, idx_map, logits_map, allowed_token_ids=None):
         object.__setattr__(self, "_obj", obj)
         object.__setattr__(self, "_req_id_map", req_map)
         object.__setattr__(self, "_batch_idx_map", idx_map)
         object.__setattr__(self, "_logit_idx_map", logits_map)
+        object.__setattr__(self, "_allowed_token_ids", allowed_token_ids)
 
     def __getattr__(self, name):
         obj = object.__getattribute__(self, "_obj")
@@ -302,6 +304,56 @@ class InputBatchProxy:
                 if isinstance(val, torch.Tensor) and val.numel() > 0:
                     if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
                         object.__setattr__(s_meta, attr, val[logits_map])
+
+            allowed_token_ids = object.__getattribute__(self, "_allowed_token_ids")
+            original_mask = getattr(s_meta, "allowed_token_ids_mask", None)
+            slice_offset, slice_size, _ = get_vocab_slice_config()
+            slice_enabled = (
+                is_vocab_slice_enabled() and slice_offset is not None and slice_size is not None
+            )
+            mask_vocab_size = slice_size if slice_enabled else getattr(obj, "vocab_size", None)
+            expanded_mask = original_mask
+            if expanded_mask is not None and slice_enabled:
+                slice_end = slice_offset + slice_size
+                if expanded_mask.shape[1] != slice_size:
+                    if expanded_mask.shape[1] < slice_end:
+                        raise RuntimeError(
+                            "Catalog mask width does not cover the configured vocabulary slice"
+                        )
+                    expanded_mask = expanded_mask[:, slice_offset:slice_end]
+            if expanded_mask is not None and expanded_mask.shape[0] != len(logits_map):
+                expanded_mask = expanded_mask[logits_map].clone()
+
+            if allowed_token_ids is not None and any(ids is not None for ids in allowed_token_ids):
+                if len(allowed_token_ids) != len(logits_map):
+                    raise RuntimeError(
+                        "Grouped Catalog mask rows do not match the sampler logits rows"
+                    )
+                if expanded_mask is None:
+                    vocab_size = mask_vocab_size
+                    device = getattr(obj, "device", None)
+                    if vocab_size is None or device is None:
+                        raise RuntimeError(
+                            "Catalog-constrained grouped beam sampling requires input batch "
+                            "vocab_size and device metadata"
+                        )
+                    expanded_mask = torch.zeros(
+                        (len(logits_map), vocab_size), dtype=torch.bool, device=device
+                    )
+                for row, token_ids in enumerate(allowed_token_ids):
+                    if token_ids is None:
+                        continue
+                    if slice_enabled:
+                        token_ids = [
+                            token_id - slice_offset
+                            for token_id in token_ids
+                            if slice_offset <= token_id < slice_offset + slice_size
+                        ]
+                    expanded_mask[row].fill_(True)
+                    expanded_mask[row, token_ids] = False
+
+            if expanded_mask is not original_mask:
+                object.__setattr__(s_meta, "allowed_token_ids_mask", expanded_mask)
             return s_meta
 
         elif name == "req_ids":
@@ -350,6 +402,7 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
 
     token_offset = 0
     row_to_req_id, row_to_batch_idx, logits_to_batch_idx, request_row_configs = ([], [], [], [])
+    logits_allowed_token_ids: List[Optional[List[int]]] = []
     input_row_idx = 0
 
     gpu_positions, cpu_positions = _get_positions_buffers(runner)
@@ -382,6 +435,17 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
             request_row_configs.append(
                 (req_id, input_row_idx, beams_count_with_logits, active_beam_ids)
             )
+            per_beam_allowed = mdata.get("allowed_token_ids")
+            if per_beam_allowed is None:
+                logits_allowed_token_ids.extend([None] * beams_count_with_logits)
+            else:
+                if any(beam_id >= len(per_beam_allowed) for beam_id in active_beam_ids):
+                    raise RuntimeError(
+                        f"Grouped Catalog mask is missing active beam rows for request {req_id!r}"
+                    )
+                logits_allowed_token_ids.extend(
+                    [per_beam_allowed[beam_id] for beam_id in active_beam_ids]
+                )
             input_row_idx += beams_count
         else:
             num_computed_tokens = runner.input_batch.num_computed_tokens_cpu[batch_idx]
@@ -401,12 +465,17 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> List[i
             row_to_batch_idx.extend([batch_idx] * beams_count)
 
             request_row_configs.append((req_id, input_row_idx, beams_count_with_logits, []))
+            logits_allowed_token_ids.extend([None] * beams_count_with_logits)
             input_row_idx += beams_count
 
         token_offset += seq_len
 
     runner.input_batch = InputBatchProxy(
-        runner.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx
+        runner.input_batch,
+        row_to_req_id,
+        row_to_batch_idx,
+        logits_to_batch_idx,
+        logits_allowed_token_ids,
     )
     scheduler_output._gr_request_row_configs = request_row_configs
 

@@ -91,6 +91,7 @@ def _handle_beam_request_step_update(self, update) -> None:
         len(update.beam_tokens) != beam_width
         or len(update.parent_beam_ids) != beam_width
         or len(update.child_beam_ids) != beam_width
+        or (update.allowed_token_ids is not None and len(update.allowed_token_ids) != beam_width)
     ):
         logger.error("BEAM_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
         for child_id in update.child_beam_ids:
@@ -187,6 +188,7 @@ def _handle_beam_request_step_update(self, update) -> None:
     req.is_beam_decode = True  # Flag indicating it's the decode stage
     req.beam_decode_steps = decode_steps
     req.prefix_len = update.prefix_len
+    req.beam_allowed_token_ids = update.allowed_token_ids
 
     self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, update.current_wave)))
 

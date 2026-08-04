@@ -38,7 +38,6 @@ from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
-    mask_candidate_logprobs,
     materialize_selected_beams,
     select_top_indices,
 )
@@ -46,7 +45,10 @@ from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
 )
-from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.sampling_params import (
+    clone_beam_decode_sampling_params,
+    validate_beam_logprobs_capacity,
+)
 from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
@@ -107,6 +109,7 @@ def _prepare_beam_step_requests(
     instance_fork_info: dict[int, ForkInfo],
     instance_prefix_len: dict[int, int],
     instance_completed_sessions: set[int],
+    catalog: Catalog | None = None,
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
@@ -124,6 +127,28 @@ def _prepare_beam_step_requests(
 
         session_id = instance_prefill_id.get(j)
         fork_info_j = instance_fork_info.get(j)
+        allowed_token_ids = None
+        if catalog is not None:
+            allowed_token_ids = [
+                sorted(catalog.valid(beam.tokens[instance.prompt_len :])) for beam in instance.beams
+            ]
+            keep_indices = [i for i, token_ids in enumerate(allowed_token_ids) if token_ids]
+            if len(keep_indices) != len(instance.beams):
+                instance.beams = [instance.beams[i] for i in keep_indices]
+                allowed_token_ids = [allowed_token_ids[i] for i in keep_indices]
+                if fork_info_j is not None:
+                    fork_info_j = [fork_info_j[i] for i in keep_indices]
+                    instance_fork_info[j] = fork_info_j
+            if not instance.beams:
+                if j not in instance_completed_sessions and j in instance_prefill_id:
+                    _beam_request_cleanup(
+                        llm_engine,
+                        instance_prefill_id[j],
+                        instance_prev_beam_internal_ids[j],
+                    )
+                    instance_completed_sessions.add(j)
+                continue
+
         if token > 0 and fork_info_j is not None:
             # BEAM_REQUEST path
             parent_beam_ids = []
@@ -143,7 +168,10 @@ def _prepare_beam_step_requests(
 
             # One grouped-beam execution is one logical upstream request.
             # Beam width travels separately in BeamRequestStepUpdate.
-            decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
+            allowed_union = set().union(*allowed_token_ids) if allowed_token_ids else None
+            decode_sampling_params = clone_beam_decode_sampling_params(
+                beam_search_params, allowed_union
+            )
             eos_token_id = (
                 sid_end_token_id if sid_end_token_id is not None else tokenizer.eos_token_id
             )
@@ -177,6 +205,7 @@ def _prepare_beam_step_requests(
                 prefix_len=prefix_len,
                 beam_width=W,
                 sampling_params=decode_sampling_params,
+                allowed_token_ids=allowed_token_ids,
                 eos_token_id=sid_end_token_id
                 if sid_end_token_id is not None
                 else tokenizer.eos_token_id,
@@ -194,10 +223,14 @@ def _prepare_beam_step_requests(
 
             request_id_item = f"{request_id_batch}-0"
             tokens_prompt = _create_tokens_prompt_from_beam(instance.beams[0])
+            request_sampling_params = clone_beam_decode_sampling_params(
+                beam_search_params,
+                allowed_token_ids[0] if allowed_token_ids is not None else None,
+            )
             ec_req = llm_engine.input_processor.process_inputs(
                 request_id=request_id_item,
                 prompt=tokens_prompt,
-                params=beam_search_params,
+                params=request_sampling_params,
                 supported_tasks=llm_engine.get_supported_tasks(),
                 arrival_time=time.time(),
                 lora_request=instance.beams[0].lora_request,
@@ -294,10 +327,13 @@ def _parse_step_logprobs(
             if catalog is not None:
                 generated_tokens = current_beam.tokens[instance.prompt_len :]
                 valid_tokens_set = catalog.valid(generated_tokens)
-                logprobs_pos = mask_candidate_logprobs(
+                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = catalog.apply_catalog_filter(
                     token_ids_pos,
                     logprobs_pos,
+                    ranks_pos,
+                    decoded_pos,
                     valid_tokens_set,
+                    catalog_strategy,
                 )
 
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -312,10 +348,13 @@ def _parse_step_logprobs(
             current_beam = instance.beams[0]
             generated_tokens = current_beam.tokens[instance.prompt_len :]
             valid_tokens_set = catalog.valid(generated_tokens)
-            logprobs_pos = mask_candidate_logprobs(
+            token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = catalog.apply_catalog_filter(
                 token_ids_pos,
                 logprobs_pos,
+                ranks_pos,
+                decoded_pos,
                 valid_tokens_set,
+                catalog_strategy,
             )
 
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -372,6 +411,7 @@ def _custom_beam_search_batch(
             instance_fork_info=instance_fork_info,
             instance_prefix_len=instance_prefix_len,
             instance_completed_sessions=instance_completed_sessions,
+            catalog=catalog,
         )
 
         if engine_core_requests:
@@ -533,6 +573,7 @@ class GRLLM(LLM):
         begin_token = params.begin_token if hasattr(params, "begin_token") else None
         end_token = params.end_token if hasattr(params, "end_token") else None
         catalog_strategy = getattr(params, "catalog_strategy", "fill")
+        validate_beam_logprobs_capacity(self.llm_engine, beam_width)
 
         tokenizer = self.get_tokenizer()
         sid_begin_token_id: int | None = None
@@ -672,6 +713,21 @@ class GRLLM(LLM):
                 )
             else:
                 for _ in token_iter:
+                    valid_tokens_sets = None
+                    has_catalog = self.catalog is not None
+                    if has_catalog:
+                        valid_tokens_sets = []
+                        for instance in instances_batch:
+                            kept_beams = []
+                            for beam in instance.beams:
+                                generated_tokens = beam.tokens[instance.prompt_len :]
+                                allowed = self.catalog.valid(generated_tokens)
+                                if not allowed:
+                                    continue
+                                kept_beams.append(beam)
+                                valid_tokens_sets.append(sorted(allowed))
+                            instance.beams = kept_beams
+
                     all_beams: list[BeamSearchSequence] = list(
                         sum((instance.beams for instance in instances_batch), [])
                     )
@@ -693,22 +749,20 @@ class GRLLM(LLM):
 
                     # only runs for one step
                     # we don't need to use tqdm here
+                    sampling_params_batch = (
+                        [
+                            clone_beam_decode_sampling_params(beam_search_params, allowed_tokens)
+                            for allowed_tokens in valid_tokens_sets
+                        ]
+                        if valid_tokens_sets is not None
+                        else beam_search_params
+                    )
                     output = self.generate(
                         prompts_batch,
-                        sampling_params=beam_search_params,
+                        sampling_params=sampling_params_batch,
                         use_tqdm=False,
                         lora_request=lora_req_batch,
                     )
-
-                    # Validate generated tokens using catalog if available
-                    valid_tokens_sets = []
-                    has_catalog = getattr(self, "catalog", None) is not None
-                    if has_catalog:
-                        for instance in instances_batch:
-                            prompt_len = instance.prompt_len
-                            for beam in instance.beams:
-                                generated_tokens = beam.tokens[prompt_len:]
-                                valid_tokens_sets.append(self.catalog.valid(generated_tokens))
 
                     for (start, end), instance in zip(instance_start_and_end, instances_batch):
                         # Gather all logprobs and cumulative scores for this instance
@@ -731,10 +785,15 @@ class GRLLM(LLM):
                                 )
                                 if has_catalog:
                                     valid_tokens_set = valid_tokens_sets[start + i]
-                                    logprobs_pos = mask_candidate_logprobs(
-                                        token_ids_pos,
-                                        logprobs_pos,
-                                        valid_tokens_set,
+                                    token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                                        self.catalog.apply_catalog_filter(
+                                            token_ids_pos,
+                                            logprobs_pos,
+                                            ranks_pos,
+                                            decoded_pos,
+                                            set(valid_tokens_set),
+                                            catalog_strategy,
+                                        )
                                     )
                                 beam_flat_cache.append(
                                     (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)

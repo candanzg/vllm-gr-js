@@ -50,6 +50,7 @@ def _beam_step_update() -> BeamRequestStepUpdate:
         prefix_len=8,
         beam_width=2,
         sampling_params=_sampling_params(),
+        allowed_token_ids=[[11], [12, 13]],
     )
 
 
@@ -101,3 +102,4 @@ def test_decode_beam_step_update_payload() -> None:
     assert isinstance(decoded, BeamRequestStepUpdate)
     assert decoded.session_id == "session-0"
     assert decoded.beam_width == 2
+    assert decoded.allowed_token_ids == [[11], [12, 13]]

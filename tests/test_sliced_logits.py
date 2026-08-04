@@ -19,6 +19,7 @@ from vllm_gr.ops.sliced_logits import (
     is_vocab_slice_enabled,
     set_vocab_slice_config,
 )
+from vllm_gr.ops.sliced_logits_patch import _apply_allowed_token_ids_mask
 from vllm_gr.utils.catalog import Catalog
 
 
@@ -133,6 +134,22 @@ def test_token_id_remapping() -> None:
     # Reset config
     set_vocab_slice_config(None, None)
     assert not is_vocab_slice_enabled()
+
+
+def test_allowed_token_mask_is_applied_before_sliced_top_k() -> None:
+    set_vocab_slice_config(offset=10, slice_size=5)
+    try:
+        logits = torch.tensor([[9.0, 8.0, 7.0, 6.0, 5.0]])
+        full_mask = torch.ones((1, 20), dtype=torch.bool)
+        full_mask[0, [11, 14]] = False
+
+        constrained = _apply_allowed_token_ids_mask(logits, full_mask)
+
+        assert constrained.shape == logits.shape
+        assert constrained.isfinite().tolist() == [[False, True, False, False, True]]
+        assert torch.topk(constrained, 2).indices.tolist() == [[1, 4]]
+    finally:
+        set_vocab_slice_config(None, None)
 
 
 def test_catalog_slice_config(tmp_path: Any) -> None:

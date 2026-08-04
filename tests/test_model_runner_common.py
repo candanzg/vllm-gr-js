@@ -60,6 +60,8 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
     )
     input_batch = SimpleNamespace(
         req_ids=["ordinary", "beam", None, "prefill"],
+        vocab_size=5,
+        device=torch.device("cpu"),
         logprob_token_ids={"stale": [1]},
         num_computed_tokens_cpu=[5, 0, 0, 2],
         num_prompt_tokens=[5, 0, 0, 4],
@@ -82,6 +84,7 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
                 "beam_width": 2,
                 "beam_decode_steps": 2,
                 "cache_len": 4,
+                "allowed_token_ids": [[1, 3], [2]],
             }
         }
     )
@@ -101,6 +104,11 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
     assert isinstance(proxy, common.InputBatchProxy)
     assert proxy.req_ids.copy() == ["ordinary", "beam", "beam", None, "prefill"]
     assert proxy.sampling_metadata.temperature.tolist() == [20, 20, 40]
+    assert proxy.sampling_metadata.allowed_token_ids_mask.tolist() == [
+        [True, False, True, False, True],
+        [True, True, False, True, True],
+        [False, False, False, False, False],
+    ]
     assert proxy.num_tokens_no_spec[2] == 20
     proxy.num_tokens[2] = 99
     assert input_batch.num_tokens[1] == 99

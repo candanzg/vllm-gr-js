@@ -23,7 +23,10 @@ from vllm_gr.beam_search_decision_utils import (
     select_top_indices,
 )
 from vllm_gr.logprobs import reconstruct_beam_logprobs
-from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.sampling_params import (
+    clone_beam_decode_sampling_params,
+    validate_beam_logprobs_capacity,
+)
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
@@ -72,12 +75,19 @@ async def _add_batch_step(
     """ADD_BATCH path: prepare and batch-send requests (step 0)."""
     queues = []
     engine_core_requests = []
-    for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
+    params_batch = (
+        beam_search_params
+        if isinstance(beam_search_params, (list, tuple))
+        else [beam_search_params] * len(prompts_batch)
+    )
+    for i, (individual_prompt, lora_req, sampling_params) in enumerate(
+        zip(prompts_batch, lora_req_batch, params_batch)
+    ):
         request_id_item = f"{request_id_batch}-beam-{i}"
         q, ec_req = await engine_client.prepare_request(
             request_id_item,
             individual_prompt,
-            beam_search_params,
+            sampling_params,
             lora_request=lora_req,
             trace_headers=trace_headers,
             priority=priority,
@@ -107,6 +117,7 @@ async def _beam_request_step(
     prefix_len: int,
     priority=0,
     data_parallel_rank: int | None = None,
+    allowed_token_ids: list[list[int]] | None = None,
 ):
     """BEAM_REQUEST path: single logical message update for all active branches."""
     parent_beam_ids = []
@@ -126,7 +137,12 @@ async def _beam_request_step(
 
     # SamplingParams.n retains its upstream meaning: this is one logical
     # request. The active beam count is carried explicitly by beam_width.
-    decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params)
+    allowed_union = (
+        set().union(*(ids for ids in allowed_token_ids if ids))
+        if allowed_token_ids is not None
+        else None
+    )
+    decode_sampling_params = clone_beam_decode_sampling_params(beam_search_params, allowed_union)
 
     # Listen exclusively to the parent session_id stream queue
     q = engine_client.register_beam_output(
@@ -155,6 +171,7 @@ async def _beam_request_step(
             prefix_len=prefix_len,
             beam_width=beam_width,
             sampling_params=decode_sampling_params,
+            allowed_token_ids=allowed_token_ids,
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
@@ -210,6 +227,7 @@ async def beam_search(
     begin_token = params.begin_token
     end_token = params.end_token
     catalog_strategy = getattr(params, "catalog_strategy", "fill")
+    validate_beam_logprobs_capacity(self.engine_client, beam_width)
 
     # All beams from the same logical beam search will share the same priority value
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
@@ -345,6 +363,33 @@ async def beam_search(
         if token == 1:
             beam_search_start = time.perf_counter()
 
+        valid_tokens_sets = None
+        if self.models.catalog is not None:
+            kept_beams = []
+            kept_allowed = []
+            kept_fork_info = [] if fork_info is not None else None
+            for beam_index, beam in enumerate(all_beams):
+                generated_tokens = beam.tokens[len(prompt_token_ids) :]
+                allowed = self.models.catalog.valid(generated_tokens)
+                if not allowed:
+                    continue
+                kept_beams.append(beam)
+                kept_allowed.append(sorted(allowed))
+                if kept_fork_info is not None:
+                    kept_fork_info.append(fork_info[beam_index])
+            all_beams = kept_beams
+            valid_tokens_sets = kept_allowed
+            if kept_fork_info is not None:
+                fork_info = kept_fork_info
+
+        if not all_beams:
+            if use_beam_request and prev_beam_internal_ids:
+                await _beam_request_cleanup(
+                    self.engine_client, prefill_id, prev_beam_internal_ids, rank
+                )
+                prev_beam_internal_ids = []
+            break
+
         prompts_batch, lora_req_batch = zip(
             *[
                 (
@@ -357,21 +402,6 @@ async def beam_search(
         if token > 0:
             num_generation_tokens += len(all_beams)
         request_id_batch = f"{request_id}-{random_uuid()}"
-
-        # Launch catalog filtering in parallel with the engine step.
-        catalog_task = None
-        if self.models.catalog is not None:
-
-            def get_valid_tokens_set(beam) -> set[int]:
-                generated_tokens = beam.tokens[len(prompt_token_ids) :]
-                return self.models.catalog.valid(generated_tokens)
-
-            async def _run_catalog(coros):
-                return list(await asyncio.gather(*coros))
-
-            catalog_task = asyncio.create_task(
-                _run_catalog([asyncio.to_thread(get_valid_tokens_set, beam) for beam in all_beams])
-            )
 
         gen_start = time.perf_counter()
 
@@ -391,14 +421,23 @@ async def beam_search(
                 prefix_len=len(initial_tokens),
                 priority=priority,
                 data_parallel_rank=rank,
+                allowed_token_ids=valid_tokens_sets,
             )
         else:
+            sampling_params_batch = (
+                [
+                    clone_beam_decode_sampling_params(beam_search_params, allowed_tokens)
+                    for allowed_tokens in valid_tokens_sets
+                ]
+                if valid_tokens_sets is not None
+                else beam_search_params
+            )
             output, new_ids = await _add_batch_step(
                 self.engine_client,
                 prompts_batch,
                 lora_req_batch,
                 request_id_batch,
-                beam_search_params,
+                sampling_params_batch,
                 use_beam_request,
                 trace_headers,
                 priority=priority,
@@ -409,9 +448,6 @@ async def beam_search(
                 if prefill_id is None:
                     prefill_id = new_ids[0]
 
-        valid_tokens_sets = None
-        if catalog_task is not None:
-            valid_tokens_sets = await catalog_task
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         # Store all new tokens generated by beam

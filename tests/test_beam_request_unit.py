@@ -25,6 +25,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import pytest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import (
     EngineCoreRequestType,
@@ -35,7 +37,10 @@ from vllm_gr.entrypoints.openai.serving_engine import (
     _beam_request_cleanup,
     _beam_request_step,
 )
-from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.sampling_params import (
+    clone_beam_decode_sampling_params,
+    validate_beam_logprobs_capacity,
+)
 from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_request_step_update
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
@@ -210,6 +215,7 @@ def _make_beam_update(
     client_index: int = 0,
     current_wave: int = 0,
     data_parallel_rank: int | None = None,
+    allowed_token_ids: list[list[int]] | None = None,
 ) -> BeamRequestStepUpdate:
     return BeamRequestStepUpdate(
         session_id=session_id,
@@ -224,6 +230,7 @@ def _make_beam_update(
         client_index=client_index,
         current_wave=current_wave,
         data_parallel_rank=data_parallel_rank,
+        allowed_token_ids=allowed_token_ids,
     )
 
 
@@ -313,6 +320,32 @@ class TestBeamDecodeSamplingParams:
         else:
             raise AssertionError("Grouped-beam params accepted SamplingParams.n > 1")
 
+    def test_clone_copies_sorted_allowed_token_ids(self) -> None:
+        params = _sampling_params(allowed_token_ids=None)
+
+        cloned = clone_beam_decode_sampling_params(params, {7, 2, 5})
+
+        assert cloned.allowed_token_ids == [2, 5, 7]
+        assert params.allowed_token_ids is None
+
+    @pytest.mark.parametrize("max_logprobs", [None, -1, 2, 4])
+    def test_max_logprobs_capacity_accepts_sufficient_values(
+        self, max_logprobs: int | None
+    ) -> None:
+        runtime = SimpleNamespace(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+        )
+
+        validate_beam_logprobs_capacity(runtime, beam_width=2)
+
+    def test_max_logprobs_capacity_rejects_values_below_beam_width(self) -> None:
+        runtime = SimpleNamespace(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_logprobs=1))
+        )
+
+        with pytest.raises(VLLMValidationError, match="max_logprobs.*beam_width"):
+            validate_beam_logprobs_capacity(runtime, beam_width=2)
+
 
 class TestTypesSerialization:
     def test_roundtrip_all_fields(self) -> None:
@@ -330,6 +363,7 @@ class TestTypesSerialization:
             client_index=3,
             current_wave=5,
             data_parallel_rank=1,
+            allowed_token_ids=[[31], [32, 33]],
         )
         encoded = msgspec.msgpack.encode(original)
         decoded = msgspec.msgpack.decode(encoded, type=BeamRequestStepUpdate)
@@ -345,6 +379,7 @@ class TestTypesSerialization:
         assert decoded.client_index == 3
         assert decoded.current_wave == 5
         assert decoded.data_parallel_rank == 1
+        assert decoded.allowed_token_ids == [[31], [32, 33]]
         # sampling_params must survive the round-trip intact
         assert decoded.sampling_params.max_tokens == sp.max_tokens
         assert decoded.sampling_params.logprobs == sp.logprobs
@@ -357,7 +392,7 @@ class TestTypesSerialization:
         assert decoded.trace_headers is None
 
     def test_optional_fields_preserve_defaults_through_roundtrip(self) -> None:
-        # All eight optional fields are omitted from the constructor call.
+        # All nine optional fields are omitted from the constructor call.
         # After encode → decode they must arrive at their declared defaults,
         # not as None/0 noise or missing keys.
         msg = BeamRequestStepUpdate(
@@ -380,6 +415,7 @@ class TestTypesSerialization:
         assert decoded.lora_request is None
         assert decoded.cache_salt is None
         assert decoded.trace_headers is None
+        assert decoded.allowed_token_ids is None
 
     def test_empty_beam_tokens_survives_roundtrip(self) -> None:
         update = _make_beam_update(
@@ -607,6 +643,26 @@ class TestBeamCache:
         assert mock_req.is_beam_decode is True
         assert mock_req.beam_decode_steps == 1  # each beam_tokens list has length 1
         assert mock_req.prefix_len == 5
+        assert mock_req.beam_allowed_token_ids is None
+
+    def test_handle_forwards_allowed_token_ids(self) -> None:
+        eng = _make_engine_self(beam_cache={"s0": _session_entry()})
+        update = _make_beam_update(
+            session_id="s0",
+            parent_beam_ids=["p0", "p1"],
+            child_beam_ids=["c0", "c1"],
+            beam_tokens=[[50], [60]],
+            beam_width=2,
+            allowed_token_ids=[[101], [202, 203]],
+        )
+
+        with patch("vllm.v1.request.Request") as MockReq:
+            mock_req = MagicMock()
+            mock_req.block_hashes = []
+            MockReq.return_value = mock_req
+            _handle_beam_request_step_update(eng, update)
+
+        assert mock_req.beam_allowed_token_ids == [[101], [202, 203]]
 
     def test_beam_width_protocol_to_runner_contract(self) -> None:
         """beam_width flows independently of SamplingParams.n through execution."""

@@ -42,3 +42,4 @@ class BeamRequestStepUpdate(
     lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     trace_headers: Mapping[str, str] | None = None
+    allowed_token_ids: list[list[int]] | None = None
