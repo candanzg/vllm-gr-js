@@ -138,12 +138,28 @@ def _remux_logprobs_tensors(
     if max_chained_dim == 0 or orig_lps.numel() == 0:
         return st_ids, orig_lps, orig_lp_ids, orig_ranks
 
+    logger.debug(
+        "CATALOG_TRACE remux_begin request_rows=%d max_chained_dim=%d target_K=%d "
+        "orig_rows=%d orig_K=%d sampled_shape=%s",
+        len(request_row_configs),
+        max_chained_dim,
+        target_K,
+        orig_lps.shape[0],
+        orig_lps.shape[1],
+        tuple(st_ids.shape),
+    )
+
     new_st_ids, new_lps, new_lp_ids, new_ranks = [], [], [], []
     gpu_row_cursor = 0
 
     for req_id, _, W_logits, *_ in request_row_configs:
         # CASE A: INTERMEDIATE CHUNKED PREFILL (No output rows generated)
         if W_logits == 0:
+            logger.debug(
+                "CATALOG_TRACE remux_placeholder request=%s max_chained_dim=%d",
+                req_id,
+                max_chained_dim,
+            )
             dummy_st = torch.tensor([[-1]], dtype=st_ids.dtype, device=st_ids.device)
             new_st_ids.append(dummy_st)
 
@@ -200,13 +216,31 @@ def _remux_logprobs_tensors(
             new_ranks.append(req_ranks)
 
         gpu_row_cursor += W_logits
+        logger.debug(
+            "CATALOG_TRACE remux_request request=%s rows=%d target_K=%d "
+            "gpu_cursor=%d padded_width=%d",
+            req_id,
+            W_logits,
+            target_K,
+            gpu_row_cursor,
+            max_chained_dim,
+        )
 
-    return (
+    result = (
         torch.cat(new_st_ids, dim=0),
         torch.cat(new_lps, dim=0),
         torch.cat(new_lp_ids, dim=0) if orig_lp_ids is not None else None,
         torch.cat(new_ranks, dim=0) if orig_ranks is not None else None,
     )
+    logger.debug(
+        "CATALOG_TRACE remux_end output_sampled_shape=%s output_logprobs_shape=%s "
+        "output_ids_shape=%s output_ranks_shape=%s",
+        tuple(result[0].shape),
+        tuple(result[1].shape),
+        tuple(result[2].shape) if result[2] is not None else None,
+        tuple(result[3].shape) if result[3] is not None else None,
+    )
+    return result
 
 
 class BeamReqIdsProxy(list):
@@ -438,6 +472,16 @@ def _beam_collapse_bookkeeping(
             orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
             actual_K = orig_lps.shape[1]
 
+            logger.debug(
+                "CATALOG_TRACE runner_logprobs request_rows=%d sampler_rows=%d "
+                "actual_K=%d beam_data_ids=%s request_configs=%s",
+                len(request_row_configs),
+                orig_lps.shape[0],
+                actual_K,
+                list(beam_data)[:16],
+                [(row[0], row[2]) for row in request_row_configs[:16]],
+            )
+
             max_chained_dim = 0
             for req_id, _, W, *_ in request_row_configs:
                 if req_id is not None and req_id in beam_data:
@@ -467,6 +511,16 @@ def _beam_collapse_bookkeeping(
                 if mdata and mdata.get("is_beam_decode", False):
                     logits_num, active_beams = req_id_to_config.get(req_id, (0, []))
                     total_beam_width = mdata.get("beam_width", 1)
+                    logger.debug(
+                        "CATALOG_TRACE runner_beam_output request=%s row=%d "
+                        "logits_num=%d active_beams=%s beam_width=%d actual_K=%d",
+                        req_id,
+                        idx,
+                        logits_num,
+                        active_beams,
+                        total_beam_width,
+                        actual_K,
+                    )
 
                     if logits_num > 0:
                         # FAST-PATH: This chunk contains ALL beams directly.

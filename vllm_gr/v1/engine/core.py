@@ -65,6 +65,15 @@ def _cache_beam_request(self, request) -> None:
             "prompt_is_token_ids": request.prompt_is_token_ids,
             "num_prompt_tokens": request.num_prompt_tokens,
         }
+    logger.debug(
+        "CATALOG_TRACE core_cache request=%s token_count=%d block_count=%d "
+        "eos=%s prompt_tokens=%d",
+        request.request_id,
+        len(request._all_token_ids),
+        len(request.block_hashes),
+        request.sampling_params.eos_token_id if request.sampling_params is not None else None,
+        request.num_prompt_tokens,
+    )
 
 
 def _handle_beam_request_step_update(self, update) -> None:
@@ -74,6 +83,17 @@ def _handle_beam_request_step_update(self, update) -> None:
     _ensure_beam_state(self)
     session_id = update.session_id
     beam_width = update.beam_width
+    logger.debug(
+        "CATALOG_TRACE core_update_begin session=%s beam_width=%d parent_count=%d "
+        "child_count=%d pruned_count=%d prefix_len=%d beam_token_lens=%s",
+        session_id,
+        beam_width,
+        len(update.parent_beam_ids),
+        len(update.child_beam_ids),
+        len(update.pruned_ids),
+        update.prefix_len,
+        [len(tokens) for tokens in update.beam_tokens[:16]],
+    )
 
     # Clear the session completely upon generation termination / cleanup message
     if beam_width == 0:
@@ -84,6 +104,12 @@ def _handle_beam_request_step_update(self, update) -> None:
         self.aborts_queue.put_nowait(session_id)
         for abort_id in update.pruned_ids:
             self.aborts_queue.put_nowait(abort_id)
+        logger.debug(
+            "CATALOG_TRACE core_update_cleanup session=%s aborted_count=%d ids_head=%s",
+            session_id,
+            1 + len(update.pruned_ids),
+            [session_id, *update.pruned_ids[:8]],
+        )
         return
 
     # Validate parallel arrays
@@ -173,6 +199,17 @@ def _handle_beam_request_step_update(self, update) -> None:
         prompt_is_token_ids=prompt_is_token_ids,
         mm_features=mm_features,
         block_hasher=None,
+    )
+    logger.debug(
+        "CATALOG_TRACE core_request_built session=%s beam_width=%d "
+        "prefill_tokens=%d decode_steps=%d total_tokens=%d parent_head=%s child_head=%s",
+        session_id,
+        beam_width,
+        len(prefill_tokens),
+        decode_steps,
+        len(beam_token_ids),
+        update.parent_beam_ids[:8],
+        update.child_beam_ids[:8],
     )
 
     # Start with the prefill block hashes; block_hasher extends it incrementally

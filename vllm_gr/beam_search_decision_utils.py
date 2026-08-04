@@ -15,11 +15,14 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
+from vllm_gr.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+
+logger = init_logger(__name__)
 
 BeamCandidateCache = tuple[
     Sequence[int],
@@ -83,6 +86,17 @@ def extract_and_dedup_segment(
                 tid + offset if 0 <= tid < slice_size else tid for tid in token_ids_pos
             ]
 
+    logger.debug(
+        "CATALOG_TRACE extract_segment start=%d end=%d requested=%d raw_len=%d "
+        "out_len=%d sampled=%s out_head=%s",
+        start_offset,
+        end_offset,
+        logprobs_num,
+        end_offset - start_offset,
+        len(token_ids_pos),
+        token_ids_pos[0] if token_ids_pos else None,
+        list(token_ids_pos[:8]),
+    )
     return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
 
@@ -172,6 +186,16 @@ def select_top_indices(
         topn_idx = np.argpartition(np.negative(scores), beam_width)[:beam_width]
     else:
         topn_idx = np.arange(scores.size)
+    logger.debug(
+        "CATALOG_TRACE select_top_indices strategy=%s candidates=%d finite=%d "
+        "beam_width=%d selected=%d selected_indices=%s",
+        catalog_strategy,
+        scores.size,
+        int(np.isfinite(scores).sum()),
+        beam_width,
+        len(topn_idx),
+        topn_idx[:16].tolist(),
+    )
     return topn_idx
 
 
@@ -187,6 +211,14 @@ def materialize_selected_beams(
 ) -> tuple[list[BeamSearchSequence], ForkInfo]:
     """Build selected child beams and their grouped-request fork mapping."""
 
+    logger.debug(
+        "CATALOG_TRACE materialize_begin selected=%d candidate_count=%d "
+        "parent_count=%d selected_indices=%s",
+        len(selected_indices),
+        len(token_ids),
+        len(parents),
+        list(selected_indices)[:16],
+    )
     new_beams: list[BeamSearchSequence] = []
     fork_info: ForkInfo = []
     for candidate_index in selected_indices:
@@ -207,4 +239,10 @@ def materialize_selected_beams(
         new_beams.append(new_beam)
         fork_info.append((parent_index, token_id))
 
+    logger.debug(
+        "CATALOG_TRACE materialize_end beams=%d fork_info_head=%s score_head=%s",
+        len(new_beams),
+        fork_info[:16],
+        [round(beam.cum_logprob, 6) for beam in new_beams[:16]],
+    )
     return new_beams, fork_info

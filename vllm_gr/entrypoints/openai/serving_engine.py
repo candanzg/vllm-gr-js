@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import math
 import time
 from collections.abc import AsyncGenerator, Mapping
 
@@ -70,6 +71,15 @@ async def _add_batch_step(
     data_parallel_rank: int | None = None,
 ):
     """ADD_BATCH path: prepare and batch-send requests (step 0)."""
+    logger.debug(
+        "CATALOG_TRACE online_add_batch request=%s prompt_count=%d "
+        "use_beam_request=%s priority=%s dp_rank=%s",
+        request_id_batch,
+        len(prompts_batch),
+        use_beam_req,
+        priority,
+        data_parallel_rank,
+    )
     queues = []
     engine_core_requests = []
     for i, (individual_prompt, lora_req) in enumerate(zip(prompts_batch, lora_req_batch)):
@@ -90,6 +100,13 @@ async def _add_batch_step(
 
     internal_ids = [r.request_id for r in engine_core_requests] if use_beam_req else []
     output = await _gather_beam_results(queues)
+    logger.debug(
+        "CATALOG_TRACE online_add_batch_done request=%s internal_ids=%s "
+        "output_count=%d",
+        request_id_batch,
+        internal_ids[:8],
+        len(output),
+    )
     return output, internal_ids
 
 
@@ -113,6 +130,19 @@ async def _beam_request_step(
     child_beam_ids = []
     beam_tokens = []
     beam_width = len(fork_info)
+
+    logger.debug(
+        "CATALOG_TRACE online_beam_request request=%s session=%s "
+        "parent_count=%d child_count=%d prefix_len=%d fork_head=%s "
+        "previous_ids_head=%s",
+        request_id_batch,
+        session_id,
+        len(prev_beam_internal_ids),
+        beam_width,
+        prefix_len,
+        fork_info[:8],
+        prev_beam_internal_ids[:8],
+    )
 
     # Map the current generation step's routing array
     for new_idx, (parent_beam_idx, tok) in enumerate(fork_info):
@@ -144,6 +174,18 @@ async def _beam_request_step(
     used_parents = set(parent_beam_ids)
     pruned_ids = [pid for pid in prev_beam_internal_ids if pid not in used_parents]
 
+    logger.debug(
+        "CATALOG_TRACE online_beam_update request=%s session=%s "
+        "parents=%s children=%s pruned=%s beam_width=%d token_deltas_head=%s",
+        request_id_batch,
+        session_id,
+        parent_beam_ids[:8],
+        child_beam_ids[:8],
+        pruned_ids[:8],
+        beam_width,
+        [tokens[:8] for tokens in beam_tokens[:8]],
+    )
+
     # Dispatch the consolidated persistent update to the client
     await engine_client.beam_request_step_update(
         BeamRequestStepUpdate(
@@ -165,6 +207,14 @@ async def _beam_request_step(
 
     # Await the singular unified engine execution response block
     single_output = await _collect_beam_result(q)
+    logger.debug(
+        "CATALOG_TRACE online_beam_result request=%s session=%s "
+        "finish_reason=%s has_logprobs=%s",
+        request_id_batch,
+        session_id,
+        getattr(single_output.outputs[0], "finish_reason", None),
+        getattr(single_output.outputs[0], "logprobs", None) is not None,
+    )
 
     # Return the singular raw output instance wrapped as a single-element list
     # to maintain backward-compatible pipeline execution with the loop below
@@ -277,6 +327,20 @@ async def beam_search(
         detokenize=False,
         flat_logprobs=True,
     )
+    logger.debug(
+        "CATALOG_TRACE online_begin request=%s beam_width=%d max_tokens=%d "
+        "temperature=%s ignore_eos=%s catalog=%s strategy=%s logprobs_num=%d "
+        "use_beam_request=%s",
+        request_id,
+        beam_width,
+        max_tokens,
+        temperature,
+        ignore_eos,
+        self.models.catalog is not None,
+        catalog_strategy,
+        logprobs_num,
+        hasattr(self.engine_client, "beam_request_step_update"),
+    )
     initial_tokens = list(prompt_token_ids)
     # NOTE: FlatLogprobs intentionally passed where BeamSearchSequence
     # expects list[dict[int, Logprob]].  Intermediate logprobs are never
@@ -357,6 +421,15 @@ async def beam_search(
         if token > 0:
             num_generation_tokens += len(all_beams)
         request_id_batch = f"{request_id}-{random_uuid()}"
+        logger.debug(
+            "CATALOG_TRACE online_step_begin request=%s token=%d beam_count=%d "
+            "beam_tokens_head=%s fork_count=%s",
+            request_id,
+            token,
+            len(all_beams),
+            [beam.tokens[-8:] for beam in all_beams[:8]],
+            len(fork_info) if fork_info is not None else None,
+        )
 
         # Launch catalog filtering in parallel with the engine step.
         catalog_task = None
@@ -412,6 +485,14 @@ async def beam_search(
         valid_tokens_sets = None
         if catalog_task is not None:
             valid_tokens_sets = await catalog_task
+            logger.debug(
+                "CATALOG_TRACE online_catalog_valid request=%s token=%d "
+                "beam_count=%d valid_counts=%s",
+                request_id,
+                token,
+                len(valid_tokens_sets),
+                [len(valid) for valid in valid_tokens_sets[:16]],
+            )
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         # Store all new tokens generated by beam
@@ -466,6 +547,16 @@ async def beam_search(
                 total_logprobs = len(raw_token_ids)
 
                 stride_k = total_logprobs // logprobs_num
+                logger.debug(
+                    "CATALOG_TRACE online_parse mode=beam_request request=%s token=%d "
+                    "fork_count=%d raw_count=%d requested=%d stride=%d",
+                    request_id,
+                    token,
+                    len(fork_info),
+                    total_logprobs,
+                    logprobs_num,
+                    stride_k,
+                )
 
                 # Each logical beam block should extract its top choices natively
                 for b_idx in range(len(fork_info)):
@@ -497,6 +588,21 @@ async def beam_search(
                                 catalog_strategy,
                             )
                         )
+
+                    logger.debug(
+                        "CATALOG_TRACE online_block mode=beam_request request=%s token=%d "
+                        "beam=%d offset=[%d,%d) extracted=%d valid_count=%s finite_after=%d "
+                        "token_head=%s",
+                        request_id,
+                        token,
+                        b_idx,
+                        start_offset,
+                        end_offset,
+                        len(token_ids_pos),
+                        len(valid_tokens_sets[b_idx]) if valid_tokens_sets is not None else None,
+                        sum(math.isfinite(lp) for lp in logprobs_pos),
+                        list(token_ids_pos[:8]),
+                    )
 
                     # Save the clean segment safely into the historical timeline cache
                     beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
@@ -546,6 +652,19 @@ async def beam_search(
                                 catalog_strategy,
                             )
                         )
+                    logger.debug(
+                        "CATALOG_TRACE online_block mode=add_batch request=%s token=%d "
+                        "beam=%d raw_count=%d extracted=%d valid_count=%s finite_after=%d "
+                        "token_head=%s",
+                        request_id,
+                        token,
+                        i,
+                        len(flat.token_ids),
+                        len(token_ids_pos),
+                        len(valid_tokens_sets[i]) if valid_tokens_sets is not None else None,
+                        sum(math.isfinite(lp) for lp in logprobs_pos),
+                        list(token_ids_pos[:8]),
+                    )
                     beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
                     all_beams_token_id.extend(token_ids_pos)
                     all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
@@ -575,6 +694,18 @@ async def beam_search(
             )
             completed.extend(eos_beams)
 
+        logger.debug(
+            "CATALOG_TRACE online_select_begin request=%s token=%d candidates=%d "
+            "finite=%d beam_width=%d strategy=%s eos_completed=%d",
+            request_id,
+            token,
+            len(all_beams_token_id),
+            int(np.isfinite(all_beams_logprob).sum()),
+            beam_width,
+            catalog_strategy,
+            len(completed),
+        )
+
         # Processing non-EOS tokens
         topn_idx = select_top_indices(
             all_beams_logprob,
@@ -594,6 +725,17 @@ async def beam_search(
         # Build fork_info for next iteration's BEAM_FORK.
         if use_beam_request:
             fork_info = selected_fork_info
+
+        logger.debug(
+            "CATALOG_TRACE online_select_end request=%s token=%d selected=%d "
+            "next_beams=%d fork_head=%s selected_tokens=%s",
+            request_id,
+            token,
+            len(topn_idx),
+            len(new_beams),
+            selected_fork_info[:8],
+            [int(all_beams_token_id[idx]) for idx in topn_idx[:8]],
+        )
 
         if not new_beams:
             all_beams = []

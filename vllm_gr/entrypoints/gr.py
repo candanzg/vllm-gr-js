@@ -17,6 +17,7 @@ LLM path.
 
 import copy
 import gc
+import math
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -77,6 +78,12 @@ def _beam_request_cleanup(llm_engine, session_id: str, final_ids: list[str]) -> 
     """Clear beam_request cache for a finished/failed session."""
     if not final_ids:
         return
+    logger.debug(
+        "CATALOG_TRACE beam_cleanup session=%s final_count=%d final_ids_head=%s",
+        session_id,
+        len(final_ids),
+        final_ids[:8],
+    )
     try:
         llm_engine.engine_core.beam_request_step_update(
             BeamRequestStepUpdate(
@@ -131,6 +138,19 @@ def _prepare_beam_step_requests(
             beam_tokens = []
             W = len(fork_info_j)
 
+            logger.debug(
+                "CATALOG_TRACE prepare_step mode=beam_request instance=%d token=%d "
+                "session=%s active_beams=%d fork_count=%d fork_head=%s "
+                "previous_ids=%s",
+                j,
+                token,
+                session_id,
+                len(instance.beams),
+                W,
+                fork_info_j[:8],
+                instance_prev_beam_internal_ids[j][:8],
+            )
+
             for new_idx, (parent_beam_idx, tok) in enumerate(fork_info_j):
                 parent_id = instance_prev_beam_internal_ids[j][parent_beam_idx]
                 child_id = f"offline-beam-{prompt_start + j}-{token}-{new_idx}"
@@ -182,6 +202,22 @@ def _prepare_beam_step_requests(
                 else tokenizer.eos_token_id,
                 lora_request=instance.beams[0].lora_request,
             )
+            logger.debug(
+                "CATALOG_TRACE beam_update instance=%d token=%d session=%s "
+                "parent_count=%d child_count=%d pruned_count=%d prefix_len=%d "
+                "beam_width=%d parent_head=%s child_head=%s pruned_head=%s",
+                j,
+                token,
+                session_id,
+                len(parent_beam_ids),
+                len(child_beam_ids),
+                len(pruned_ids),
+                prefix_len,
+                W,
+                parent_beam_ids[:8],
+                child_beam_ids[:8],
+                pruned_ids[:8],
+            )
             llm_engine.engine_core.beam_request_step_update(update)
 
             # Update tracking variables
@@ -191,6 +227,16 @@ def _prepare_beam_step_requests(
             # ADD_BATCH path (step 0)
             request_id_batch = f"offline-beam-{prompt_start + j}"
             instance_prefix_len[j] = len(instance.beams[0].tokens)
+
+            logger.debug(
+                "CATALOG_TRACE prepare_step mode=add_batch instance=%d token=%d "
+                "request_id=%s prompt_len=%d beam_count=%d",
+                j,
+                token,
+                request_id_batch,
+                instance_prefix_len[j],
+                len(instance.beams),
+            )
 
             request_id_item = f"{request_id_batch}-0"
             tokens_prompt = _create_tokens_prompt_from_beam(instance.beams[0])
@@ -219,9 +265,17 @@ def _step_engine_and_collect_outputs(
 ) -> dict[str, Any]:
     """Execute LLM engine step until outputs for all active instances are gathered."""
     active_indices = [j for j, instance in enumerate(instances_batch) if len(instance.beams) > 0]
+    logger.debug(
+        "CATALOG_TRACE engine_step_begin token=%d active_instances=%s active_beam_counts=%s",
+        token,
+        active_indices,
+        [len(instances_batch[j].beams) for j in active_indices],
+    )
     step_outputs_accumulated = []
+    step_count = 0
     while active_indices:
         step_outputs = llm_engine.step()
+        step_count += 1
         step_outputs_accumulated.extend(step_outputs)
 
         outputs_map = {out.request_id: out for out in step_outputs}
@@ -233,6 +287,22 @@ def _step_engine_and_collect_outputs(
                 new_active_indices.append(j)
         active_indices = new_active_indices
 
+        logger.debug(
+            "CATALOG_TRACE engine_step_poll token=%d poll=%d output_count=%d "
+            "output_ids_head=%s remaining_instances=%s",
+            token,
+            step_count,
+            len(step_outputs),
+            [getattr(out, "request_id", None) for out in step_outputs[:8]],
+            active_indices,
+        )
+
+    logger.debug(
+        "CATALOG_TRACE engine_step_end token=%d polls=%d accumulated_outputs=%d",
+        token,
+        step_count,
+        len(step_outputs_accumulated),
+    )
     return {out.request_id: out for out in step_outputs_accumulated}
 
 
@@ -255,6 +325,7 @@ def _parse_step_logprobs(
         beam_flat_cache: list of parsed segments for each parent beam
     """
     if result.outputs[0].finish_reason == "error":
+        logger.debug("CATALOG_TRACE parse_step error finish_reason=error token=%d", token)
         return True, [], [], [], []
 
     all_beams_token_id = []
@@ -273,6 +344,19 @@ def _parse_step_logprobs(
     raw_ranks = getattr(flat, "ranks", None)
     raw_decoded = getattr(flat, "decoded_tokens", None)
     total_logprobs = len(raw_token_ids)
+
+    logger.debug(
+        "CATALOG_TRACE parse_step_begin token=%d fork_count=%d requested_logprobs=%d "
+        "raw_logprobs=%d raw_ranks=%d raw_decoded=%d catalog=%s strategy=%s",
+        token,
+        len(fork_info_j) if fork_info_j is not None else 1,
+        logprobs_num,
+        total_logprobs,
+        len(raw_ranks) if raw_ranks is not None else -1,
+        len(raw_decoded) if raw_decoded is not None else -1,
+        catalog is not None,
+        catalog_strategy,
+    )
 
     if token > 0 and fork_info_j is not None:
         stride_k = total_logprobs // len(fork_info_j)
@@ -299,6 +383,23 @@ def _parse_step_logprobs(
                     logprobs_pos,
                     valid_tokens_set,
                 )
+            else:
+                valid_tokens_set = None
+
+            logger.debug(
+                "CATALOG_TRACE parse_step_block token=%d beam=%d offset=[%d,%d) "
+                "raw_block=%d extracted=%d valid_count=%s finite_after=%d "
+                "token_head=%s",
+                token,
+                b_idx,
+                start_offset,
+                end_offset,
+                end_offset - start_offset,
+                len(token_ids_pos),
+                len(valid_tokens_set) if valid_tokens_set is not None else None,
+                sum(math.isfinite(lp) for lp in logprobs_pos),
+                list(token_ids_pos[:8]),
+            )
 
             beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
             all_beams_token_id.extend(token_ids_pos)
@@ -317,12 +418,36 @@ def _parse_step_logprobs(
                 logprobs_pos,
                 valid_tokens_set,
             )
+        else:
+            valid_tokens_set = None
+
+        logger.debug(
+            "CATALOG_TRACE parse_step_block token=%d beam=0 offset=[0,%d) "
+            "raw_block=%d extracted=%d valid_count=%s finite_after=%d token_head=%s",
+            token,
+            total_logprobs,
+            total_logprobs,
+            len(token_ids_pos),
+            len(valid_tokens_set) if valid_tokens_set is not None else None,
+            sum(math.isfinite(lp) for lp in logprobs_pos),
+            list(token_ids_pos[:8]),
+        )
 
         beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
         all_beams_token_id.extend(token_ids_pos)
         all_beams_logprob.extend(instance.beams[0].cum_logprob + lp for lp in logprobs_pos)
         all_beams_beam_idx.extend([0] * len(token_ids_pos))
 
+    logger.debug(
+        "CATALOG_TRACE parse_step_end token=%d candidates=%d finite=%d beam_cache=%d "
+        "beam_idx_head=%s token_head=%s",
+        token,
+        len(all_beams_token_id),
+        sum(math.isfinite(lp) for lp in all_beams_logprob),
+        len(beam_flat_cache),
+        all_beams_beam_idx[:16],
+        all_beams_token_id[:16],
+    )
     return False, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache
 
 
@@ -401,6 +526,14 @@ def _custom_beam_search_batch(
             result = outputs_map.get(search_id)
 
             if result is None:
+                logger.debug(
+                    "CATALOG_TRACE custom_result_missing instance=%d token=%d "
+                    "search_id=%s available_ids=%s",
+                    j,
+                    token,
+                    search_id,
+                    list(outputs_map)[:8],
+                )
                 continue
 
             is_error, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache = (
@@ -442,6 +575,19 @@ def _custom_beam_search_batch(
                 )
                 instance.completed.extend(eos_beams)
 
+            logger.debug(
+                "CATALOG_TRACE custom_select_begin instance=%d token=%d "
+                "candidate_count=%d finite=%d current_beams=%d completed=%d "
+                "strategy=%s",
+                j,
+                token,
+                len(all_beams_token_id),
+                sum(math.isfinite(lp) for lp in all_beams_logprob),
+                len(instance.beams),
+                len(instance.completed),
+                catalog_strategy,
+            )
+
             topn_idx = select_top_indices(all_beams_logprob, beam_width, catalog_strategy)
             new_beams, fork_info = materialize_selected_beams(
                 parents=instance.beams,
@@ -454,6 +600,15 @@ def _custom_beam_search_batch(
             )
             instance.beams = new_beams
             instance_fork_info[j] = fork_info
+            logger.debug(
+                "CATALOG_TRACE custom_select_end instance=%d token=%d "
+                "selected=%d next_beams=%d fork_head=%s",
+                j,
+                token,
+                len(topn_idx),
+                len(instance.beams),
+                fork_info[:8],
+            )
 
     # Step 4: Cleanup completed sessions
     for j, instance in enumerate(instances_batch):
@@ -643,6 +798,22 @@ class GRLLM(LLM):
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
         )
+        logger.debug(
+            "CATALOG_TRACE offline_begin prompts=%d beam_width=%d max_tokens=%d "
+            "temperature=%s ignore_eos=%s catalog=%s strategy=%s logprobs_num=%d "
+            "concurrency=%d attention_backend=%s custom_attn=%s",
+            len(prompts),
+            beam_width,
+            max_tokens,
+            temperature,
+            ignore_eos,
+            self.catalog is not None,
+            catalog_strategy,
+            logprobs_num,
+            concurrency_limit,
+            attention_backend,
+            use_custom_attn,
+        )
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
 
@@ -671,7 +842,7 @@ class GRLLM(LLM):
                     catalog_strategy=catalog_strategy,
                 )
             else:
-                for _ in token_iter:
+                for token in token_iter:
                     all_beams: list[BeamSearchSequence] = list(
                         sum((instance.beams for instance in instances_batch), [])
                     )
@@ -682,6 +853,16 @@ class GRLLM(LLM):
 
                     if len(all_beams) == 0:
                         break
+
+                    logger.debug(
+                        "CATALOG_TRACE offline_step token=%d prompt_start=%d "
+                        "instances=%d beam_counts=%s total_beams=%d",
+                        token,
+                        prompt_start,
+                        len(instances_batch),
+                        [len(instance.beams) for instance in instances_batch],
+                        len(all_beams),
+                    )
 
                     # create corresponding batch entries for prompt & optional lora
                     prompts_batch, lora_req_batch = zip(
@@ -710,7 +891,10 @@ class GRLLM(LLM):
                                 generated_tokens = beam.tokens[prompt_len:]
                                 valid_tokens_sets.append(self.catalog.valid(generated_tokens))
 
-                    for (start, end), instance in zip(instance_start_and_end, instances_batch):
+                    for local_instance_idx, ((start, end), instance) in enumerate(
+                        zip(instance_start_and_end, instances_batch)
+                    ):
+                        trace_instance_idx = prompt_start + local_instance_idx
                         # Gather all logprobs and cumulative scores for this instance
                         all_beams_token_id = []
                         all_beams_logprob = []
@@ -736,6 +920,21 @@ class GRLLM(LLM):
                                         logprobs_pos,
                                         valid_tokens_set,
                                     )
+                                else:
+                                    valid_tokens_set = None
+                                logger.debug(
+                                    "CATALOG_TRACE offline_block token=%d instance=%d "
+                                    "beam=%d raw_count=%d extracted=%d valid_count=%s "
+                                    "finite_after=%d token_head=%s",
+                                    token,
+                                    trace_instance_idx,
+                                    i,
+                                    len(flat.token_ids),
+                                    len(token_ids_pos),
+                                    len(valid_tokens_set) if valid_tokens_set is not None else None,
+                                    sum(math.isfinite(lp) for lp in logprobs_pos),
+                                    list(token_ids_pos[:8]),
+                                )
                                 beam_flat_cache.append(
                                     (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
                                 )
@@ -772,6 +971,16 @@ class GRLLM(LLM):
                             instance.completed.extend(eos_beams)
 
                         # Select top beams
+                        logger.debug(
+                            "CATALOG_TRACE offline_select_begin token=%d instance=%d "
+                            "candidate_count=%d finite=%d beam_width=%d strategy=%s",
+                            token,
+                            trace_instance_idx,
+                            len(all_beams_token_id),
+                            int(np.isfinite(all_beams_logprob).sum()),
+                            beam_width,
+                            catalog_strategy,
+                        )
                         topn_idx = select_top_indices(
                             all_beams_logprob, beam_width, catalog_strategy
                         )
@@ -785,6 +994,15 @@ class GRLLM(LLM):
                             initial_logprobs=initial_logprobs,
                         )
                         instance.beams = new_beams
+                        logger.debug(
+                            "CATALOG_TRACE offline_select_end token=%d instance=%d "
+                            "selected=%d next_beams=%d token_head=%s",
+                            token,
+                            trace_instance_idx,
+                            len(topn_idx),
+                            len(new_beams),
+                            [int(all_beams_token_id[idx]) for idx in topn_idx[:8]],
+                        )
 
         outputs = []
         for idx, instance in enumerate(instances):

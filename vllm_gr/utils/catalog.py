@@ -4,6 +4,7 @@
 """Catalog-constraint utilities for beam search."""
 
 import json
+import math
 from typing import Any
 
 from vllm.tokenizers import TokenizerLike
@@ -119,8 +120,25 @@ class Catalog:
             if tid in node:
                 node = node[tid]
             else:
+                logger.debug(
+                    "CATALOG_TRACE catalog_valid prefix_len=%d prefix_head=%s "
+                    "result=dead_end missing_token=%s",
+                    len(token_ids),
+                    token_ids[:8],
+                    tid,
+                )
                 return set()
-        return {k for k in node if k != self._TERMINAL_MARKER}
+        valid_tokens = {k for k in node if k != self._TERMINAL_MARKER}
+        logger.debug(
+            "CATALOG_TRACE catalog_valid prefix_len=%d prefix_head=%s result_count=%d "
+            "valid_head=%s terminal=%s",
+            len(token_ids),
+            token_ids[:8],
+            len(valid_tokens),
+            sorted(valid_tokens)[:8],
+            self._TERMINAL_MARKER in node,
+        )
+        return valid_tokens
 
     def apply_catalog_filter(
         self,
@@ -161,6 +179,12 @@ class Catalog:
             - decoded is None iff input decoded_pos was None
         """
         if not valid_tokens_set:
+            logger.debug(
+                "CATALOG_TRACE catalog_filter strategy=%s input_count=%d "
+                "valid_count=0 output_count=0 action=drop_beam",
+                catalog_strategy,
+                len(token_ids_pos),
+            )
             return (
                 [],
                 [],
@@ -179,12 +203,26 @@ class Catalog:
                 else:
                     all_inf = False
             if all_inf:
+                logger.debug(
+                    "CATALOG_TRACE catalog_filter strategy=null input_count=%d "
+                    "valid_count=%d finite_after=0 output_count=0 action=drop_beam",
+                    n,
+                    len(valid_tokens_set),
+                )
                 return (
                     [],
                     [],
                     ([] if ranks_pos is not None else None),
                     ([] if decoded_pos is not None else None),
                 )
+            logger.debug(
+                "CATALOG_TRACE catalog_filter strategy=null input_count=%d "
+                "valid_count=%d finite_after=%d output_count=%d",
+                n,
+                len(valid_tokens_set),
+                sum(math.isfinite(lp) for lp in filtered_lps),
+                len(filtered_tids),
+            )
             return filtered_tids, filtered_lps, ranks_pos, decoded_pos
 
         valid_list = sorted(valid_tokens_set)
@@ -209,4 +247,13 @@ class Catalog:
                     new_ranks[j] = None
                 if new_decoded is not None:
                     new_decoded[j] = None
+        logger.debug(
+            "CATALOG_TRACE catalog_filter strategy=fill input_count=%d "
+            "valid_count=%d replaced=%d output_count=%d output_head=%s",
+            n,
+            len(valid_tokens_set),
+            fill_used,
+            len(new_tids),
+            new_tids[:8],
+        )
         return new_tids, new_lps, new_ranks, new_decoded

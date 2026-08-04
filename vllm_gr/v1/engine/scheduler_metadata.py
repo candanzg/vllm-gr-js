@@ -7,6 +7,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from vllm_gr.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional[Dict[str, Any]]:
     """Build scheduler metadata for a grouped beam-decode request.
@@ -31,10 +35,21 @@ def build_beam_request_metadata(req: Any, num_scheduled_tokens: int) -> Optional
             "expected a positive integer"
         )
 
-    return {
+    metadata = {
         "is_beam_decode": True,
         "beam_width": beam_width,
         "beam_decode_steps": getattr(req, "beam_decode_steps", 0),
         "prefix_len": getattr(req, "prefix_len", 0),
         "cache_len": req.num_computed_tokens - num_scheduled_tokens,
     }
+    logger.debug(
+        "CATALOG_TRACE scheduler_metadata request=%s beam_width=%d "
+        "scheduled_tokens=%d decode_steps=%d prefix_len=%d cache_len=%d",
+        req.request_id,
+        metadata["beam_width"],
+        num_scheduled_tokens,
+        metadata["beam_decode_steps"],
+        metadata["prefix_len"],
+        metadata["cache_len"],
+    )
+    return metadata

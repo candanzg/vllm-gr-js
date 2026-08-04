@@ -230,6 +230,22 @@ def apply_scheduler_patch():
                         if metadata is not None:
                             beam_data[req_id] = metadata
             output.beam_data = beam_data
+            logger.debug(
+                "CATALOG_TRACE scheduler_output request_count=%d beam_requests=%d "
+                "scheduled_tokens=%s beam_data=%s",
+                len(getattr(output, "num_scheduled_tokens", {})),
+                len(beam_data),
+                dict(getattr(output, "num_scheduled_tokens", {})),
+                {
+                    req_id: {
+                        "beam_width": data.get("beam_width"),
+                        "beam_decode_steps": data.get("beam_decode_steps"),
+                        "prefix_len": data.get("prefix_len"),
+                        "cache_len": data.get("cache_len"),
+                    }
+                    for req_id, data in beam_data.items()
+                },
+            )
             return output
         finally:
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
