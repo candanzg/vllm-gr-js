@@ -9,7 +9,7 @@ from typing import Final
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_gr.config import GRAttentionBackend, GRConfig
+from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -65,6 +65,13 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         default=None,
         help="Optional JSON catalog used to constrain generation results.",
     )
+    model_group.add_argument(
+        "--constraint-backend",
+        type=str,
+        choices=[backend.value for backend in ConstraintBackend],
+        default=None,
+        help="Constraint implementation: trie (default) or constraint_tables.",
+    )
     return parser
 
 
@@ -75,6 +82,9 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     engine_args.catalog_path = None
     if hasattr(args, "catalog_path"):
         engine_args.catalog_path = args.catalog_path
+    engine_args.constraint_backend = None
+    if hasattr(args, "constraint_backend"):
+        engine_args.constraint_backend = args.constraint_backend
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -161,10 +171,16 @@ def create_engine_config(self, usage_context=None, headless=False):
     # the EngineConfig is returned and before runtime execution begins.
     existing_gr_config = GRConfig.from_vllm_config(config)
     catalog_path = getattr(self, "catalog_path", None)
+    constraint_backend = getattr(self, "constraint_backend", None)
     backend_is_explicit, backend_override = _explicit_gr_attention_backend(self)
 
     effective_catalog_path = (
         catalog_path if catalog_path is not None else existing_gr_config.catalog_path
+    )
+    effective_constraint_backend = (
+        ConstraintBackend(constraint_backend)
+        if constraint_backend is not None
+        else existing_gr_config.constraint_backend
     )
     offset, slice_size = None, None
     if effective_catalog_path is not None:
@@ -187,6 +203,7 @@ def create_engine_config(self, usage_context=None, headless=False):
 
     effective_gr_config = GRConfig(
         catalog_path=effective_catalog_path,
+        constraint_backend=effective_constraint_backend,
         attention_backend=(
             backend_override if backend_is_explicit else existing_gr_config.attention_backend
         ),

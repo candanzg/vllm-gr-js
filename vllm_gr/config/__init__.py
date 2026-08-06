@@ -3,6 +3,6 @@
 
 """Typed configuration boundary for vLLM-GR."""
 
-from vllm_gr.config.models import GRAttentionBackend, GRConfig
+from vllm_gr.config.models import ConstraintBackend, GRAttentionBackend, GRConfig
 
-__all__ = ["GRAttentionBackend", "GRConfig"]
+__all__ = ["ConstraintBackend", "GRAttentionBackend", "GRConfig"]

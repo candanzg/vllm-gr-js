@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from vllm_gr.config.models import GRAttentionBackend
+from vllm_gr.config.models import ConstraintBackend, GRAttentionBackend
 
 
 def validate_catalog_path(value: object) -> str | None:
@@ -14,6 +14,20 @@ def validate_catalog_path(value: object) -> str | None:
     if not value.strip():
         raise ValueError("vllm-gr catalog_path must not be empty")
     return value
+
+
+def validate_constraint_backend(value: object) -> ConstraintBackend:
+    if isinstance(value, ConstraintBackend):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr constraint_backend must be a string")
+    try:
+        return ConstraintBackend(value.lower())
+    except ValueError as exc:
+        supported = ", ".join(backend.value for backend in ConstraintBackend)
+        raise ValueError(
+            f"unsupported vllm-gr constraint_backend {value!r}; supported: {supported}"
+        ) from exc
 
 
 def validate_attention_backend(value: object) -> GRAttentionBackend | None:

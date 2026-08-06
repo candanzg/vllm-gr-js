@@ -192,7 +192,7 @@ def _run_null_all_dead_target() -> None:
 
 
 async def _null_all_dead_impl() -> None:
-    model_name = "OpenOneRec/OneRec-1.7B"
+    model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
 
     # A catalog with a single entry whose first token is a special token the
     # model will never emit as its top prediction for a normal prompt.

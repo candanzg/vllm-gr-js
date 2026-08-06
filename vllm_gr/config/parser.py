@@ -10,11 +10,13 @@ from vllm_gr.config.models import GRConfig
 from vllm_gr.config.validation import (
     validate_attention_backend,
     validate_catalog_path,
+    validate_constraint_backend,
     validate_vocab_offset,
     validate_vocab_slice_size,
 )
 
 CATALOG_PATH_KEY: Final = "vllm_gr_catalog_path"
+CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
 ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
 VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
@@ -22,6 +24,7 @@ GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
         CATALOG_PATH_KEY,
+        CONSTRAINT_BACKEND_KEY,
         ATTENTION_BACKEND_KEY,
         VOCAB_OFFSET_KEY,
         VOCAB_SLICE_SIZE_KEY,
@@ -56,6 +59,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
     _reject_unknown_gr_keys(additional_config)
     return GRConfig(
         catalog_path=validate_catalog_path(additional_config.get(CATALOG_PATH_KEY)),
+        constraint_backend=validate_constraint_backend(
+            additional_config.get(CONSTRAINT_BACKEND_KEY, "trie")
+        ),
         attention_backend=validate_attention_backend(additional_config.get(ATTENTION_BACKEND_KEY)),
         vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
         vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
@@ -69,6 +75,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     _reject_unknown_gr_keys(additional_config)
 
     catalog_path = validate_catalog_path(gr_config.catalog_path)
+    constraint_backend = validate_constraint_backend(gr_config.constraint_backend)
     attention_backend = validate_attention_backend(gr_config.attention_backend)
     vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
     vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
@@ -77,6 +84,11 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(CATALOG_PATH_KEY, None)
     else:
         additional_config[CATALOG_PATH_KEY] = catalog_path
+
+    if constraint_backend.value == "trie":
+        additional_config.pop(CONSTRAINT_BACKEND_KEY, None)
+    else:
+        additional_config[CONSTRAINT_BACKEND_KEY] = constraint_backend.value
 
     if attention_backend is None:
         additional_config.pop(ATTENTION_BACKEND_KEY, None)

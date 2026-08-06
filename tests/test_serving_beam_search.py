@@ -36,6 +36,15 @@ if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is
 
 async def beam_search_test(loops: int) -> None:
     model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
+    raw_gpu_memory_utilization = os.getenv("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION", "0.7")
+    try:
+        gpu_memory_utilization = float(raw_gpu_memory_utilization)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_GR_TEST_GPU_MEMORY_UTILIZATION must be a floating-point value in (0, 1]"
+        ) from exc
+    if not 0 < gpu_memory_utilization <= 1:
+        raise ValueError("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION must be in (0, 1]")
     beam_width = 512
     max_tokens = 5
 
@@ -45,6 +54,7 @@ async def beam_search_test(loops: int) -> None:
         enforce_eager=True,
         enable_log_requests=False,
         max_logprobs=2 * beam_width,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     async with build_async_engine_client_from_engine_args(engine_args) as engine_client:

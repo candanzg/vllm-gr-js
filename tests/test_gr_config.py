@@ -9,12 +9,17 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.config import GRAttentionBackend, GRConfig
-from vllm_gr.config.parser import ATTENTION_BACKEND_KEY, CATALOG_PATH_KEY
+from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config.parser import (
+    ATTENTION_BACKEND_KEY,
+    CATALOG_PATH_KEY,
+    CONSTRAINT_BACKEND_KEY,
+)
 
 
 def _vllm_config(additional_config: object | None = None) -> SimpleNamespace:
-    return SimpleNamespace(additional_config={} if additional_config is None else additional_config)
+    normalized = {} if additional_config is None else additional_config
+    return SimpleNamespace(additional_config=normalized)
 
 
 class _OpaqueAdditionalConfig:
@@ -46,6 +51,37 @@ def test_parses_known_keys_and_normalizes_backend() -> None:
     assert config.catalog_path == "/models/catalog.json"
     assert config.attention_backend is GRAttentionBackend.CUSTOM
     assert config.enabled is True
+
+
+def test_constraint_backend_round_trip_and_default_elision() -> None:
+    config = GRConfig.from_vllm_config(
+        _vllm_config(
+            {
+                CATALOG_PATH_KEY: "/models/catalog.json",
+                CONSTRAINT_BACKEND_KEY: "constraint_tables",
+            }
+        )
+    )
+    assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLES
+    assert config.enabled is True
+
+    vllm_config = _vllm_config()
+    config.write_to_vllm_config(vllm_config)
+    assert vllm_config.additional_config[CONSTRAINT_BACKEND_KEY] == "constraint_tables"
+
+    GRConfig().write_to_vllm_config(vllm_config)
+    assert CONSTRAINT_BACKEND_KEY not in vllm_config.additional_config
+
+
+@pytest.mark.parametrize("value", [1, True, [], "unknown"])  # type: ignore[misc]
+def test_rejects_invalid_constraint_backend(value: object) -> None:
+    with pytest.raises(ValueError, match="constraint_backend"):
+        GRConfig.from_vllm_config(_vllm_config({CONSTRAINT_BACKEND_KEY: value}))
+
+
+def test_constraint_tables_requires_catalog_path() -> None:
+    with pytest.raises(ValueError, match="requires catalog_path"):
+        GRConfig(constraint_backend=ConstraintBackend.CONSTRAINT_TABLES)
 
 
 def test_write_preserves_unrelated_additional_config() -> None:
@@ -168,6 +204,29 @@ def test_engine_config_entrypoint_writes_typed_catalog_config() -> None:
 
     assert GRConfig.from_vllm_config(result) == GRConfig(catalog_path="/models/catalog.json")
     assert result.additional_config["unrelated"] is True
+
+
+def test_engine_config_writes_constraint_backend_override() -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    engine_args = SimpleNamespace(
+        catalog_path="/models/catalog.json",
+        constraint_backend="constraint_tables",
+        attention_backend=None,
+        attention_config=None,
+        model=None,
+    )
+    with mock.patch(
+        "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+        return_value=vllm_config,
+    ):
+        result = create_engine_config(engine_args)
+
+    assert GRConfig.from_vllm_config(result) == GRConfig(
+        catalog_path="/models/catalog.json",
+        constraint_backend=ConstraintBackend.CONSTRAINT_TABLES,
+    )
 
 
 def test_engine_config_merges_existing_backend_with_cli_catalog() -> None:
