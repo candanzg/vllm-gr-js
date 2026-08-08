@@ -4,6 +4,7 @@
 """Catalog-constraint utilities for beam search."""
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from vllm.tokenizers import TokenizerLike
@@ -113,7 +114,7 @@ class Catalog:
                 return False
         return self._TERMINAL_MARKER in node
 
-    def valid(self, token_ids: list[int]) -> set[int]:
+    def valid(self, token_ids: Sequence[int]) -> set[int]:
         node = self.trie
         for tid in token_ids:
             if tid in node:

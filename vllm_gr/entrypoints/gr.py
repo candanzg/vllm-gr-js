@@ -18,7 +18,6 @@ LLM path.
 import copy
 import gc
 import time
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
@@ -38,16 +37,22 @@ from vllm_gr.beam_search_decision_utils import (
     complete_eos_candidates,
     extract_and_dedup_flat_logprobs,
     extract_and_dedup_segment,
-    mask_candidate_logprobs,
     materialize_selected_beams,
     select_top_indices,
 )
+from vllm_gr.config import ConstraintBackend
+from vllm_gr.constraints import (
+    BeamConstraintCoordinator,
+    ParentCandidateBuilder,
+    create_constraint_strategy,
+)
+from vllm_gr.constraints.models import BeamCandidateCache
+from vllm_gr.constraints.strategies import TrieConstraintStrategy
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
-from vllm_gr.utils.catalog import Catalog
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
@@ -59,12 +64,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-BeamCandidateCache = tuple[
-    Sequence[int],
-    Sequence[float],
-    Sequence[int | None] | None,
-    Sequence[str | None] | None,
-]
 ForkInfo = list[tuple[int, int]]
 
 
@@ -244,23 +243,31 @@ def _parse_step_logprobs(
     fork_info_j: ForkInfo | None,
     catalog: Optional[Any] = None,
     catalog_strategy: str = "fill",
-) -> tuple[bool, list[int], list[float], list[int], list[BeamCandidateCache]]:
+    constraint_coordinator: BeamConstraintCoordinator | None = None,
+    return_arrays: bool = False,
+) -> tuple[bool, Any, Any, Any, list[BeamCandidateCache]]:
     """Parse flat logprobs from engine step results.
 
     Returns:
         is_error: bool indicating if the engine returned an error
-        all_beams_token_id: list of token ids across candidate beams
-        all_beams_logprob: list of cumulative logprobs
-        all_beams_beam_idx: list of beam indices for each entry
+        all_beams_token_id: candidate token ids across candidate beams
+        all_beams_logprob: cumulative logprobs
+        all_beams_beam_idx: parent index for each entry
         beam_flat_cache: list of parsed segments for each parent beam
     """
     if result.outputs[0].finish_reason == "error":
+        if return_arrays:
+            return (
+                True,
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+                np.empty(0, dtype=np.intp),
+                [],
+            )
         return True, [], [], [], []
 
-    all_beams_token_id = []
-    all_beams_logprob = []
-    all_beams_beam_idx = []
-    beam_flat_cache = []
+    coordinator = constraint_coordinator or BeamConstraintCoordinator.from_catalog(catalog)
+    candidate_builder = ParentCandidateBuilder()
 
     flat = result.outputs[0].logprobs
     if flat is None:
@@ -291,39 +298,61 @@ def _parse_step_logprobs(
                 end_offset,
                 logprobs_num,
             )
-            if catalog is not None:
+            valid_token_ids = None
+            if coordinator.enabled:
                 generated_tokens = current_beam.tokens[instance.prompt_len :]
-                valid_tokens_set = catalog.valid(generated_tokens)
-                logprobs_pos = mask_candidate_logprobs(
-                    token_ids_pos,
-                    logprobs_pos,
-                    valid_tokens_set,
-                )
+                valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
 
-            beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
-            all_beams_token_id.extend(token_ids_pos)
-            all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
-            all_beams_beam_idx.extend([b_idx] * len(token_ids_pos))
+            coordinator.add_parent_candidates(
+                candidate_builder,
+                parent_index=b_idx,
+                parent_cumulative_logprob=current_beam.cum_logprob,
+                token_ids=token_ids_pos,
+                logprobs=logprobs_pos,
+                ranks=ranks_pos,
+                decoded_tokens=decoded_pos,
+                valid_token_ids=valid_token_ids,
+                candidate_strategy=catalog_strategy,
+            )
     else:
         token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_flat_logprobs(
             flat, logprobs_num
         )
-        if catalog is not None:
+        valid_token_ids = None
+        if coordinator.enabled:
             current_beam = instance.beams[0]
             generated_tokens = current_beam.tokens[instance.prompt_len :]
-            valid_tokens_set = catalog.valid(generated_tokens)
-            logprobs_pos = mask_candidate_logprobs(
-                token_ids_pos,
-                logprobs_pos,
-                valid_tokens_set,
-            )
+            valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
 
-        beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
-        all_beams_token_id.extend(token_ids_pos)
-        all_beams_logprob.extend(instance.beams[0].cum_logprob + lp for lp in logprobs_pos)
-        all_beams_beam_idx.extend([0] * len(token_ids_pos))
+        coordinator.add_parent_candidates(
+            candidate_builder,
+            parent_index=0,
+            parent_cumulative_logprob=instance.beams[0].cum_logprob,
+            token_ids=token_ids_pos,
+            logprobs=logprobs_pos,
+            ranks=ranks_pos,
+            decoded_tokens=decoded_pos,
+            valid_token_ids=valid_token_ids,
+            candidate_strategy=catalog_strategy,
+        )
 
-    return False, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache
+    candidate_batch = candidate_builder.build()
+    if not return_arrays:
+        return (
+            False,
+            candidate_batch.token_ids.tolist(),
+            candidate_batch.cumulative_logprobs.tolist(),
+            candidate_batch.parent_indices.tolist(),
+            candidate_batch.parent_cache,
+        )
+    # Keep the arrays produced by the builder for the internal hot path.
+    return (
+        False,
+        candidate_batch.token_ids,
+        candidate_batch.cumulative_logprobs,
+        candidate_batch.parent_indices,
+        candidate_batch.parent_cache,
+    )
 
 
 def _custom_beam_search_batch(
@@ -340,6 +369,7 @@ def _custom_beam_search_batch(
     logprobs_num: int,
     catalog: Optional[Any] = None,
     catalog_strategy: str = "fill",
+    constraint_coordinator: BeamConstraintCoordinator | None = None,
 ) -> None:
     """Run beam search in batch mode for custom attention backend."""
     instance_prefill_id: dict[int, str] = {}
@@ -412,6 +442,8 @@ def _custom_beam_search_batch(
                     fork_info_j=instance_fork_info.get(j),
                     catalog=catalog,
                     catalog_strategy=catalog_strategy,
+                    constraint_coordinator=constraint_coordinator,
+                    return_arrays=True,
                 )
             )
 
@@ -425,9 +457,9 @@ def _custom_beam_search_batch(
                 instance.beams = []
                 continue
 
-            all_beams_token_id = np.array(all_beams_token_id)
-            all_beams_logprob = np.array(all_beams_logprob)
-            all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
+            # _parse_step_logprobs returns the builder's NumPy arrays for the
+            # internal path; do not convert them through Python lists again.
+            all_beams_beam_idx_arr = all_beams_beam_idx
             if not ignore_eos:
                 eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
@@ -479,6 +511,7 @@ class GRLLM(LLM):
         model: str = "",
         *,
         catalog_path: Optional[str] = None,
+        constraint_backend: ConstraintBackend | str = ConstraintBackend.TRIE,
         **kwargs,
     ):
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
@@ -496,9 +529,17 @@ class GRLLM(LLM):
         )
 
         self.catalog = None
+        self.constraint_strategy = None
+        self.constraint_coordinator = BeamConstraintCoordinator(None)
         if catalog_path is not None:
-            self.catalog = Catalog(self.get_tokenizer())
-            self.catalog.load(catalog_path)
+            self.constraint_strategy = create_constraint_strategy(
+                backend=constraint_backend,
+                tokenizer=self.get_tokenizer(),
+                catalog_path=catalog_path,
+            )
+            self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
+            if isinstance(self.constraint_strategy, TrieConstraintStrategy):
+                self.catalog = self.constraint_strategy.catalog
 
     def beam_search(
         self,
@@ -669,6 +710,7 @@ class GRLLM(LLM):
                     logprobs_num=logprobs_num,
                     catalog=self.catalog,
                     catalog_strategy=catalog_strategy,
+                    constraint_coordinator=self.constraint_coordinator,
                 )
             else:
                 for _ in token_iter:
@@ -701,24 +743,21 @@ class GRLLM(LLM):
                     )
 
                     # Validate generated tokens using catalog if available
-                    valid_tokens_sets = []
-                    has_catalog = getattr(self, "catalog", None) is not None
-                    if has_catalog:
+                    valid_tokens_sets: list[set[int]] = []
+                    if self.constraint_coordinator.enabled:
                         for instance in instances_batch:
                             prompt_len = instance.prompt_len
                             for beam in instance.beams:
                                 generated_tokens = beam.tokens[prompt_len:]
-                                valid_tokens_sets.append(self.catalog.valid(generated_tokens))
+                                valid_token_ids = self.constraint_coordinator.valid_next_token_ids(
+                                    generated_tokens
+                                )
+                                assert valid_token_ids is not None
+                                valid_tokens_sets.append(valid_token_ids)
 
                     for (start, end), instance in zip(instance_start_and_end, instances_batch):
                         # Gather all logprobs and cumulative scores for this instance
-                        all_beams_token_id = []
-                        all_beams_logprob = []
-                        # Explicit beam index for each entry in all_beams_token_id/logprob.
-                        # Replaces idx // logprobs_num so that null-strategy beams (empty lists)
-                        # don't shift the mapping for subsequent beams.
-                        all_beams_beam_idx: list[int] = []
-                        beam_flat_cache: list[tuple | None] = []
+                        candidate_builder = ParentCandidateBuilder()
                         beam_outputs = output[start:end]  # outputs for this instance's beams
 
                         for i, (current_beam, result) in enumerate(
@@ -729,21 +768,21 @@ class GRLLM(LLM):
                                 token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
                                     extract_and_dedup_flat_logprobs(flat, logprobs_num)
                                 )
-                                if has_catalog:
-                                    valid_tokens_set = valid_tokens_sets[start + i]
-                                    logprobs_pos = mask_candidate_logprobs(
-                                        token_ids_pos,
-                                        logprobs_pos,
-                                        valid_tokens_set,
-                                    )
-                                beam_flat_cache.append(
-                                    (token_ids_pos, logprobs_pos, ranks_pos, decoded_pos)
+                                self.constraint_coordinator.add_parent_candidates(
+                                    candidate_builder,
+                                    parent_index=i,
+                                    parent_cumulative_logprob=current_beam.cum_logprob,
+                                    token_ids=token_ids_pos,
+                                    logprobs=logprobs_pos,
+                                    ranks=ranks_pos,
+                                    decoded_tokens=decoded_pos,
+                                    valid_token_ids=(
+                                        valid_tokens_sets[start + i]
+                                        if self.constraint_coordinator.enabled
+                                        else None
+                                    ),
+                                    candidate_strategy=catalog_strategy,
                                 )
-                                all_beams_token_id.extend(token_ids_pos)
-                                all_beams_logprob.extend(
-                                    current_beam.cum_logprob + lp for lp in logprobs_pos
-                                )
-                                all_beams_beam_idx.extend([i] * len(token_ids_pos))
                             else:
                                 raise ValueError(
                                     "Beam search generation expected non-empty logprobs "
@@ -752,10 +791,11 @@ class GRLLM(LLM):
                                     "logprobs when using beam search."
                                 )
 
-                        # Convert to numpy for efficient processing
-                        all_beams_token_id = np.array(all_beams_token_id)
-                        all_beams_logprob = np.array(all_beams_logprob)
-                        all_beams_beam_idx_arr = np.array(all_beams_beam_idx, dtype=np.intp)
+                        candidate_batch = candidate_builder.build()
+                        all_beams_token_id = candidate_batch.token_ids
+                        all_beams_logprob = candidate_batch.cumulative_logprobs
+                        all_beams_beam_idx_arr = candidate_batch.parent_indices
+                        beam_flat_cache = candidate_batch.parent_cache
                         # Handle EOS tokens
                         if not ignore_eos:
                             eos_beams, all_beams_logprob = complete_eos_candidates(

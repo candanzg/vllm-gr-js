@@ -19,14 +19,9 @@ from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
+from vllm_gr.constraints.models import BeamCandidateCache
 from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
 
-BeamCandidateCache = tuple[
-    Sequence[int],
-    Sequence[float],
-    Sequence[int | None] | None,
-    Sequence[str | None] | None,
-]
 ForkInfo = list[tuple[int, int]]
 
 
