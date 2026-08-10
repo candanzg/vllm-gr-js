@@ -12,6 +12,10 @@ from vllm_gr.ops.onerec_decode import (
     beam_search_rec_final_select,
     select_unshared_kv,
 )
+from vllm_gr.ops.rec_constrained_topk import (
+    rec_constrained_topk,
+    rec_constrained_topk_torch,
+)
 
 __all__ = [
     "_beam_search_group_torch",
@@ -20,5 +24,7 @@ __all__ = [
     "beam_search_group",
     "beam_search_rec_final_select",
     "cache_unshared_kv_torch",
+    "rec_constrained_topk",
+    "rec_constrained_topk_torch",
     "select_unshared_kv",
 ]

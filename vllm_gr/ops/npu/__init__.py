@@ -7,4 +7,11 @@ Ascend fused operators, including split-QKV-RMSNorm-RoPE, are registered by
 vLLM-Ascend 0.22.1rc1.
 """
 
-__all__: list[str] = []
+from vllm_gr.ops.npu.rec_constrained_topk import (
+    is_available as rec_constrained_topk_npu_available,
+)
+from vllm_gr.ops.npu.rec_constrained_topk import (
+    rec_constrained_topk_npu,
+)
+
+__all__ = ["rec_constrained_topk_npu", "rec_constrained_topk_npu_available"]
