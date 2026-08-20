@@ -85,10 +85,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     else:
         additional_config[CATALOG_PATH_KEY] = catalog_path
 
-    if constraint_backend.value == "trie":
-        additional_config.pop(CONSTRAINT_BACKEND_KEY, None)
-    else:
-        additional_config[CONSTRAINT_BACKEND_KEY] = constraint_backend.value
+    additional_config[CONSTRAINT_BACKEND_KEY] = constraint_backend.value
 
     if attention_backend is None:
         additional_config.pop(ATTENTION_BACKEND_KEY, None)

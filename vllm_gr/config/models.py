@@ -50,11 +50,6 @@ class GRConfig:
         object.__setattr__(
             self, "vocab_slice_size", validate_vocab_slice_size(self.vocab_slice_size)
         )
-        if (
-            self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
-            and self.catalog_path is None
-        ):
-            raise ValueError("vllm-gr constraint_backend='constraint_table' requires catalog_path")
 
     @property
     def enabled(self) -> bool:

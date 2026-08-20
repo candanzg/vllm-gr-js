@@ -3,11 +3,6 @@
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
-from unittest.mock import MagicMock
-
 import numpy as np
 import pytest
 
@@ -16,45 +11,17 @@ from vllm_gr.constraints import (
     BeamConstraintCoordinator,
     CandidateLayout,
     ParentCandidateBuilder,
-    TrieConstraintStrategy,
     create_constraint_strategy,
 )
 
 
-@pytest.fixture  # type: ignore[misc]
-def tokenizer() -> MagicMock:
-    result = MagicMock()
-    result.convert_tokens_to_ids.side_effect = lambda values: [int(value) for value in values]
-    return result
-
-
-def test_trie_factory_loads_catalog_and_preserves_compatibility(
-    tokenizer: MagicMock,
-) -> None:
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as file:
-        json.dump([["1", "2", "3"], ["1", "4", "5"]], file)
-        catalog_path = file.name
-    try:
-        strategy = create_constraint_strategy(
-            backend="TRIE",
-            tokenizer=tokenizer,
-            catalog_path=catalog_path,
-        )
-
-        assert isinstance(strategy, TrieConstraintStrategy)
-        assert strategy.valid_next_token_ids([]) == {1}
-        assert strategy.valid_next_token_ids([1]) == {2, 4}
-    finally:
-        os.remove(catalog_path)
-
-
-def test_constraint_table_factory_fails_at_phase_boundary(tokenizer: MagicMock) -> None:
-    with pytest.raises(NotImplementedError, match="rec_constrained_topk"):
-        create_constraint_strategy(
-            backend=ConstraintBackend.CONSTRAINT_TABLE,
-            tokenizer=tokenizer,
-            catalog_path="catalog.json",
-        )
+def test_worker_backend_routes_to_worker_strategy() -> None:
+    strategy = create_constraint_strategy(
+        backend=ConstraintBackend.CONSTRAINT_TABLE,
+        tokenizer=object(),
+        catalog_path="catalog.json",
+    )
+    assert strategy.execution_site == "worker"
 
 
 def test_parent_candidate_builder_keeps_ragged_parent_mapping() -> None:
@@ -85,38 +52,22 @@ def test_parent_candidate_builder_keeps_ragged_parent_mapping() -> None:
     assert len(batch.parent_cache) == 2
 
 
-def test_coordinator_applies_fill_and_null_with_the_same_contract(
-    tokenizer: MagicMock,
-) -> None:
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as file:
-        json.dump([["1", "2"], ["1", "4"]], file)
-        catalog_path = file.name
-    try:
-        strategy = TrieConstraintStrategy.load(tokenizer, catalog_path)
-        coordinator = BeamConstraintCoordinator(strategy)
-        valid = coordinator.valid_next_token_ids([1])
-
-        fill_tokens, fill_logprobs, _, _ = coordinator.filter_candidates(
-            token_ids=[9, 2],
-            logprobs=[-0.1, -0.2],
-            ranks=None,
-            decoded_tokens=None,
-            valid_token_ids=valid,
-            candidate_strategy="fill",
-        )
-        null_tokens, null_logprobs, _, _ = coordinator.filter_candidates(
-            token_ids=[9, 2],
-            logprobs=[-0.1, -0.2],
-            ranks=None,
-            decoded_tokens=None,
-            valid_token_ids=valid,
-            candidate_strategy="null",
-        )
-
-        assert fill_tokens == [2, 2]
-        assert fill_logprobs == pytest.approx([-10000.0, -0.2])
-        assert null_tokens == [9, 2]
-        assert null_logprobs[0] == -float("inf")
-        assert null_logprobs[1] == pytest.approx(-0.2)
-    finally:
-        os.remove(catalog_path)
+def test_coordinator_skips_frontend_filtering_for_worker_strategy() -> None:
+    strategy = create_constraint_strategy(
+        backend=ConstraintBackend.CONSTRAINT_TABLE,
+        tokenizer=object(),
+        catalog_path="catalog.json",
+    )
+    coordinator = BeamConstraintCoordinator(strategy)
+    assert coordinator.frontend_enabled is False
+    assert coordinator.valid_next_token_ids([1]) is None
+    tokens, logprobs, _, _ = coordinator.filter_candidates(
+        token_ids=[9, 2],
+        logprobs=[-0.1, -0.2],
+        ranks=None,
+        decoded_tokens=None,
+        valid_token_ids=None,
+        candidate_strategy="fill",
+    )
+    assert tokens == [9, 2]
+    assert logprobs == [-0.1, -0.2]

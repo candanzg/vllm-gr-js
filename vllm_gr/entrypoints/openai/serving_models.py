@@ -11,7 +11,6 @@ from vllm.entrypoints.openai.models.serving import (
 
 from vllm_gr.config import GRConfig
 from vllm_gr.constraints import BeamConstraintCoordinator, create_constraint_strategy
-from vllm_gr.constraints.strategies import TrieConstraintStrategy
 
 _original_init = OpenAIServingModels.__init__
 
@@ -37,9 +36,6 @@ def init_gr(
             catalog_path=gr_config.catalog_path,
         )
         self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
-        if isinstance(self.constraint_strategy, TrieConstraintStrategy):
-            # Compatibility for existing callers that inspect ``models.catalog``.
-            self.catalog = self.constraint_strategy.catalog
 
 
 def patch_OpenAIServingModels_init():

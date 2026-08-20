@@ -47,7 +47,6 @@ from vllm_gr.constraints import (
     create_constraint_strategy,
 )
 from vllm_gr.constraints.models import BeamCandidateCache
-from vllm_gr.constraints.strategies import TrieConstraintStrategy
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
     reconstruct_beam_logprobs,
@@ -307,7 +306,7 @@ def _parse_step_logprobs(
                 logprobs_num,
             )
             valid_token_ids = None
-            if coordinator.enabled:
+            if coordinator.frontend_enabled:
                 generated_tokens = current_beam.tokens[instance.prompt_len :]
                 valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
 
@@ -327,7 +326,7 @@ def _parse_step_logprobs(
             flat, logprobs_num
         )
         valid_token_ids = None
-        if coordinator.enabled:
+        if coordinator.frontend_enabled:
             current_beam = instance.beams[0]
             generated_tokens = current_beam.tokens[instance.prompt_len :]
             valid_token_ids = coordinator.valid_next_token_ids(generated_tokens)
@@ -548,8 +547,6 @@ class GRLLM(LLM):
                 catalog_path=catalog_path,
             )
             self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
-            if isinstance(self.constraint_strategy, TrieConstraintStrategy):
-                self.catalog = self.constraint_strategy.catalog
 
     def beam_search(
         self,
@@ -755,7 +752,7 @@ class GRLLM(LLM):
 
                     # Validate generated tokens using catalog if available
                     valid_tokens_sets: list[set[int]] = []
-                    if self.constraint_coordinator.enabled:
+                    if self.constraint_coordinator.frontend_enabled:
                         for instance in instances_batch:
                             prompt_len = instance.prompt_len
                             for beam in instance.beams:
@@ -789,7 +786,7 @@ class GRLLM(LLM):
                                     decoded_tokens=decoded_pos,
                                     valid_token_ids=(
                                         valid_tokens_sets[start + i]
-                                        if self.constraint_coordinator.enabled
+                                        if self.constraint_coordinator.frontend_enabled
                                         else None
                                     ),
                                     candidate_strategy=catalog_strategy,

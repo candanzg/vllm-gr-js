@@ -370,7 +370,7 @@ async def beam_search(
 
         # Launch catalog filtering in parallel with the engine step.
         catalog_task = None
-        if constraint_coordinator.enabled:
+        if constraint_coordinator.frontend_enabled:
 
             def get_valid_tokens_set(beam) -> set[int]:
                 generated_tokens = beam.tokens[len(prompt_token_ids) :]

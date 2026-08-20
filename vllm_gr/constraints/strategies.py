@@ -142,13 +142,7 @@ def create_constraint_strategy(
         if normalized_backend is ConstraintBackend.CONSTRAINT_TABLE:
             raise ValueError("constraint_backend='constraint_table' requires catalog_path")
         return None
-    if normalized_backend is ConstraintBackend.TRIE:
-        return TrieConstraintStrategy.load(tokenizer, catalog_path)
 
-    # Keep the concrete strategy available to callers and tests, but fail at
-    # the phase boundary instead of accidentally running the Trie path.
-    strategy = ConstraintTableStrategy(catalog_path)
-    raise NotImplementedError(
-        f"constraint_backend={strategy.backend.value!r} is defined but its Worker/NPU "
-        "rec_constrained_topk runtime is not implemented in phase one"
-    )
+    # Worker-only flow: the frontend trie path is intentionally not used.
+    # Keep the trie class for compatibility, but do not route through it.
+    return ConstraintTableStrategy(catalog_path)

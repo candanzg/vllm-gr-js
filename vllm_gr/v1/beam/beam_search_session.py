@@ -56,6 +56,14 @@ class BeamSearchSession:
         for pool in self.context.pools:
             pool.reset_slot(self.slot)
 
+    @property
+    def current_step(self) -> int:
+        return self.decode_step
+
+    @property
+    def temperatures(self) -> torch.Tensor | None:
+        return getattr(self.context, "temperatures", None)
+
     def end_session(self):
         """End a beam search session. Releases slot from registry."""
         state = self._state

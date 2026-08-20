@@ -31,8 +31,15 @@ class BeamConstraintCoordinator:
     def enabled(self) -> bool:
         return self.strategy is not None
 
+    @property
+    def frontend_enabled(self) -> bool:
+        return (
+            self.strategy is not None
+            and getattr(self.strategy, "execution_site", None) == "frontend"
+        )
+
     def valid_next_token_ids(self, generated_token_ids: Sequence[int]) -> set[int] | None:
-        if self.strategy is None:
+        if self.strategy is None or not self.frontend_enabled:
             return None
         return self.strategy.valid_next_token_ids(generated_token_ids)
 

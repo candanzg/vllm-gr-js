@@ -20,6 +20,15 @@ _WORKER_PREPARE_PATCH_MARKER = "_vllm_gr_beam_prepare_patch"
 _WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
 
 
+def _get_worker_beam_context(runner: Any):
+    beam_sessions = getattr(runner, "_beam_sessions", None)
+    if beam_sessions:
+        for session in beam_sessions.values():
+            if session is not None and hasattr(session, "context"):
+                return session.context
+    return getattr(runner, "_beam_constraint_context", None)
+
+
 def _get_positions_buffers(runner: Any) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Safely extracts underlying hardware and host indexing position tensors."""
     gpu_positions = None
