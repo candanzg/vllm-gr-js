@@ -13,7 +13,7 @@ reference it but do not own it.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -46,6 +46,8 @@ class BeamAttentionContext:
         num_layers: int,
         device: torch.device,
         dtype: torch.dtype,
+        trie: Optional[Any] = None,
+        constraint_tables: Optional[Dict[str, torch.Tensor]] = None,
     ):
         _validate_pool_dtype(dtype)
 
@@ -55,6 +57,8 @@ class BeamAttentionContext:
         self.num_layers = num_layers
         self.device = device
         self.dtype = dtype
+        self.trie = trie
+        self.constraint_tables = constraint_tables
 
         # Per-request session registry
         self.registry = BeamSessionRegistry(max_batch)
