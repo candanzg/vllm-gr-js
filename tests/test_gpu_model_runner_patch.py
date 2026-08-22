@@ -454,6 +454,68 @@ def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
         common._get_gr_config = original_fn
 
 
+def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warmup + capture forwards must run inside torch.inference_mode().
+
+    The CUDA graph pool holds inference tensors created by the native
+    ``_dummy_run`` (decorated with ``@torch.inference_mode()``).  Running the
+    capture forward outside inference mode makes ``capture_begin``'s in-place
+    pool updates raise "Inplace update to inference tensor outside
+    InferenceMode is not allowed".
+    """
+    import contextlib
+
+    import vllm.compilation.monitor as monitor
+
+    import vllm_gr.v1.worker.model_runner_common as common
+
+    monkeypatch.setattr(
+        common,
+        "_get_gr_config",
+        lambda r: SimpleNamespace(
+            beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3
+        ),
+    )
+    monkeypatch.setattr(monitor, "set_cudagraph_capturing_enabled", lambda *_: None)
+
+    side_stream = SimpleNamespace(wait_stream=lambda *_: None)
+    fake_cuda = SimpleNamespace(
+        Stream=lambda: side_stream, stream=lambda _s: contextlib.nullcontext()
+    )
+    fake_accelerator = SimpleNamespace(
+        current_stream=lambda: SimpleNamespace(wait_stream=lambda *_: None),
+        synchronize=lambda: None,
+    )
+    monkeypatch.setattr(torch, "cuda", fake_cuda, raising=False)
+    monkeypatch.setattr(torch, "accelerator", fake_accelerator, raising=False)
+
+    session = SimpleNamespace(end_session=lambda: None)
+    monkeypatch.setattr(
+        gpu_patch,
+        "_capture_create_dummy_context",
+        lambda *args, **kwargs: (object(), session, object(), object()),
+    )
+
+    inference_flags: list[bool] = []
+
+    def fake_forward(*args: Any, **kwargs: Any) -> None:
+        inference_flags.append(torch.is_inference_mode_enabled())
+
+    monkeypatch.setattr(gpu_patch, "_dummy_beam_forward", fake_forward)
+    monkeypatch.setattr(gpu_patch, "_verify_and_record_captured_graph", lambda r, width: True)
+
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
+        _beam_sessions={},
+        _current_beam_info=None,
+    )
+    assert gpu_patch.capture_beam_decode_graph(runner) is True
+    assert len(inference_flags) == 3  # num_warmups (2) + capture forward
+    assert all(inference_flags), f"capture forwards ran outside inference_mode: {inference_flags}"
+
+
 # ---------------------------------------------------------------------------
 # _create_beam_context — shared context factory
 # ---------------------------------------------------------------------------

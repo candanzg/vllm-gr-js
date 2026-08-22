@@ -10,13 +10,29 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.worker.constraint_hook import apply_constrained_sample_override
+
+# Shared device-neutral beam-graph helpers live in model_runner_common; they
+# are re-exported here so callers/tests that historically reached them via
+# this module keep working (and monkeypatching this alias still patches the
+# GPU patch behavior, which resolves them through this module's globals).
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_BOOKKEEPING_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
     _beam_collapse_bookkeeping,
+)
+from vllm_gr.v1.worker.model_runner_common import (  # noqa: E402,F401
+    _beam_full_graph_ready as _common_beam_full_graph_ready,
+)
+from vllm_gr.v1.worker.model_runner_common import (
+    _beam_graph_enabled_for_run as _common_beam_graph_enabled_for_run,
+)
+from vllm_gr.v1.worker.model_runner_common import (
     _beam_remap_inputs,
+)
+from vllm_gr.v1.worker.model_runner_common import (
+    _create_beam_context as _common_create_beam_context,
 )
 
 logger = init_logger(__name__)
@@ -126,32 +142,18 @@ def make_patched_bookkeeping_sync_gpu(_orig_bookkeeping_sync):
 
 
 def _beam_full_graph_ready(runner, num_tokens: int) -> bool:
-    """True iff a FULL-mode CUDA graph for this beam width is captured.
+    """Deprecated local alias — see model_runner_common._beam_full_graph_ready.
 
-    The beam graph is captured once at engine startup (dummy data, output
-    never consumed).  ``capture_beam_decode_graph`` records the captured
-    width in ``runner._beam_graph_keys``; this function checks that set
-    directly — O(1), no traversal of vllm-internal ``CUDAGraphWrapper``
-    instances, and no risk of matching a native (beam-kernel-free) graph
-    whose descriptor happens to collide.
-
-    Previously this function walked ``CUDAGraphWrapper._all_instances``
-    and relied on an implicit invariant that native FULL descriptors
-    always carry ``num_reqs=int`` while beam descriptors use
-    ``num_reqs=None, uniform=True``.  If that invariant broke (upstream
-    change), beam decode would replay a wrong (native) graph and produce
-    silently incorrect output — *not* a safe fallback to eager.  The
-    runner-side key set makes the check self-contained.
+    Kept (delegating) so tests and callers that monkeypatch THIS module's
+    attribute affect the GPU determine patch, which resolves the helper
+    through this module's globals.
     """
-    beam_keys = getattr(runner, "_beam_graph_keys", None)
-    return beam_keys is not None and num_tokens in beam_keys
+    return _common_beam_full_graph_ready(runner, num_tokens)
 
 
 def _beam_graph_enabled_for_run(runner) -> bool:
-    """Beam graphs are only used when the config enables them (GRConfig)."""
-    from vllm_gr.v1.worker.model_runner_common import _get_gr_config
-
-    return _get_gr_config(runner).beam_graph_enabled
+    """Deprecated local alias — see model_runner_common._beam_graph_enabled_for_run."""
+    return _common_beam_graph_enabled_for_run(runner)
 
 
 def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
@@ -275,50 +277,11 @@ _BEAM_DUMMY_REQ_ID = "vllm-gr-beam-graph-dummy"
 
 
 def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
-    """Create a BeamAttentionContext with sizing derived from model + GRConfig.
+    """Deprecated local alias — see model_runner_common._create_beam_context.
 
-    Shared by the dummy-capture path (``capture_beam_decode_graph``) and
-    the runtime lazy-creation path (``_get_or_create_beam_session`` in
-    ``model_runner_common``) so that the pool dimensions, dtype, and
-    device are always derived from the same sources.  A single source of
-    truth prevents silent size mismatches that would invalidate captured
-    CUDA graphs if the runtime path rebuilt the context with different
-    parameters.
-
-    Args:
-        runner: The GPU ModelRunner (must have ``model_config``,
-            ``parallel_config``, ``device``).
-        gr_cfg: The GRConfig (provides ``beam_max_width``,
-            ``beam_max_decode_steps``).  ``beam_max_width`` must not be
-            None — callers must guard before reaching this function.
-        max_batch: Maximum concurrent beam search sessions.
-
-    Returns:
-        A new ``BeamAttentionContext``.
-
-    Raises:
-        TypeError: If ``gr_cfg.beam_max_width`` is None.
+    Kept (delegating) for callers/tests importing it from this module.
     """
-    if gr_cfg.beam_max_width is None:
-        raise TypeError(
-            "beam_max_width must be set before creating a BeamAttentionContext "
-            "(beam KV pool is disabled when beam_max_width is None)"
-        )
-    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-
-    model_config = runner.model_config
-    parallel_config = runner.parallel_config
-
-    return BeamAttentionContext(
-        max_batch=max_batch,
-        max_beams=int(gr_cfg.beam_max_width),
-        num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-        max_decode_steps=int(gr_cfg.beam_max_decode_steps),
-        head_dim=model_config.get_head_size(),
-        num_layers=model_config.get_num_layers(parallel_config),
-        device=runner.device,
-        dtype=model_config.dtype,
-    )
+    return _common_create_beam_context(runner, gr_cfg, max_batch=max_batch)
 
 
 def _capture_create_dummy_context(
@@ -581,12 +544,26 @@ def capture_beam_decode_graph(runner) -> bool:
     captured = False
     try:
         set_cudagraph_capturing_enabled(True)
-        # CUDA graph capture requires a non-default stream (native
-        # graph_capture() provides one during capture_model; emulate here).
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.accelerator.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(num_warmups):
+        # The graph pool's tensors are inference tensors (the native
+        # ``_dummy_run`` creates them under ``@torch.inference_mode()``), so
+        # ``capture_begin``'s in-place updates are only legal inside
+        # inference mode.  Mirror the native decorator here.
+        with torch.inference_mode():
+            # CUDA graph capture requires a non-default stream (native
+            # graph_capture() provides one during capture_model; emulate here).
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.accelerator.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(num_warmups):
+                    _dummy_beam_forward(
+                        runner,
+                        context,
+                        beam_info,
+                        batch_descriptor,
+                        width,
+                        prefix_len,
+                        capture=False,
+                    )
                 _dummy_beam_forward(
                     runner,
                     context,
@@ -594,22 +571,13 @@ def capture_beam_decode_graph(runner) -> bool:
                     batch_descriptor,
                     width,
                     prefix_len,
-                    capture=False,
+                    capture=True,
                 )
-            _dummy_beam_forward(
-                runner,
-                context,
-                beam_info,
-                batch_descriptor,
-                width,
-                prefix_len,
-                capture=True,
-            )
-        torch.accelerator.current_stream().wait_stream(side)
-        torch.accelerator.synchronize()
+            torch.accelerator.current_stream().wait_stream(side)
+            torch.accelerator.synchronize()
 
-        # 3. Verify capture succeeded and record the width.
-        captured = _verify_and_record_captured_graph(runner, width)
+            # 3. Verify capture succeeded and record the width.
+            captured = _verify_and_record_captured_graph(runner, width)
     finally:
         set_cudagraph_capturing_enabled(False)
         # Drop the dummy session even if capture threw. The context and

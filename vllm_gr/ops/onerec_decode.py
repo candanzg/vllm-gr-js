@@ -334,11 +334,12 @@ def _beam_search_group_torch(
     )
 
     if current_step == 0:
-        # xllm-ops skips TopK and leaves the four zero-initialized outputs
-        # untouched.  Its sequence kernel consumes the first candidate token.
-        copy_width = min(top_k, beam_width)
-        first_tokens = top_tokens.reshape(batch_size, beam_width, beam_width)[:, :copy_width, 0]
-        out_sequence[:, :copy_width, 0] = first_tokens
+        # Matches the NPU kernel's legacy initialization contract (verified on
+        # device): only the flat sequence rows [0, batch_size) receive their
+        # own row's first candidate token; every other output stays zero.
+        # The ACS integration bypasses this path through init_from_prefill.
+        flat_out_sequence = out_sequence.reshape(-1, current_step + 1)
+        flat_out_sequence[:batch_size, 0] = top_tokens[:batch_size, 0].to(torch.int32)
         return (
             out_token_ids,
             out_token_index,

@@ -181,10 +181,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # All buffers are pre-allocated at init time with maximum sizes.
         # build() writes into these buffers and returns views (stable addresses).
         # This ensures that tensor addresses captured during CUDA/ACL Graph
-        # capture remain valid across replays.  Currently only CUDA allocates
-        # these; when ACL Graph support lands, NPU will set _fixed_buffers=True
-        # here too and the rest of the code needs no change.
-        self._fixed_buffers = self._is_cuda
+        # capture remain valid across replays.  CUDA and NPU allocate these
+        # (NPU needs them for ACL Graph FULL-mode beam decode via the xllm
+        # path; the cascade path ignores the *_device fields).
+        self._fixed_buffers = self._is_cuda or self._is_npu
         if self._fixed_buffers:
             max_reqs = vllm_config.scheduler_config.max_num_seqs
             max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens

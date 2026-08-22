@@ -17,6 +17,7 @@ from vllm_gr.config.validation import (
     validate_beam_max_width,
     validate_catalog_path,
     validate_constraint_backend,
+    validate_npu_decode_execution,
     validate_vocab_offset,
     validate_vocab_slice_size,
 )
@@ -29,6 +30,7 @@ VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
 BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
 BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
 BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
+NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -40,6 +42,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_GRAPH_ENABLED_KEY,
         BEAM_MAX_WIDTH_KEY,
         BEAM_MAX_DECODE_STEPS_KEY,
+        NPU_DECODE_EXECUTION_KEY,
     }
 )
 
@@ -84,6 +87,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         beam_max_decode_steps=validate_beam_max_decode_steps(
             additional_config.get(BEAM_MAX_DECODE_STEPS_KEY, _BEAM_MAX_DECODE_STEPS_DEFAULT)
         ),
+        npu_decode_execution=validate_npu_decode_execution(
+            additional_config.get(NPU_DECODE_EXECUTION_KEY)
+        ),
     )
 
 
@@ -98,6 +104,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     attention_backend = validate_attention_backend(gr_config.attention_backend)
     vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
     vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
+    npu_decode_execution = validate_npu_decode_execution(gr_config.npu_decode_execution)
 
     if catalog_path is None:
         additional_config.pop(CATALOG_PATH_KEY, None)
@@ -138,3 +145,12 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(BEAM_MAX_DECODE_STEPS_KEY, None)
     else:
         additional_config[BEAM_MAX_DECODE_STEPS_KEY] = gr_config.beam_max_decode_steps
+
+    if npu_decode_execution is None:
+        # Unset stays out of the serialized config; the runtime resolves it
+        # per platform at load time.
+        additional_config.pop(NPU_DECODE_EXECUTION_KEY, None)
+    else:
+        # Both explicit modes round-trip: an explicit 'cascade' opt-out must
+        # survive a write so it cannot be silently re-defaulted to xllm.
+        additional_config[NPU_DECODE_EXECUTION_KEY] = npu_decode_execution.value

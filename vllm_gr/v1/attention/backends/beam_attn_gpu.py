@@ -62,6 +62,31 @@ def supports_sinks() -> bool:
     return bool(is_available() and flash_attn_supports_sinks())
 
 
+def cache_unshared_kv(
+    unshared_key: Any,
+    unshared_value: Any,
+    curr_key: Any,
+    curr_value: Any,
+    slot: int,
+    decode_step: int,
+    beam_session: object = None,  # unused on GPU; xllm-only contract
+) -> None:
+    """Cascade-mode pool write: slot/0-based semantics, unchanged behavior."""
+    from vllm_gr.v1.attention.backends.beam_kernels import (
+        cache_unshared_kv as _cache_unshared_kv,
+    )
+
+    del beam_session
+    _cache_unshared_kv(
+        unshared_key,
+        unshared_value,
+        curr_key,
+        curr_value,
+        slot,
+        decode_step,
+    )
+
+
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,

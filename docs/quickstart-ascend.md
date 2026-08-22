@@ -138,3 +138,38 @@ python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
 Refer to [quickstart](quickstart.md#quick-start) for deployment.
 
 See [getting_started/installation/npu/npu.inc.md](getting_started/installation/npu/npu.inc.md) for the full NPU installation guide.
+
+## NPU decode execution mode
+
+The incremental beam decode branch on Ascend NPU has two execution modes,
+selected through the engine's `additional_config`:
+
+- `xllm` (default when the xllm-ops library from step 5 is installed): the
+  fused path — a single `x_attention` kernel attends over the paged shared
+  prefix and the contiguous unshared beam pool at once, and the fused
+  `cache_unshared_kv` / `select_unshared_kv` operators handle pool writes and
+  beam-selection reorders.
+- `cascade`: the per-operator path — two
+  `npu_fused_infer_attention_score_v2` calls plus the pool-to-buffer copies
+  and the merge operator chain. This is the default on NPU when xllm-ops is
+  missing (a log line explains why) and always the default on CUDA.
+
+```bash
+# default (xllm on NPU with xllm-ops installed; cascade otherwise)
+vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM"}'
+
+# explicit xllm fused decode (fails fast at startup when xllm-ops is missing)
+vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM", "vllm_gr_npu_decode_execution": "xllm"}'
+
+# explicit cascade (opt out of the fused path)
+vllm serve <model> --additional-config '{"vllm_gr_attention_backend": "CUSTOM", "vllm_gr_npu_decode_execution": "cascade"}'
+```
+
+Notes:
+
+- The option is NPU-only; selecting `xllm` on a CUDA host raises at startup.
+- Mixed std/beam batches and mixed sliding-window / sink / ALiBI configs are
+  not supported by the fused path; the scheduler falls back to the cascade
+  operators for those cases, and unsorted or shrunk beam selections always
+  reorder through the cascade kernel (the fused `select_unshared_kv` only
+  encodes full-width parents grouped by source beam).

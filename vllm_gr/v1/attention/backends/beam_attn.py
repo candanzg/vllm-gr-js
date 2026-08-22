@@ -39,13 +39,68 @@ logger = init_logger(__name__)
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()
 
+# In-process cache for the resolved vllm_gr_npu_decode_execution mode.  The
+# vLLM config is process-global and set once before model load, so the first
+# non-None read settles the mode for the lifetime of the process.
+_NPU_DECODE_EXECUTION_MODE: str | None = None
+
+
+def _get_npu_decode_execution() -> str:
+    """Lazily resolve ``vllm_gr_npu_decode_execution`` (cascade | xllm).
+
+    An unset config (None) resolves per platform: ``xllm`` on NPU when the
+    xllm-ops operator library is installed, ``cascade`` everywhere else (CUDA,
+    NPU without the library, or config not yet installed in this process).
+    Explicit ``cascade`` / ``xllm`` values always win.
+    """
+    global _NPU_DECODE_EXECUTION_MODE
+    if _NPU_DECODE_EXECUTION_MODE is not None:
+        return _NPU_DECODE_EXECUTION_MODE
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_gr.config import GRConfig
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        # Config not installed yet in this process; default without caching.
+        return "cascade"
+    configured = GRConfig.from_vllm_config(vllm_config).npu_decode_execution
+    if configured is not None:
+        _NPU_DECODE_EXECUTION_MODE = configured.value
+        return _NPU_DECODE_EXECUTION_MODE
+    if NPU_DEVICE and not CUDA_DEVICE:
+        from vllm_gr.ops.npu import beam_ops
+
+        _NPU_DECODE_EXECUTION_MODE = "xllm" if beam_ops.is_available() else "cascade"
+        if _NPU_DECODE_EXECUTION_MODE == "cascade":
+            logger.info(
+                "vllm_gr_npu_decode_execution is unset and the xllm-ops library "
+                "is unavailable (%s); defaulting to the cascade decode path. "
+                "Install xllm-ops (tools/install_xllm_ops.sh) to enable the "
+                "fused xllm decode path by default.",
+                beam_ops.unavailable_reason(),
+            )
+    else:
+        _NPU_DECODE_EXECUTION_MODE = "cascade"
+    return _NPU_DECODE_EXECUTION_MODE
+
 
 def _get_platform_execution_module() -> ModuleType:
+    npu_decode_execution = _get_npu_decode_execution()
     if NPU_DEVICE and not CUDA_DEVICE:
+        if npu_decode_execution == "xllm":
+            from vllm_gr.v1.attention.backends import beam_attn_npu_xllm
+
+            return beam_attn_npu_xllm
         from vllm_gr.v1.attention.backends import beam_attn_npu
 
         return beam_attn_npu
     if CUDA_DEVICE and not NPU_DEVICE:
+        if npu_decode_execution == "xllm":
+            raise RuntimeError(
+                "vllm_gr_npu_decode_execution='xllm' requires an Ascend NPU; "
+                "unset the option or select 'cascade' on CUDA."
+            )
         from vllm_gr.v1.attention.backends import beam_attn_gpu
 
         return beam_attn_gpu
@@ -57,6 +112,42 @@ def _get_platform_execution_module() -> ModuleType:
 
 class BeamAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config,
+        speculative_config=None,
+        num_dcp_pcp_tokens=None,
+        draft_attn_metadatas=None,
+    ):
+        """ACL Graph FULL-mode replay hook (vllm-ascend contract).
+
+        Called by ``update_full_graph_params`` before every FULL replay
+        (``vllm_ascend/compilation/acl_graph.py``).  Deliberately a no-op:
+        unlike the native PA/FIA backends, whose launch parameters are
+        host-side Python values that freeze at capture, every runtime-varying
+        input of the beam attention path is a persistent fixed-address device
+        buffer refreshed outside the graph each step (metadata builder's
+        ``_fixed_buffers`` pool, the beam context's ``decode_step_buf`` /
+        ``decode_step_1based_buf`` / ``xllm_block_table_buf``), so the
+        captured graph reads fresh values at replay by construction.  The
+        method must exist — the vllm-ascend caller dispatches through
+        ``get_impl_cls().update_graph_params`` unconditionally and would
+        raise AttributeError on the first FULL decode step otherwise.
+        """
+        del (
+            update_stream,
+            forward_context,
+            num_tokens,
+            vllm_config,
+            speculative_config,
+            num_dcp_pcp_tokens,
+            draft_attn_metadatas,
+        )
+        return None
 
     def __init__(
         self,
@@ -224,7 +315,10 @@ class BeamAttentionImpl(AttentionImpl):
             # Use Graph-compatible Triton kernel when decode_step_buf is
             # available on CUDA (reads decode_step from device buffer instead
             # of host Python int, enabling CUDA Graph capture/replay).
-            # Non-CUDA (e.g. CPU unit tests) falls back to the Python path.
+            # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through
+            # the platform module so the xllm execution mode can swap in the
+            # fused NPU operator; cascade modules forward to the original
+            # beam_kernels implementation.
             decode_step_buf = getattr(beam_session.context, "decode_step_buf", None)
             if decode_step_buf is not None and decode_step_buf.is_cuda:
                 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
@@ -240,15 +334,20 @@ class BeamAttentionImpl(AttentionImpl):
                     decode_step_buf,
                 )
             else:
-                from vllm_gr.v1.attention.backends.beam_kernels import cache_unshared_kv
-
-                cache_unshared_kv(
+                # Non-CUDA (NPU xllm/cascade, CPU unit tests) dispatches through
+                # the platform module so the xllm execution mode can swap in the
+                # fused NPU operator; cascade modules forward to the original
+                # beam_kernels implementation.  The beam_session gives the xllm
+                # module access to the context's fixed-address device buffers
+                # (ACL graph capture/replay); cascade/gpu modules ignore it.
+                platform_execution.cache_unshared_kv(
                     pool.unshared_key,
                     pool.unshared_value,
                     beam_key,
                     beam_value,
                     beam_session.slot,
                     beam_session.decode_step,
+                    beam_session=beam_session,
                 )
 
             # The suffix pool stores unquantized model activations. Its dtype
