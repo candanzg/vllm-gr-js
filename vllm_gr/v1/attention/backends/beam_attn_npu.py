@@ -16,6 +16,29 @@ from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
 )
 
 
+def cache_unshared_kv(
+    unshared_key: torch.Tensor,
+    unshared_value: torch.Tensor,
+    curr_key: torch.Tensor,
+    curr_value: torch.Tensor,
+    slot: int,
+    decode_step: int,
+) -> None:
+    """Cascade-mode pool write: slot/0-based semantics, unchanged behavior."""
+    from vllm_gr.v1.attention.backends.beam_kernels import (
+        cache_unshared_kv as _cache_unshared_kv,
+    )
+
+    _cache_unshared_kv(
+        unshared_key,
+        unshared_value,
+        curr_key,
+        curr_value,
+        slot,
+        decode_step,
+    )
+
+
 def is_available() -> bool:
     return True
 

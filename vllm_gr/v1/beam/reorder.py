@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""KV pool reorder dispatcher for incremental beam decode.
+
+``BeamSearchSession.step_complete`` calls ``reorder_unshared_kv`` after each
+beam decision.  The mode follows ``vllm_gr_npu_decode_execution``:
+
+- ``cascade`` (default, any device): the original
+  ``beam_kernels.select_unshared_kv``, indexed by ``slot`` with 0-based
+  ``decode_step`` semantics.
+- ``xllm`` (NPU only): the fused ``beam_ops.select_unshared_kv`` operator,
+  which consumes a ``block_table`` plus ``group_token_num`` prefix sums and a
+  1-based step, and reorders every layer's pool in one call.
+
+The fused kernel's mapping is derived from ``group_token_num``
+(``bincount(parent).cumsum``), which can only express survivors *grouped by
+source beam in ascending order* at *full beam width* — the ordering
+``beam_search_group`` emits.  When the caller's ``parent`` is unsorted or
+shrunk (e.g. catalog pruning drops beams), the dispatcher falls back to the
+cascade kernel, which handles arbitrary ``beam_index`` orderings.
+"""
+
+from __future__ import annotations
+
+import torch
+
+_FALLBACK_LOGGED = False
+
+
+def _resolve_mode() -> str:
+    """Read the process-global decode execution mode (cascade | xllm)."""
+    from vllm_gr.v1.attention.backends.beam_attn import _get_npu_decode_execution
+
+    return _get_npu_decode_execution()
+
+
+def _group_token_num_from_parents(parent: torch.Tensor) -> torch.Tensor:
+    """Request-local prefix sums of surviving-child counts per source beam.
+
+    ``group_token_num[j] = #{{ i : parent[i] <= j }}`` within the request,
+    i.e. ``bincount(parent, minlength=beam_size).cumsum`` flattened — the
+    exact representation the xllm ``select_unshared_kv`` kernel parses back
+    into per-target source beams (``_parent_beams_from_prefix`` is the
+    inverse; it round-trips exactly for sorted parents).
+    """
+    width = int(parent.max().item()) + 1 if parent.numel() else 1
+    width = max(width, parent.numel())
+    counts = torch.bincount(parent.to(torch.int64), minlength=width)
+    return counts.cumsum(0).to(torch.int32).reshape(-1)
+
+
+def _fused_reorder_applies(parent: torch.Tensor, pool_beam_width: int) -> bool:
+    """Whether the fused kernel can express this selection.
+
+    The kernel derives its mapping purely from ``group_token_num`` prefix
+    sums, so it requires (a) one survivor per pool beam row (full width) and
+    (b) survivors grouped by source beam ascending.  Both hold for
+    ``beam_search_group`` output; anything else must use the cascade kernel.
+    """
+    if parent.numel() != pool_beam_width:
+        return False
+    parent_cpu = parent.detach().to("cpu")
+    if parent_cpu.numel() < 2:
+        return True
+    return bool((parent_cpu[1:] >= parent_cpu[:-1]).all().item())
+
+
+def reorder_unshared_kv(
+    parent: torch.Tensor,
+    slot: int,
+    pools: list,
+    decode_step: int,
+) -> None:
+    """Reorder every layer's unshared pool KV in place after selection.
+
+    Args:
+        parent: ``[W_cur]`` int tensor; ``parent[i] = j`` means new beam i
+            inherits old beam j's KV history.
+        slot: pool slot (batch row) of the owning session.
+        pools: per-layer ``BeamAttentionPool`` objects.
+        decode_step: 0-based step; the reorder covers ``[0, decode_step]``.
+    """
+    pools = list(pools)
+    if _resolve_mode() == "xllm":
+        pool_beam_width = pools[0].unshared_key.shape[1]
+        if _fused_reorder_applies(parent, pool_beam_width):
+            from vllm_gr.ops.npu import beam_ops
+
+            beam_ops.select_unshared_kv(
+                parent.to(torch.int32).contiguous(),
+                [p.unshared_key for p in pools],
+                [p.unshared_value for p in pools],
+                torch.tensor([slot], dtype=torch.int32, device=parent.device),
+                _group_token_num_from_parents(parent).to(parent.device),
+                decode_step + 1,
+                pool_beam_width,
+                len(pools),
+            )
+            return
+
+        global _FALLBACK_LOGGED
+        if not _FALLBACK_LOGGED:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).debug(
+                "xllm decode execution fell back to the cascade KV reorder: "
+                "the fused select_unshared_kv requires full-width parents "
+                "sorted by source beam (got width=%d, pool width=%d)",
+                parent.numel(),
+                pool_beam_width,
+            )
+            _FALLBACK_LOGGED = True
+
+    from vllm_gr.v1.attention.backends.beam_kernels import select_unshared_kv
+
+    select_unshared_kv(
+        parent,
+        slot,
+        [p.unshared_key for p in pools],
+        [p.unshared_value for p in pools],
+        decode_step,
+    )
+
+
+__all__ = ["reorder_unshared_kv"]

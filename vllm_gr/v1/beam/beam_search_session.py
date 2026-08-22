@@ -70,13 +70,12 @@ class BeamSearchSession:
         """
         state = self._state
         if not state.is_last_step:
-            from vllm_gr.v1.attention.backends.beam_kernels import select_unshared_kv
+            from vllm_gr.v1.beam.reorder import reorder_unshared_kv
 
-            select_unshared_kv(
+            reorder_unshared_kv(
                 parent,
                 self.slot,
-                [p.unshared_key for p in self.context.pools],
-                [p.unshared_value for p in self.context.pools],
+                self.context.pools,
                 state.decode_step,
             )
         state.decode_step += 1

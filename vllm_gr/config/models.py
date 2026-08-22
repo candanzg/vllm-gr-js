@@ -16,6 +16,13 @@ class ConstraintBackend(str, Enum):
     CONSTRAINT_TABLE = "constraint_table"
 
 
+class NPUDecodeExecution(str, Enum):
+    """Execution mode for the NPU incremental beam decode branch."""
+
+    CASCADE = "cascade"
+    XLLM = "xllm"
+
+
 @dataclass(frozen=True)
 class GRConfig:
     """Validated vLLM-GR configuration reconstructed in each process."""
@@ -25,12 +32,16 @@ class GRConfig:
     attention_backend: GRAttentionBackend | None = None
     vocab_offset: int | None = None
     vocab_slice_size: int | None = None
+    # None = unset: the runtime picks per-platform defaults (xllm on NPU when
+    # the operator library is present, cascade otherwise and on CUDA).
+    npu_decode_execution: NPUDecodeExecution | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
             validate_attention_backend,
             validate_catalog_path,
             validate_constraint_backend,
+            validate_npu_decode_execution,
             validate_vocab_offset,
             validate_vocab_slice_size,
         )
@@ -50,6 +61,11 @@ class GRConfig:
         object.__setattr__(
             self, "vocab_slice_size", validate_vocab_slice_size(self.vocab_slice_size)
         )
+        object.__setattr__(
+            self,
+            "npu_decode_execution",
+            validate_npu_decode_execution(self.npu_decode_execution),
+        )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -64,6 +80,7 @@ class GRConfig:
             or self.attention_backend is not None
             or self.vocab_offset is not None
             or self.vocab_slice_size is not None
+            or self.npu_decode_execution is not None
         )
 
     @classmethod

@@ -1,0 +1,366 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Parity tests: xllm fused decode vs the cascade incremental path on NPU.
+
+Drives the real ``BeamAttentionMetadataBuilder`` with a live
+``BeamSearchSession`` (so the metadata carries the incremental-decode fields
+``is_beam_decode`` / ``beam_session`` / ``prefix_indices``) and compares
+``beam_attn_npu_xllm.cascade_attention`` against
+``beam_attn_npu.cascade_attention`` on identical pool and query state.
+
+Both paths must agree because they compute the same quantity -- attention of
+each beam query over ``[shared paged prefix || own unshared pool history]`` --
+with the same bottom-right causal convention on the unshared axis.
+
+Also covers:
+  * ``beam_attn_npu_xllm.cache_unshared_kv`` vs the reference pool write.
+  * mixed std+beam batches: the xllm module must refuse them loudly instead
+    of silently dropping the std rows.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.npu_integration
+
+try:
+    import torch_npu  # noqa: F401
+except (ImportError, RuntimeError) as exc:
+    pytest.skip(f"torch-npu is not installed: {exc}", allow_module_level=True)
+
+if not hasattr(torch, "npu") or not torch.npu.is_available():
+    pytest.skip("Ascend NPU is not available", allow_module_level=True)
+
+from vllm_gr.ops.npu import beam_ops
+from vllm_gr.v1.attention.backends import beam_attn_npu, beam_attn_npu_xllm
+from vllm_gr.v1.attention.backends.beam_attn_metadata import (
+    BeamAttentionMetadataBuilder,
+)
+from vllm_gr.v1.beam import BeamAttentionContext, BeamSearchSession
+from vllm_gr.v1.beam.context import BEAM_DATA_VAR
+
+DEVICE = torch.device("npu")
+DTYPE = torch.bfloat16
+
+NUM_HEADS = 8
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+BLOCK_SIZE = 128
+MAX_DECODE_STEPS = 8
+NUM_LAYERS = 1
+
+
+def _build_incremental_metadata(
+    *,
+    beam_width: int,
+    prefix_len: int,
+    decode_step: int,
+    session: BeamSearchSession,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    std_req: tuple[int, int, int] | None = None,
+):
+    """Build real incremental-decode metadata through the real builder.
+
+    Mirrors ``cascade_beam_attn_utils.build_beam_attn_metadata`` but wires a
+    live ``BeamSearchSession`` into ``BEAM_DATA_VAR`` so the builder takes the
+    incremental path (``is_incremental=True``).
+    """
+    beam_seq_len = prefix_len + beam_width * (decode_step + 1)
+    num_reqs = block_tables.shape[0] + (1 if std_req else 0)
+
+    total_q = query.shape[0] + (
+        0 if std_req is None else 0
+    )  # std tokens are not part of the beam query tensor here
+    query_start_loc_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32)
+    # Beam request occupies the first w query rows; each beam contributes 1.
+    if std_req is None:
+        query_start_loc_cpu[1] = beam_width
+        query_start_loc_cpu[2:] = beam_width
+        num_actual_tokens = beam_width
+    else:
+        std_idx, std_q_len, _ = std_req
+        # std rows come first (std_indices gather), beam rows after.
+        query_start_loc_cpu[1 : std_idx + 1] = std_q_len
+        query_start_loc_cpu[std_idx + 1 :] = std_q_len + beam_width
+        num_actual_tokens = std_q_len + beam_width
+
+    seq_lens = torch.tensor([beam_seq_len] * num_reqs, dtype=torch.int32, device=DEVICE)
+
+    class _Common:
+        pass
+
+    common = _Common()
+    common.num_reqs = num_reqs
+    common.query_start_loc_cpu = query_start_loc_cpu
+    common.query_start_loc = query_start_loc_cpu.to(DEVICE)
+    common.seq_lens = seq_lens
+    common.block_table_tensor = block_tables.to(DEVICE)
+    common.num_actual_tokens = num_actual_tokens
+    common.max_query_len = max(beam_width, 1)
+    common.max_seq_len = beam_seq_len
+    common.causal = True
+    common.slot_mapping = torch.zeros(num_actual_tokens, dtype=torch.long, device=DEVICE)
+
+    beam_data: dict = {
+        "req_0": {
+            "is_beam_decode": True,
+            "prefix_len": prefix_len,
+            "beam_width": beam_width,
+            "beam_decode_steps": decode_step + 1,
+            "cache_len": prefix_len // BLOCK_SIZE * BLOCK_SIZE,
+            "decode_step": decode_step,
+        }
+    }
+    beam_info: dict = {
+        "beam_data": beam_data,
+        "req_ids": [f"req_{i}" for i in range(num_reqs)],
+        "beam_session": session,
+    }
+
+    token = BEAM_DATA_VAR.set(beam_info)
+    try:
+        builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
+        builder.device = DEVICE
+        builder.block_size = BLOCK_SIZE
+        builder.aot_schedule = False
+        builder.aot_sliding_window = None
+        builder.use_full_cuda_graph = False
+        builder.max_cudagraph_size = None
+        builder.max_num_splits = 0
+        builder.num_heads_q = NUM_HEADS
+        builder.num_kv_heads = NUM_KV_HEADS
+        builder._is_cuda = False
+        builder._is_npu = True
+        builder.npu_causal_atten_mask = (
+            torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(DEVICE)
+        )
+        return builder.build(
+            common_prefix_len=prefix_len,
+            common_attn_metadata=common,
+            fast_build=False,
+        )
+    finally:
+        BEAM_DATA_VAR.reset(token)
+
+
+def _run_mode(module, metadata, query, key_cache, value_cache, pool, scale):
+    output = torch.zeros_like(query)
+    module.cascade_attention(
+        output=output,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        attn_metadata=metadata,
+        sliding_window_size=None,
+        scale=scale,
+        logits_soft_cap=0.0,
+        vllm_flash_attn_version=0,
+        s_aux=None,
+        alibi_slopes=None,
+        beam_pool=pool,
+    )
+    torch.npu.synchronize()
+    return output
+
+
+@pytest.mark.parametrize("beam_width", [2, 4])
+@pytest.mark.parametrize("decode_step", [0, 1, 3, 7])
+def test_xllm_incremental_matches_cascade(beam_width: int, decode_step: int) -> None:
+    """x_attention fused path vs cascade incremental path, allclose."""
+    torch.manual_seed(beam_width * 100 + decode_step)
+    prefix_len = 256  # 2 full blocks; no remainder-block std spill
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=beam_width,
+        num_kv_heads=NUM_KV_HEADS,
+        max_decode_steps=MAX_DECODE_STEPS,
+        head_dim=HEAD_DIM,
+        num_layers=NUM_LAYERS,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    slot = context.registry.allocate("test", beam_width=beam_width, prefix_len=prefix_len)
+    session = BeamSearchSession(session_id="test", slot=slot, context=context)
+    session.begin_session(beam_width=beam_width, prefix_len=prefix_len)
+    # advance to the requested step
+    for _ in range(decode_step):
+        session._state.decode_step += 1
+    pool = session.pools[0]
+
+    # Fill pool history for steps [0, decode_step] with distinct values.
+    steps = decode_step + 1
+    hist_k = (
+        torch.randn(beam_width, NUM_KV_HEADS, steps, HEAD_DIM, dtype=DTYPE) * scale
+    )
+    hist_v = (
+        torch.randn(beam_width, NUM_KV_HEADS, steps, HEAD_DIM, dtype=DTYPE) * scale
+    )
+    pool.unshared_key[slot, :beam_width, :, :steps, :] = hist_k.to(DEVICE)
+    pool.unshared_value[slot, :beam_width, :, :steps, :] = hist_v.to(DEVICE)
+
+    # Paged shared prefix KV.
+    blocks_per_req = prefix_len // BLOCK_SIZE
+    key_cache = (
+        torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
+        * scale
+    ).to(DEVICE)
+    value_cache = (
+        torch.randn(blocks_per_req, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE)
+        * scale
+    ).to(DEVICE)
+    block_tables = torch.arange(blocks_per_req, dtype=torch.int32).unsqueeze(0)
+
+    query = (
+        torch.randn(beam_width, NUM_HEADS, HEAD_DIM, dtype=DTYPE) * scale
+    ).to(DEVICE)
+
+    metadata = _build_incremental_metadata(
+        beam_width=beam_width,
+        prefix_len=prefix_len,
+        decode_step=decode_step,
+        session=session,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_tables,
+    )
+    assert metadata.is_beam_decode is True
+    assert metadata.beam_session is session
+    assert metadata.prefix_indices is not None
+    assert metadata.std_indices is None
+
+    cascade_out = _run_mode(
+        beam_attn_npu, metadata, query, key_cache, value_cache, pool, scale
+    )
+    xllm_out = _run_mode(
+        beam_attn_npu_xllm, metadata, query, key_cache, value_cache, pool, scale
+    )
+
+    assert xllm_out.shape == cascade_out.shape
+    torch.testing.assert_close(
+        xllm_out.float(), cascade_out.float(), rtol=2e-2, atol=2e-2
+    )
+
+    session.end_session()
+
+
+def test_xllm_cache_unshared_kv_matches_reference() -> None:
+    """The xllm pool write must reproduce the reference slot/0-based write."""
+    torch.manual_seed(99)
+    beam_width, max_steps = 4, 8
+    pool = torch.zeros(
+        1, beam_width, NUM_KV_HEADS, max_steps, HEAD_DIM, dtype=DTYPE, device=DEVICE
+    )
+    pool_ref = torch.zeros_like(pool)
+
+    curr_k = (
+        torch.randn(beam_width, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * 0.1
+    ).to(DEVICE)
+    curr_v = (
+        torch.randn(beam_width, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE) * 0.1
+    ).to(DEVICE)
+    slot, decode_step = 0, 3
+
+    beam_attn_npu_xllm.cache_unshared_kv(
+        pool, pool.clone(), curr_k, curr_v, slot, decode_step
+    )
+    # Reference: the original beam_kernels semantics (slot/0-based).
+    pool_ref[slot, :beam_width, :, decode_step : decode_step + 1, :] = curr_k.unsqueeze(
+        2
+    )
+    pool_ref_v = pool_ref.clone()
+    pool_ref_v[slot, :beam_width, :, decode_step : decode_step + 1, :] = curr_v.unsqueeze(
+        2
+    )
+
+    torch.testing.assert_close(pool, pool_ref, rtol=0, atol=0)
+
+    # And the fused op itself must agree with the same reference layout.
+    pool2 = torch.zeros_like(pool)
+    pool2_v = torch.zeros_like(pool)
+    block_table = torch.tensor([slot], dtype=torch.int32, device=DEVICE)
+    beam_ops.cache_unshared_kv(pool2, pool2_v, curr_k, curr_v, block_table, decode_step + 1)
+    torch.testing.assert_close(pool2, pool_ref, rtol=0, atol=0)
+    torch.testing.assert_close(pool2_v, pool_ref_v, rtol=0, atol=0)
+
+
+def test_xllm_rejects_mixed_std_beam_batch() -> None:
+    """Mixed std+beam batches must be rejected loudly by the xllm module."""
+    beam_width, prefix_len, decode_step = 2, 256, 1
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    context = BeamAttentionContext(
+        max_batch=1,
+        max_beams=beam_width,
+        num_kv_heads=NUM_KV_HEADS,
+        max_decode_steps=MAX_DECODE_STEPS,
+        head_dim=HEAD_DIM,
+        num_layers=NUM_LAYERS,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    slot = context.registry.allocate("mixed", beam_width=beam_width, prefix_len=prefix_len)
+    session = BeamSearchSession(session_id="mixed", slot=slot, context=context)
+    session.begin_session(beam_width=beam_width, prefix_len=prefix_len)
+    session._state.decode_step = decode_step
+    pool = session.pools[0]
+
+    blocks_per_req = prefix_len // BLOCK_SIZE
+    key_cache = torch.zeros(
+        blocks_per_req + 1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE
+    )
+    value_cache = torch.zeros_like(key_cache)
+    # std request occupies block `blocks_per_req`
+    block_tables = torch.arange(blocks_per_req + 1, dtype=torch.int32).unsqueeze(0)
+
+    # 1 std token + w beam tokens
+    query = torch.zeros(
+        1 + beam_width, NUM_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE
+    )
+
+    metadata = _build_incremental_metadata(
+        beam_width=beam_width,
+        prefix_len=prefix_len,
+        decode_step=decode_step,
+        session=session,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_tables,
+        std_req=(0, 1, prefix_len),
+    )
+    # Force a mixed batch: std rows exist alongside beam rows.  The std
+    # branch needs the std routing fields the builder would have produced
+    # (std_block_table / std_cu_seqlens_q_cpu / std_seqlens_kv_cpu).
+    metadata.std_indices = torch.tensor([0], dtype=torch.long, device=DEVICE)
+    metadata.num_std_indices = 1
+    metadata.prefix_indices = torch.arange(1, 1 + beam_width, dtype=torch.long, device=DEVICE)
+    metadata.num_prefix_indices = beam_width
+    metadata.std_block_table = block_tables.to(DEVICE)
+    metadata.std_cu_seqlens_q_cpu = [1]
+    metadata.std_seqlens_kv_cpu = [prefix_len]
+
+    with pytest.raises(RuntimeError, match="mixed std/beam"):
+        beam_attn_npu_xllm.cascade_attention(
+            output=torch.zeros_like(query),
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attn_metadata=metadata,
+            sliding_window_size=None,
+            scale=scale,
+            logits_soft_cap=0.0,
+            vllm_flash_attn_version=0,
+            beam_pool=pool,
+        )
+
+    session.end_session()

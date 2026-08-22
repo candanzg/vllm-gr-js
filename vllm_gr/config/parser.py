@@ -11,6 +11,7 @@ from vllm_gr.config.validation import (
     validate_attention_backend,
     validate_catalog_path,
     validate_constraint_backend,
+    validate_npu_decode_execution,
     validate_vocab_offset,
     validate_vocab_slice_size,
 )
@@ -20,6 +21,7 @@ CONSTRAINT_BACKEND_KEY: Final = "vllm_gr_constraint_backend"
 ATTENTION_BACKEND_KEY: Final = "vllm_gr_attention_backend"
 VOCAB_OFFSET_KEY: Final = "vllm_gr_vocab_offset"
 VOCAB_SLICE_SIZE_KEY: Final = "vllm_gr_vocab_slice_size"
+NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -28,6 +30,7 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         ATTENTION_BACKEND_KEY,
         VOCAB_OFFSET_KEY,
         VOCAB_SLICE_SIZE_KEY,
+        NPU_DECODE_EXECUTION_KEY,
     }
 )
 
@@ -65,6 +68,9 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         attention_backend=validate_attention_backend(additional_config.get(ATTENTION_BACKEND_KEY)),
         vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
         vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
+        npu_decode_execution=validate_npu_decode_execution(
+            additional_config.get(NPU_DECODE_EXECUTION_KEY)
+        ),
     )
 
 
@@ -79,6 +85,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
     attention_backend = validate_attention_backend(gr_config.attention_backend)
     vocab_offset = validate_vocab_offset(gr_config.vocab_offset)
     vocab_slice_size = validate_vocab_slice_size(gr_config.vocab_slice_size)
+    npu_decode_execution = validate_npu_decode_execution(gr_config.npu_decode_execution)
 
     if catalog_path is None:
         additional_config.pop(CATALOG_PATH_KEY, None)
@@ -104,3 +111,12 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config.pop(VOCAB_SLICE_SIZE_KEY, None)
     else:
         additional_config[VOCAB_SLICE_SIZE_KEY] = vocab_slice_size
+
+    if npu_decode_execution is None:
+        # Unset stays out of the serialized config; the runtime resolves it
+        # per platform at load time.
+        additional_config.pop(NPU_DECODE_EXECUTION_KEY, None)
+    else:
+        # Both explicit modes round-trip: an explicit 'cascade' opt-out must
+        # survive a write so it cannot be silently re-defaulted to xllm.
+        additional_config[NPU_DECODE_EXECUTION_KEY] = npu_decode_execution.value

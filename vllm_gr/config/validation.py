@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from vllm_gr.config.models import ConstraintBackend, GRAttentionBackend
+from vllm_gr.config.models import ConstraintBackend, GRAttentionBackend, NPUDecodeExecution
 
 
 def validate_catalog_path(value: object) -> str | None:
@@ -43,6 +43,22 @@ def validate_attention_backend(value: object) -> GRAttentionBackend | None:
         supported = ", ".join(backend.value for backend in GRAttentionBackend)
         raise ValueError(
             f"unsupported vllm-gr attention_backend {value!r}; supported: {supported}"
+        ) from exc
+
+
+def validate_npu_decode_execution(value: object) -> NPUDecodeExecution | None:
+    if value is None:
+        return None
+    if isinstance(value, NPUDecodeExecution):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("vllm-gr npu_decode_execution must be a string")
+    try:
+        return NPUDecodeExecution(value.lower())
+    except ValueError as exc:
+        supported = ", ".join(mode.value for mode in NPUDecodeExecution)
+        raise ValueError(
+            f"unsupported vllm-gr npu_decode_execution {value!r}; supported: {supported}"
         ) from exc
 
 

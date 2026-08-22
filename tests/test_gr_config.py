@@ -9,11 +9,12 @@ from unittest import mock
 
 import pytest
 
-from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig
+from vllm_gr.config import ConstraintBackend, GRAttentionBackend, GRConfig, NPUDecodeExecution
 from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
     CATALOG_PATH_KEY,
     CONSTRAINT_BACKEND_KEY,
+    NPU_DECODE_EXECUTION_KEY,
 )
 
 
@@ -82,6 +83,54 @@ def test_rejects_invalid_constraint_backend(value: object) -> None:
 def test_constraint_table_requires_catalog_path() -> None:
     with pytest.raises(ValueError, match="requires catalog_path"):
         GRConfig(constraint_backend=ConstraintBackend.CONSTRAINT_TABLE)
+
+
+def test_npu_decode_execution_defaults_to_unset() -> None:
+    # Unset (None): the runtime resolves per platform (xllm on NPU with the
+    # operator library, cascade otherwise).
+    assert GRConfig().npu_decode_execution is None
+    assert GRConfig.from_vllm_config(_vllm_config()).npu_decode_execution is None
+    # Unset is not an explicit GR configuration; explicit cascade is.
+    assert GRConfig().enabled is False
+    assert GRConfig(npu_decode_execution=NPUDecodeExecution.CASCADE).enabled is True
+
+
+def test_npu_decode_execution_parses_and_normalizes() -> None:
+    config = GRConfig.from_vllm_config(
+        _vllm_config({NPU_DECODE_EXECUTION_KEY: "XLLM"})
+    )
+    assert config.npu_decode_execution is NPUDecodeExecution.XLLM
+    assert config.enabled is True
+
+
+@pytest.mark.parametrize("value", [1, True, [], {}, "flash"])  # type: ignore[misc]
+def test_rejects_invalid_npu_decode_execution(value: object) -> None:
+    with pytest.raises(ValueError, match="npu_decode_execution"):
+        GRConfig.from_vllm_config(_vllm_config({NPU_DECODE_EXECUTION_KEY: value}))
+
+
+def test_npu_decode_execution_round_trip_and_default_elision() -> None:
+    vllm_config = _vllm_config()
+    GRConfig(npu_decode_execution=NPUDecodeExecution.XLLM).write_to_vllm_config(
+        vllm_config
+    )
+    assert vllm_config.additional_config[NPU_DECODE_EXECUTION_KEY] == "xllm"
+    assert (
+        GRConfig.from_vllm_config(vllm_config).npu_decode_execution
+        is NPUDecodeExecution.XLLM
+    )
+
+    # Explicit cascade is preserved through a round trip so a later write
+    # cannot silently re-enable the platform default.
+    GRConfig(npu_decode_execution=NPUDecodeExecution.CASCADE).write_to_vllm_config(
+        vllm_config
+    )
+    assert vllm_config.additional_config[NPU_DECODE_EXECUTION_KEY] == "cascade"
+
+    # Writing the unset default removes the key entirely.
+    GRConfig().write_to_vllm_config(vllm_config)
+    assert NPU_DECODE_EXECUTION_KEY not in vllm_config.additional_config
+    assert GRConfig.from_vllm_config(vllm_config).npu_decode_execution is None
 
 
 def test_write_preserves_unrelated_additional_config() -> None:

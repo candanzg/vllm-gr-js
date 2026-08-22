@@ -27,7 +27,9 @@ def _load_prompt_text() -> str:
         return f.read()
 
 
-def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
+def _run_offline_beam_search(
+    loops: int, use_patch: bool, npu_decode_execution: str = "default"
+) -> None:
     model_name = os.getenv("VLLM_GR_TEST_MODEL", "OpenOneRec/OneRec-1.7B")
     beam_width = 128
     max_tokens = 5
@@ -49,11 +51,23 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
 
     prompt_text = _load_prompt_text()
     prompts = [{"prompt": prompt_text}]
-    print(f"Running offline beam search (patch={use_patch}) loops={loops}")
+    print(
+        f"Running offline beam search (patch={use_patch}) loops={loops} "
+        f"npu_decode_execution={npu_decode_execution}"
+    )
 
     # vllm-gr is designed to use beam_width for max_logprobs (not 2 * beam_width)
     # to improve performance. Reflect that here when use_patch is True.
     max_logprobs = beam_width if use_patch else 2 * beam_width
+
+    engine_kwargs: Dict[str, Any] = {}
+    if npu_decode_execution != "default":
+        # 'default' deliberately leaves the config unset so the test exercises
+        # the platform default resolution (xllm on NPU with xllm-ops
+        # installed, cascade otherwise).
+        engine_kwargs["additional_config"] = {
+            "vllm_gr_npu_decode_execution": npu_decode_execution
+        }
 
     with GRLLM(
         model=model_name,
@@ -61,6 +75,7 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
         max_logprobs=max_logprobs,
         attention_config={"backend": "CUSTOM"},
         max_num_seqs=64,
+        **engine_kwargs,
     ) as llm:
         start = time.perf_counter()
         for _ in range(max(1, loops)):
@@ -71,14 +86,22 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     print(f"Elapsed mean: {(end - start) / max(1, loops):.4f}s")
 
 
-def _run_offline_gr_beam_search_target(loops: int) -> None:
+def _run_offline_gr_beam_search_target(
+    loops: int, npu_decode_execution: str = "default"
+) -> None:
+    # The memory-delta check below needs two engine lifecycles in one process.
+    # After the first lifecycle the parent has initialized the NPU runtime,
+    # and vLLM's default fork start method would fail EngineCore startup with
+    # "Cannot re-initialize NPU in forked subprocess" (upstream only force-
+    # spawns when CUDA/XPU is initialized). Force spawn for the second run.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     device = torch.cuda
     if hasattr(torch, "npu") and torch.npu.is_available():
         device = torch.npu
     before_gpu = device.memory_allocated()
     before_host = psutil.Process().memory_info().rss
-    _run_offline_beam_search(loops, use_patch=True)
-    _run_offline_beam_search(loops, use_patch=True)
+    _run_offline_beam_search(loops, use_patch=True, npu_decode_execution=npu_decode_execution)
+    _run_offline_beam_search(loops, use_patch=True, npu_decode_execution=npu_decode_execution)
     device.synchronize()
     after_gpu = device.memory_allocated()
     after_host = psutil.Process().memory_info().rss
@@ -109,9 +132,17 @@ def _run_offline_gr_beam_search_target(loops: int) -> None:
 
 
 @pytest.mark.slow  # type: ignore
-def test_offline_gr_beam_search(loops: int) -> None:
+@pytest.mark.parametrize("npu_decode_execution", ["default", "cascade", "xllm"])  # type: ignore
+def test_offline_gr_beam_search(loops: int, npu_decode_execution: str) -> None:
+    if npu_decode_execution == "xllm" and not (
+        hasattr(torch, "npu") and torch.npu.is_available()
+    ):
+        pytest.skip("xllm decode execution requires an Ascend NPU")
     ctx = multiprocessing.get_context("spawn")
-    p = ctx.Process(target=_run_offline_gr_beam_search_target, args=(loops,))
+    p = ctx.Process(
+        target=_run_offline_gr_beam_search_target,
+        args=(loops, npu_decode_execution),
+    )
     p.start()
     p.join()
     assert p.exitcode == 0

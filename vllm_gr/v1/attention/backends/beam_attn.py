@@ -39,13 +39,70 @@ logger = init_logger(__name__)
 NPU_DEVICE = is_npu_available()
 CUDA_DEVICE = is_cuda_available()
 
+# In-process cache for the resolved vllm_gr_npu_decode_execution mode.  The
+# vLLM config is process-global and set once before model load, so the first
+# non-None read settles the mode for the lifetime of the process.
+_NPU_DECODE_EXECUTION_MODE: str | None = None
+
+
+def _get_npu_decode_execution() -> str:
+    """Lazily resolve ``vllm_gr_npu_decode_execution`` (cascade | xllm).
+
+    An unset config (None) resolves per platform: ``xllm`` on NPU when the
+    xllm-ops operator library is installed, ``cascade`` everywhere else (CUDA,
+    NPU without the library, or config not yet installed in this process).
+    Explicit ``cascade`` / ``xllm`` values always win.
+    """
+    global _NPU_DECODE_EXECUTION_MODE
+    if _NPU_DECODE_EXECUTION_MODE is not None:
+        return _NPU_DECODE_EXECUTION_MODE
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_gr.config import GRConfig
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        # Config not installed yet in this process; default without caching.
+        return "cascade"
+    configured = GRConfig.from_vllm_config(vllm_config).npu_decode_execution
+    if configured is not None:
+        _NPU_DECODE_EXECUTION_MODE = configured.value
+        return _NPU_DECODE_EXECUTION_MODE
+    if NPU_DEVICE and not CUDA_DEVICE:
+        from vllm_gr.ops.npu import beam_ops
+
+        _NPU_DECODE_EXECUTION_MODE = (
+            "xllm" if beam_ops.is_available() else "cascade"
+        )
+        if _NPU_DECODE_EXECUTION_MODE == "cascade":
+            logger.info(
+                "vllm_gr_npu_decode_execution is unset and the xllm-ops library "
+                "is unavailable (%s); defaulting to the cascade decode path. "
+                "Install xllm-ops (tools/install_xllm_ops.sh) to enable the "
+                "fused xllm decode path by default.",
+                beam_ops.unavailable_reason(),
+            )
+    else:
+        _NPU_DECODE_EXECUTION_MODE = "cascade"
+    return _NPU_DECODE_EXECUTION_MODE
+
 
 def _get_platform_execution_module() -> ModuleType:
+    npu_decode_execution = _get_npu_decode_execution()
     if NPU_DEVICE and not CUDA_DEVICE:
+        if npu_decode_execution == "xllm":
+            from vllm_gr.v1.attention.backends import beam_attn_npu_xllm
+
+            return beam_attn_npu_xllm
         from vllm_gr.v1.attention.backends import beam_attn_npu
 
         return beam_attn_npu
     if CUDA_DEVICE and not NPU_DEVICE:
+        if npu_decode_execution == "xllm":
+            raise RuntimeError(
+                "vllm_gr_npu_decode_execution='xllm' requires an Ascend NPU; "
+                "unset the option or select 'cascade' on CUDA."
+            )
         from vllm_gr.v1.attention.backends import beam_attn_gpu
 
         return beam_attn_gpu
@@ -192,8 +249,6 @@ class BeamAttentionImpl(AttentionImpl):
         is_beam_decode = getattr(attn_metadata, "is_beam_decode", False)
 
         if is_beam_decode and beam_session is not None and beam_session.is_active:
-            from vllm_gr.v1.attention.backends.beam_kernels import cache_unshared_kv
-
             # Resolve this layer's KV pool with module-level caching.
             # First touch: extract the layer index from layer_name via
             # extract_layer_index (loud AssertionError on ambiguous names
@@ -218,8 +273,11 @@ class BeamAttentionImpl(AttentionImpl):
                 beam_key = key
                 beam_value = value
 
-            # cache_unshared_kv: write current step's KV into pool
-            cache_unshared_kv(
+            # cache_unshared_kv: write current step's KV into pool.
+            # Dispatched through the platform module so the xllm execution
+            # mode can swap in the fused NPU operator; cascade modules
+            # forward to the original beam_kernels implementation.
+            platform_execution.cache_unshared_kv(
                 pool.unshared_key,
                 pool.unshared_value,
                 beam_key,

@@ -162,8 +162,11 @@ def test_group_torch_step0_matches_npu_observable_initialization() -> None:
     batch, beam, top_k = 2, 8, 8
     inputs = _group_inputs(batch, beam, 0, "cpu")
     token, parent, score, prefix, sequence = _beam_search_group_torch(*inputs, 0, top_k)
-    expected = inputs[1].reshape(batch, beam, beam)[:, :, 0]
-    assert torch.equal(sequence[:, :, 0], expected)
+    # Legacy kernel-initialization contract (verified on device): only the
+    # flat sequence rows [0, batch) receive their own row's first candidate.
+    expected = torch.zeros_like(sequence)
+    expected.reshape(-1, 1)[:batch, 0] = inputs[1][:batch, 0]
+    assert torch.equal(sequence, expected)
     assert torch.count_nonzero(token) == 0
     assert torch.count_nonzero(parent) == 0
     assert torch.count_nonzero(score) == 0
