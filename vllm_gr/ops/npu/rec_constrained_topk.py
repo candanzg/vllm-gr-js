@@ -5,46 +5,9 @@
 
 from __future__ import annotations
 
-from types import ModuleType
-
 import torch
 
-
-def _load_xllm_ops() -> None:
-    """Load the shared xLLM extension before probing its Python bindings.
-
-    ACS uses this lazy load because the ``custom_xllm_math`` CANN vendor is
-    linked by ``libxllm_ops.so``.  Importing ``custom_ops_lib`` alone does not
-    necessarily register the rec_constrained_topk binding.
-    """
-    if hasattr(torch.ops, "xllm_ops"):
-        return
-    try:
-        torch.utils.cpp_extension.load(
-            name="xllm_ops",
-            sources=[],
-            extra_ldflags=["-lxllm_ops"],
-        )
-    except Exception:
-        # The extension may already be loaded by the runtime or by an
-        # LD_PRELOAD/setup script.  The availability probe below is the
-        # authoritative check.
-        pass
-
-
-def _custom_ops() -> ModuleType | None:
-    """Load the xLLM Python binding used by the ACS integration lazily.
-
-    ``custom_xllm_math`` is the CANN OPP vendor name, not the Python module
-    name.  Its environment script makes ``libcust_opapi.so`` discoverable;
-    the callable Python API is exported by ``custom_ops_lib``.
-    """
-    _load_xllm_ops()
-    try:
-        import custom_ops_lib as custom_ops  # type: ignore[import-not-found]
-    except (ImportError, ModuleNotFoundError):
-        return None
-    return custom_ops
+from vllm_gr.ops.npu._xllm_loader import custom_ops as _custom_ops
 
 
 def is_available() -> bool:

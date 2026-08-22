@@ -602,6 +602,71 @@ def _get_gr_config(runner) -> Any:
     return cfg
 
 
+def _beam_full_graph_ready(runner, num_tokens: int) -> bool:
+    """True iff a FULL-mode graph for this beam width is captured.
+
+    The beam graph is captured once at engine startup (dummy data, output
+    never consumed).  ``capture_beam_decode_graph`` records the captured
+    width in ``runner._beam_graph_keys``; this function checks that set
+    directly — O(1), no traversal of wrapper instances, and no risk of
+    matching a native (beam-kernel-free) graph whose descriptor happens to
+    collide.  Device-neutral: shared by the GPU and NPU patches.
+    """
+    beam_keys = getattr(runner, "_beam_graph_keys", None)
+    return beam_keys is not None and num_tokens in beam_keys
+
+
+def _beam_graph_enabled_for_run(runner) -> bool:
+    """Beam graphs are only used when the config enables them (GRConfig)."""
+    return _get_gr_config(runner).beam_graph_enabled
+
+
+def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
+    """Create a BeamAttentionContext with sizing derived from model + GRConfig.
+
+    Shared by the dummy-capture paths (GPU/NPU ``capture_beam_decode_graph``)
+    and the runtime lazy-creation path (``_get_or_create_beam_session``) so
+    that the pool dimensions, dtype, and device are always derived from the
+    same sources.  A single source of truth prevents silent size mismatches
+    that would invalidate captured graphs if the runtime path rebuilt the
+    context with different parameters.
+
+    Args:
+        runner: The ModelRunner (must have ``model_config``,
+            ``parallel_config``, ``device``).
+        gr_cfg: The GRConfig (provides ``beam_max_width``,
+            ``beam_max_decode_steps``).  ``beam_max_width`` must not be
+            None — callers must guard before reaching this function.
+        max_batch: Maximum concurrent beam search sessions.
+
+    Returns:
+        A new ``BeamAttentionContext``.
+
+    Raises:
+        TypeError: If ``gr_cfg.beam_max_width`` is None.
+    """
+    if gr_cfg.beam_max_width is None:
+        raise TypeError(
+            "beam_max_width must be set before creating a BeamAttentionContext "
+            "(beam KV pool is disabled when beam_max_width is None)"
+        )
+    from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
+
+    model_config = runner.model_config
+    parallel_config = runner.parallel_config
+
+    return BeamAttentionContext(
+        max_batch=max_batch,
+        max_beams=int(gr_cfg.beam_max_width),
+        num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+        max_decode_steps=int(gr_cfg.beam_max_decode_steps),
+        head_dim=model_config.get_head_size(),
+        num_layers=model_config.get_num_layers(parallel_config),
+        device=runner.device,
+        dtype=model_config.dtype,
+    )
+
+
 def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) -> Any | None:
     """Get or create per-request BeamSearchSession for incremental decode.
 
@@ -625,6 +690,12 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     - Fallback: if allocate fails and the registry is full, stale sessions
       (whose req_ids are no longer in beam_data) are released as a safety
       net for unexpected abort/error paths.
+
+    Concurrency: the shared context is created with ``max_batch=1`` — a
+    single active beam session by design (pool slots, suffix buffers and the
+    captured FULL graphs all bake one session).  Batches carrying more than
+    one incremental beam-decode request are rejected with an explicit
+    RuntimeError below.
     """
     runner._beam_sessions = getattr(runner, "_beam_sessions", {})
 
@@ -636,12 +707,30 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
             session.end_session()
 
     # 2. Check if we have any beam decode requests with decode_step
-    has_incremental = any(
-        mdata.get("is_beam_decode", False) and "decode_step" in mdata
-        for mdata in beam_data.values()
-    )
-    if not has_incremental:
+    incremental_ids = [
+        req_id
+        for req_id, mdata in beam_data.items()
+        if mdata.get("is_beam_decode", False) and "decode_step" in mdata
+    ]
+    if not incremental_ids:
         return None
+
+    # The shared beam context serves a SINGLE active session: the pools, the
+    # suffix buffers, the xllm block-table buffer and the captured FULL
+    # graphs are all sized/created with max_batch=1 (see step 3 below and the
+    # capture paths).  A second concurrent beam-decode request would exhaust
+    # the slot registry mid-batch, and the stale-session retry inside the
+    # allocate path below cannot free a slot because BOTH ids are active —
+    # the batch would die with the generic "No free beam session slots"
+    # error.  Reject the unsupported concurrency explicitly instead.
+    if len(incremental_ids) > 1:
+        raise RuntimeError(
+            "vllm-gr concurrent incremental beam decode requests are not "
+            "supported: the beam KV pool holds a single active session "
+            f"(max_batch=1), but this batch carries {len(incremental_ids)} "
+            f"({incremental_ids}). Serialize beam search requests or wait "
+            "for the active one to finish."
+        )
 
     gr_cfg = _get_gr_config(runner)
 
@@ -661,46 +750,10 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
     # 3. Ensure worker-level context exists (lazy creation).
     #    Uses the shared _create_beam_context so pool sizing (max_beams,
     #    max_decode_steps, dtype, device) is derived from the same sources
-    #    as the dummy-capture path — a single source of truth prevents
-    #    silent size mismatches that would invalidate captured CUDA graphs.
+    #    as the dummy-capture paths — a single source of truth prevents
+    #    silent size mismatches that would invalidate captured graphs.
     if not hasattr(runner, "_beam_context"):
-        try:
-            from vllm_gr.v1.worker.gpu_model_runner_patch import _create_beam_context
-
-            runner._beam_context = _create_beam_context(runner, gr_cfg, max_batch=1)
-        except ImportError:
-            # GPU patch module not available (e.g. NPU-only deployment).
-            # Fall back to inline construction with the same parameter sources.
-            from vllm_gr.v1.beam.beam_attention_context import BeamAttentionContext
-
-            model_config = getattr(runner, "model_config", None)
-            if model_config is None:
-                vllm_config = getattr(runner, "vllm_config", None)
-                if vllm_config is not None:
-                    model_config = vllm_config.model_config
-            if model_config is None:
-                logger.warning("Cannot create BeamAttentionContext: model_config not available")
-                return None
-
-            parallel_config = getattr(runner, "parallel_config", None)
-            if parallel_config is None:
-                vllm_config = getattr(runner, "vllm_config", None)
-                if vllm_config is not None:
-                    parallel_config = vllm_config.parallel_config
-            if parallel_config is None:
-                logger.warning("Cannot create BeamAttentionContext: parallel_config not available")
-                return None
-
-            runner._beam_context = BeamAttentionContext(
-                max_batch=1,
-                max_beams=int(gr_cfg.beam_max_width),
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                max_decode_steps=int(gr_cfg.beam_max_decode_steps),
-                head_dim=model_config.get_head_size(),
-                num_layers=model_config.get_num_layers(parallel_config),
-                device=runner.device if hasattr(runner, "device") else torch.device("cuda"),
-                dtype=model_config.dtype,
-            )
+        runner._beam_context = _create_beam_context(runner, gr_cfg, max_batch=1)
 
     # 4. Per-request session management
     active_session = None
@@ -832,6 +885,17 @@ def make_patched_execute_model(_orig_execute_model):
             # build() each step).
             if hasattr(context, "decode_step_buf"):
                 context.decode_step_buf.fill_(decode_step)
+
+            # decode_step_1based_buf / xllm_block_table_buf: device inputs for
+            # the xllm fused kernels (NPU).  Same refresh-outside-the-graph
+            # contract — a captured ACL graph reads fresh values at replay.
+            if hasattr(context, "decode_step_1based_buf"):
+                context.decode_step_1based_buf.fill_(decode_step + 1)
+            if hasattr(context, "xllm_block_table_buf"):
+                # max_batch-sized; request 0 maps to the active session's pool
+                # slot (the registry is max_batch=1, so one active session).
+                context.xllm_block_table_buf.fill_(0)
+                context.xllm_block_table_buf[0] = beam_session.slot
 
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info

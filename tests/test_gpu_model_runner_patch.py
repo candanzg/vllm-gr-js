@@ -311,6 +311,40 @@ def test_patched_determine_pure_beam_batch_grants_full() -> None:
         mod._beam_graph_enabled_for_run = original_fn
 
 
+def test_patched_determine_active_lora_downgrades_full() -> None:
+    """Active-LoRA beam batches must run eager: the beam graph is captured
+    only for the no-LoRA descriptor, and the FULL rewrite would drop
+    has_lora/num_active_loras (silently routing to the LoRA-free graph)."""
+    from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
+
+    session = SimpleNamespace(is_active=True)
+    beam_info: dict[str, Any] = {
+        "beam_data": {"beam-1": {"is_beam_decode": True, "decode_step": 0}},
+        "req_ids": ["beam-1"],
+        "beam_session": session,
+    }
+    native = (CUDAGraphMode.FULL, BatchDescriptor(num_tokens=4, uniform=True, has_lora=True))
+    runner = SimpleNamespace(
+        _current_beam_info=beam_info,
+        _beam_graph_keys={4},
+    )
+
+    import vllm_gr.v1.worker.gpu_model_runner_patch as mod
+
+    original_fn = mod._beam_graph_enabled_for_run
+
+    def _stub_enabled(r: Any) -> bool:
+        return True
+
+    mod._beam_graph_enabled_for_run = _stub_enabled
+    try:
+        wrapped = _make_determine_wrapper(beam_info, native)
+        result = wrapped(runner, num_tokens=4)
+        assert result[0] == CUDAGraphMode.NONE
+    finally:
+        mod._beam_graph_enabled_for_run = original_fn
+
+
 def test_patched_determine_graph_disabled_no_full() -> None:
     """If beam_graph_enabled is False, FULL is not granted even for pure batch."""
     from vllm.v1.cudagraph_dispatcher import BatchDescriptor, CUDAGraphMode
@@ -452,6 +486,68 @@ def test_capture_beam_decode_graph_ubatching_returns_false() -> None:
         assert result is False
     finally:
         common._get_gr_config = original_fn
+
+
+def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warmup + capture forwards must run inside torch.inference_mode().
+
+    The CUDA graph pool holds inference tensors created by the native
+    ``_dummy_run`` (decorated with ``@torch.inference_mode()``).  Running the
+    capture forward outside inference mode makes ``capture_begin``'s in-place
+    pool updates raise "Inplace update to inference tensor outside
+    InferenceMode is not allowed".
+    """
+    import contextlib
+
+    import vllm.compilation.monitor as monitor
+
+    import vllm_gr.v1.worker.model_runner_common as common
+
+    monkeypatch.setattr(
+        common,
+        "_get_gr_config",
+        lambda r: SimpleNamespace(
+            beam_graph_active=True, beam_max_width=4, beam_max_decode_steps=3
+        ),
+    )
+    monkeypatch.setattr(monitor, "set_cudagraph_capturing_enabled", lambda *_: None)
+
+    side_stream = SimpleNamespace(wait_stream=lambda *_: None)
+    fake_cuda = SimpleNamespace(
+        Stream=lambda: side_stream, stream=lambda _s: contextlib.nullcontext()
+    )
+    fake_accelerator = SimpleNamespace(
+        current_stream=lambda: SimpleNamespace(wait_stream=lambda *_: None),
+        synchronize=lambda: None,
+    )
+    monkeypatch.setattr(torch, "cuda", fake_cuda, raising=False)
+    monkeypatch.setattr(torch, "accelerator", fake_accelerator, raising=False)
+
+    session = SimpleNamespace(end_session=lambda: None)
+    monkeypatch.setattr(
+        gpu_patch,
+        "_capture_create_dummy_context",
+        lambda *args, **kwargs: (object(), session, object(), object()),
+    )
+
+    inference_flags: list[bool] = []
+
+    def fake_forward(*args: Any, **kwargs: Any) -> None:
+        inference_flags.append(torch.is_inference_mode_enabled())
+
+    monkeypatch.setattr(gpu_patch, "_dummy_beam_forward", fake_forward)
+    monkeypatch.setattr(gpu_patch, "_verify_and_record_captured_graph", lambda r, width: True)
+
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, use_ubatching=False),
+        _beam_sessions={},
+        _current_beam_info=None,
+    )
+    assert gpu_patch.capture_beam_decode_graph(runner) is True
+    assert len(inference_flags) == 3  # num_warmups (2) + capture forward
+    assert all(inference_flags), f"capture forwards ran outside inference_mode: {inference_flags}"
 
 
 # ---------------------------------------------------------------------------

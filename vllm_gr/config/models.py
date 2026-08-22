@@ -22,6 +22,13 @@ class ConstraintBackend(str, Enum):
 _BEAM_MAX_DECODE_STEPS_DEFAULT: int = 3  # OneRec SID: max_tokens=5 minus begin/end
 
 
+class NPUDecodeExecution(str, Enum):
+    """Execution mode for the NPU incremental beam decode branch."""
+
+    CASCADE = "cascade"
+    XLLM = "xllm"
+
+
 @dataclass(frozen=True)
 class GRConfig:
     """Validated vLLM-GR configuration reconstructed in each process."""
@@ -42,6 +49,9 @@ class GRConfig:
     beam_graph_enabled: bool = True
     beam_max_width: int | None = None
     beam_max_decode_steps: int = _BEAM_MAX_DECODE_STEPS_DEFAULT
+    # None = unset: the runtime picks per-platform defaults (xllm on NPU when
+    # the operator library is present, cascade otherwise and on CUDA).
+    npu_decode_execution: NPUDecodeExecution | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -51,6 +61,7 @@ class GRConfig:
             validate_beam_max_width,
             validate_catalog_path,
             validate_constraint_backend,
+            validate_npu_decode_execution,
             validate_vocab_offset,
             validate_vocab_slice_size,
         )
@@ -81,6 +92,11 @@ class GRConfig:
             "beam_max_decode_steps",
             validate_beam_max_decode_steps(self.beam_max_decode_steps),
         )
+        object.__setattr__(
+            self,
+            "npu_decode_execution",
+            validate_npu_decode_execution(self.npu_decode_execution),
+        )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -100,6 +116,7 @@ class GRConfig:
             or self.attention_backend is not None
             or self.vocab_offset is not None
             or self.vocab_slice_size is not None
+            or self.npu_decode_execution is not None
         )
 
     @classmethod

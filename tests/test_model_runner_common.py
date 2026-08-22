@@ -299,3 +299,51 @@ def test_beam_session_raises_when_beam_max_width_unconfigured() -> None:
             beam_data,
             SimpleNamespace(beam_finished_session_ids=[]),
         )
+
+
+def test_beam_session_rejects_concurrent_incremental_requests() -> None:
+    """Two concurrent incremental beam-decode requests must be rejected loudly.
+
+    The shared beam context is created with max_batch=1 (pool slots, suffix
+    buffers and captured FULL graphs all bake a single session).  Without
+    this guard the second request's registry allocate would fail mid-batch
+    with the generic "No free beam session slots" error — and the stale-
+    session retry cannot help because BOTH ids are active.  An explicit
+    concurrency error is the only safe outcome.
+    """
+    runner = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(beam_max_width=128, beam_max_decode_steps=3),
+        model_config=SimpleNamespace(
+            dtype=torch.float16,
+            get_num_kv_heads=lambda config: 2,
+            get_head_size=lambda: 8,
+            get_num_layers=lambda config: 1,
+        ),
+        parallel_config=object(),
+        device=torch.device("cpu"),
+    )
+    beam_data = {
+        "beam-a": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_decode_steps": 1,
+            "beam_width": 2,
+            "prefix_len": 4,
+            "max_decode_steps": 3,
+        },
+        "beam-b": {
+            "is_beam_decode": True,
+            "decode_step": 0,
+            "beam_decode_steps": 1,
+            "beam_width": 2,
+            "prefix_len": 4,
+            "max_decode_steps": 3,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="concurrent incremental beam decode"):
+        common._get_or_create_beam_session(
+            runner,
+            beam_data,
+            SimpleNamespace(beam_finished_session_ids=[]),
+        )

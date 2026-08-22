@@ -84,10 +84,21 @@ class BeamAttentionContext:
             device=device,
         )
 
-        # --- CUDA Graph fixed-address device buffers ---
+        # --- CUDA/ACL Graph fixed-address device buffers ---
         # decode_step_buf: device-side scalar, read by Triton cache_unshared_kv kernel
         # and filled each step before model forward / graph replay.
         self.decode_step_buf = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # decode_step_1based_buf: device-side 1-based step count consumed by the
+        # xllm cache_unshared_kv / x_attention kernels (their ABI takes an int32
+        # [1] device tensor).  Refreshed each step outside the graph so a
+        # captured ACL graph reads the fresh value at replay.
+        self.decode_step_1based_buf = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # xllm_block_table_buf: pool-slot block table for the xllm
+        # cache_unshared_kv kernel (replaces the per-call torch.tensor([slot])
+        # allocation; request i maps to pool slot xllm_block_table_buf[i]).
+        self.xllm_block_table_buf = torch.zeros(max_batch, dtype=torch.int32, device=device)
 
         # aux_key_buf / aux_value_buf: pre-allocated buffers for select_unshared_kv
         # (replace per-step .clone() allocation). Shape matches one pool slot.
