@@ -21,6 +21,7 @@ _WORKER_BOOKKEEPING_PATCH_MARKER = "_vllm_gr_beam_bookkeeping_patch"
 # Optional: only installed when the runner exposes ``_sample`` (NPU builds may
 # not).  is_worker_runner_patched() deliberately does not require it.
 _WORKER_SAMPLE_PATCH_MARKER = "_vllm_gr_beam_sample_patch"
+_WORKER_SAMPLE_TOKENS_PATCH_MARKER = "_vllm_gr_beam_sample_tokens_patch"
 _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 
@@ -50,31 +51,42 @@ def _write_position_segments(
     gpu_pos: torch.Tensor | None,
     cpu_pos: torch.Tensor | None,
 ) -> None:
-    """Write concatenated per-beam position-id segments in one vectorized pass.
+    """Write concatenated per-beam position-id segments in one pass.
 
-    Each active beam contributes ``range(st_b, st_b + len_b)``. The previous
-    implementation emitted one ``torch.arange`` per beam (up to ``beam_width``
-    GPU kernel launches per call); here we build the whole concatenation on CPU
-    with a handful of vectorized ops and a single host->device copy for
-    ``gpu_pos``. The result is element-wise identical to the per-beam writes.
+    Each active beam contributes ``range(st_b, st_b + len_b)``.  The result is
+    element-wise identical to the historical per-beam ``torch.arange`` writes,
+    but the concatenation is built with numpy on the host (microseconds) and
+    committed with a single host->device copy for ``gpu_pos``.
+
+    NOTE: the previous implementation used ``torch.repeat_interleave`` to
+    expand per-segment offsets; on Ascend that aten op is a pure host-side
+    stall (profiling bw128_1k_t3: 45.5ms + 90.6ms per decode step with zero
+    device activity), because the ACL backend materializes the repeat on
+    device.  ACS builds positions with plain numpy writes
+    (model_runner_v1.py ``positions_np[start:end] = ...``); we match that.
     """
     if not seg_lens:
         return
-    lens = torch.tensor(seg_lens, dtype=torch.int64)
-    total = int(lens.sum().item())
+    import numpy as np
+
+    lens = np.asarray(seg_lens, dtype=np.int64)
+    total = int(lens.sum())
     if total == 0:
         return
-    starts = torch.tensor(seg_starts, dtype=torch.int64)
+    starts = np.asarray(seg_starts, dtype=np.int64)
     # Output offset where each segment begins (prefix sum minus own length).
-    seg_off = torch.cumsum(lens, dim=0) - lens
-    gidx = torch.arange(total, dtype=torch.int64)
-    seg_off_rep = torch.repeat_interleave(seg_off, lens)
-    starts_rep = torch.repeat_interleave(starts, lens)
-    positions = starts_rep + (gidx - seg_off_rep)
+    seg_off = np.cumsum(lens) - lens
+    gidx = np.arange(total, dtype=np.int64)
+    # positions[start:end] = st + arange(len) for each segment, vectorized:
+    # repeat the per-segment start/offset by the segment length and add the
+    # within-segment index (gidx - seg_off_rep).
+    starts_rep = np.repeat(starts, lens)
+    seg_off_rep = np.repeat(seg_off, lens)
+    positions = torch.from_numpy(starts_rep + (gidx - seg_off_rep))
     if gpu_pos is not None:
-        gpu_pos[token_offset : token_offset + total] = positions
+        gpu_pos[token_offset : token_offset + total] = positions.to(gpu_pos.device)
     if cpu_pos is not None:
-        cpu_pos[token_offset : token_offset + total] = positions
+        cpu_pos[token_offset : token_offset + total] = positions.to(cpu_pos.device)
 
 
 def _process_beam_decode_request(
@@ -99,18 +111,19 @@ def _process_beam_decode_request(
     # --- Incremental decode path ---
     if is_incremental:
         decode_step = mdata.get("decode_step", 0)
-        seg_starts: list[int] = []
-        seg_lens: list[int] = []
-
         for b in range(beam_width):
             # Each beam: 1 token, position = prefix_len + decode_step
-            seg_starts.append(prefix_len + decode_step)
-            seg_lens.append(1)
             new_logits_indices.append(token_offset + b)
             active_beam_ids.append(b)
 
-        # Batched position-id write
-        _write_position_segments(token_offset, seg_starts, seg_lens, gpu_pos, cpu_pos)
+        # All beams share one constant position id this step, so a scalar
+        # slice-fill is enough: a single device-side fill kernel, no host
+        # build, no H2D copy (matches the recompute path's no-stall goal).
+        pos_id = prefix_len + decode_step
+        if gpu_pos is not None:
+            gpu_pos[token_offset : token_offset + beam_width] = pos_id
+        if cpu_pos is not None:
+            cpu_pos[token_offset : token_offset + beam_width] = pos_id
 
         return beam_width, beam_width, token_offset + beam_width, active_beam_ids
 
@@ -298,12 +311,47 @@ class Mock2DArray:
             raise e
 
 
+# Per-request sampling tensors remapped onto per-beam logits rows by
+# InputBatchProxy. Shared across the remap pass so one cached device index
+# tensor serves every attribute (instead of one host->device list transfer
+# per attribute, the `aten::index` + `aten::to/copy_` pairs in profiling
+# bw128_1k_t3).
+_SAMPLING_META_ATTRS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "frequency_penalties",
+    "presence_penalties",
+    "repetition_penalties",
+)
+
+
 class InputBatchProxy:
     def __init__(self, obj, req_map, idx_map, logits_map):
         object.__setattr__(self, "_obj", obj)
         object.__setattr__(self, "_req_id_map", req_map)
         object.__setattr__(self, "_batch_idx_map", idx_map)
         object.__setattr__(self, "_logit_idx_map", logits_map)
+        # Remapped sampling metadata, cached for this proxy's lifetime.
+        # Holds the underlying ``sampling_metadata`` object after its
+        # per-request tensors were remapped onto logits rows; validated by
+        # identity so a mid-step rebuild (refresh_metadata) is picked up.
+        object.__setattr__(self, "_sampling_metadata_cache", None)
+        # (device, tensor) cache for the shared logits-row index tensor.
+        object.__setattr__(self, "_logits_idx_tensor_cache", None)
+
+    def _logits_idx_tensor(self, device):
+        cache = object.__getattribute__(self, "_logits_idx_tensor_cache")
+        if cache is not None and cache[0] == device:
+            return cache[1]
+        idx = torch.tensor(
+            object.__getattribute__(self, "_logit_idx_map"),
+            dtype=torch.long,
+            device=device,
+        )
+        object.__setattr__(self, "_logits_idx_tensor_cache", (device, idx))
+        return idx
 
     def __getattr__(self, name):
         obj = object.__getattribute__(self, "_obj")
@@ -316,20 +364,23 @@ class InputBatchProxy:
             if s_meta is None or logits_map is None:
                 return s_meta
 
+            cached = object.__getattribute__(self, "_sampling_metadata_cache")
+            if cached is not None and cached is s_meta:
+                # Fast path: this exact metadata object was already remapped.
+                # Repeated accesses within the step (sampler, constraint
+                # hook, bookkeeping) skip the per-attribute loop entirely.
+                return cached
+
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
-            for attr in [
-                "temperature",
-                "top_p",
-                "top_k",
-                "min_p",
-                "frequency_penalties",
-                "presence_penalties",
-                "repetition_penalties",
-            ]:
+            idx_tensor = None
+            for attr in _SAMPLING_META_ATTRS:
                 val = getattr(s_meta, attr, None)
                 if isinstance(val, torch.Tensor) and val.numel() > 0:
                     if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        object.__setattr__(s_meta, attr, val[logits_map])
+                        if idx_tensor is None:
+                            idx_tensor = self._logits_idx_tensor(val.device)
+                        object.__setattr__(s_meta, attr, val[idx_tensor])
+            object.__setattr__(self, "_sampling_metadata_cache", s_meta)
             return s_meta
 
         elif name == "req_ids":
@@ -352,6 +403,10 @@ class InputBatchProxy:
         return getattr(obj, name)
 
     def __setattr__(self, name, value):
+        if name == "sampling_metadata":
+            # The underlying metadata object is being replaced; drop the
+            # remapped cache so the next read reindexes fresh tensors.
+            object.__setattr__(self, "_sampling_metadata_cache", None)
         setattr(object.__getattribute__(self, "_obj"), name, value)
 
 
@@ -440,6 +495,16 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
         runner.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx
     )
     scheduler_output._gr_request_row_configs = request_row_configs
+
+    # Warm the remapped sampling metadata now, in the prepare phase, instead
+    # of lazily at the first ``_sample`` access: the per-request tensor remap
+    # is host-side work that would otherwise land right after the model
+    # forward, where the device sits idle waiting for the sampler (the
+    # post-forward host stall in profiling bw128_1k_t3).  refresh_metadata
+    # has already run (it is the tail of _update_states, executed at the top
+    # of execute_model), so this is the step's final metadata object.  Harmless
+    # no-op when the metadata is not built yet (returns None, caches nothing).
+    _ = runner.input_batch.sampling_metadata
 
     return new_logits_indices
 
@@ -583,6 +648,45 @@ def _beam_collapse_bookkeeping(
                 raise RuntimeError("Inplace copy failed during beam collapse") from e
 
     return collapsed_req_ids_copy, collapsed_req_id_to_index, num_logical_requests
+
+
+def _attach_beam_search_result(runner: Any, model_output: Any) -> None:
+    """Attach the worker beam decision onto a ModelRunnerOutput, if present.
+
+    ``ModelRunnerOutput`` is a mutable dataclass (no ``__slots__``), so the
+    decision dict is attached as a dynamic ``beam_search_result`` attribute.
+    Under async scheduling the runner returns an ``AsyncModelRunnerOutput``
+    wrapper; the scheduler eventually sees ``get_output()`` which returns the
+    inner ``ModelRunnerOutput``, so the attribute must land on that inner
+    object.  This matches the ACS ``ModelRunnerOutput.beam_search_result``
+    save-flow used by the scheduler ``kv_transfer_params`` attachment.
+
+    Async ``execute_model`` returns ``None`` / an ``ExecuteModelState`` (the
+    sampling + decision happen later in ``sample_tokens``), which are skipped
+    here; the ``sample_tokens`` hook attaches the decision to the final output.
+    """
+    decision = getattr(runner, "_beam_decision_result", None)
+    if decision is None:
+        return
+    from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+    if not isinstance(model_output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
+        # Async execute_model: sampling (and the decision) has not run yet; the
+        # sample_tokens hook attaches the decision to the real output.
+        return
+
+    target = model_output
+    if isinstance(target, AsyncModelRunnerOutput):
+        target = getattr(target, "model_runner_output", None) or getattr(
+            target, "_model_runner_output", None
+        )
+        if target is None:
+            logger.warning(
+                "vllm-gr: cannot attach beam_search_result to AsyncModelRunnerOutput "
+                "(no inner ModelRunnerOutput); decision dropped"
+            )
+            return
+    target.beam_search_result = decision
 
 
 def _get_gr_config(runner) -> Any:
@@ -811,7 +915,50 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 state = session._state
                 state.is_last_step = is_last_step
 
-                if parent_beam_ids is not None and not is_last_step:
+                # Worker-side same-step reorder record: the worker beam
+                # decision already applied ``select_unshared_kv`` inside the
+                # previous execute_model (ACS decode_select timing) and
+                # advanced decode_step there.  Consume the record —
+                # re-applying the same parent mapping is NOT idempotent
+                # (p . p != p), so an exact match with the frontend's
+                # parent_beam_ids means the KV reorder is already done.
+                recorded = state.kv_reorder
+                if recorded is not None:
+                    state.kv_reorder = None
+                    if (
+                        parent_beam_ids is not None
+                        and not is_last_step
+                        and list(parent_beam_ids) != recorded
+                    ):
+                        # Frontend mapping differs from what the worker
+                        # applied (e.g. EOS re-ordering).  The pool currently
+                        # holds pre-decision row `recorded[i]` at row i; the
+                        # frontend wants pre-decision row parent[j] at row j.
+                        # Composite via the cascade kernel (gather semantics
+                        # tolerate mappings the fused kernel cannot express).
+                        comp = []
+                        for p in parent_beam_ids:
+                            try:
+                                comp.append(recorded.index(p))
+                            except ValueError:
+                                logger.warning(
+                                    "vllm-gr: frontend parent %s not in worker "
+                                    "reorder record %r; keeping identity",
+                                    p,
+                                    recorded,
+                                )
+                                comp.append(p)
+                        from vllm_gr.v1.beam.reorder import reorder_unshared_kv
+
+                        reorder_unshared_kv(
+                            torch.tensor(comp, dtype=torch.int32, device=runner.device),
+                            session.slot,
+                            context.pools,
+                            state.decode_step - 1,  # KV range written through the previous step
+                        )
+                    # Exact match (or no parent / last step): the same-step
+                    # path already reordered and advanced decode_step.
+                elif parent_beam_ids is not None and not is_last_step:
                     parent = torch.tensor(parent_beam_ids, dtype=torch.int32, device=runner.device)
                     session.step_complete(parent)
                 else:
@@ -864,8 +1011,21 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        # Clear the previous step's beam context at the START of the next
+        # execute_model, not in a finally: with async scheduling the sampled
+        # tokens are produced by ``sample_tokens`` AFTER execute_model returns,
+        # and the worker-side beam decision needs ``_current_beam_data`` /
+        # ``_current_beam_info`` (session + decision buffers) still alive there.
+        # A stale previous-step context is overwritten here before the new
+        # step's values are installed.
         self._current_beam_data = getattr(scheduler_output, "beam_data", {})
-        beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
+        self._current_beam_info = {"beam_data": self._current_beam_data, "req_ids": []}
+        beam_info = self._current_beam_info
+
+        # Worker-side beam decision output (NPU xllm path).  Reset each step so
+        # a stale result from a previous run can never leak into this step's
+        # ModelRunnerOutput.beam_search_result.
+        self._beam_decision_result = None
 
         # Manage BeamSearchSession for incremental decode
         beam_session = _get_or_create_beam_session(self, self._current_beam_data, scheduler_output)
@@ -901,16 +1061,21 @@ def make_patched_execute_model(_orig_execute_model):
         self._current_beam_info = beam_info
         # Published for the optional Constraint Tables ``_sample`` hook
         # (constraint_hook): it reads ``_gr_request_row_configs`` to locate the
-        # constrained logits rows.  Lives until bookkeeping, which runs inside
-        # ``_orig_execute_model``; cleaned here in ``finally`` to prevent a
-        # stale scheduler_output leaking into the next step.
+        # constrained logits rows.  Lives until the next execute_model (which
+        # overwrites it at the top); with async scheduling the constraint hook
+        # and worker beam decision run in ``sample_tokens`` AFTER
+        # execute_model returns, so the context must stay alive past the
+        # execute_model frame.
         self._current_scheduler_output = scheduler_output
         try:
-            return _orig_execute_model(self, scheduler_output, *args, **kwargs)
+            out = _orig_execute_model(self, scheduler_output, *args, **kwargs)
+            _attach_beam_search_result(self, out)
+            return out
         finally:
-            self._current_beam_data = {}
-            self._current_beam_info = None
-            self._current_scheduler_output = None
+            # Deliberately keep ``_current_beam_data`` / ``_current_beam_info``
+            # / ``_current_scheduler_output`` alive for the async sampling
+            # phase (sample_tokens runs after execute_model returns).  They are
+            # overwritten at the top of the next execute_model call.
             BEAM_DATA_VAR.reset(token)
 
     setattr(patched_execute_model, _WORKER_EXECUTE_PATCH_MARKER, True)

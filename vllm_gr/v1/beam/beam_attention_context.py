@@ -19,6 +19,52 @@ from vllm_gr.v1.beam.beam_attention_pool import BeamAttentionPool, _validate_poo
 from vllm_gr.v1.beam.beam_session_registry import BeamSessionRegistry
 
 
+class BeamDecisionBuffers:
+    """Device-resident beam-decision state (ACS ``BeamSearchBufferPool`` analog).
+
+    Holds ``sequence`` / ``beam_scores`` / ``group_token_num`` so that the
+    beam decision (``beam_search_group`` / ``beam_search_rec_final_select`` +
+    ``select_unshared_kv``) can run on the NPU worker with stable addresses,
+    matching the ACS ``BeamSearchContext.decode_select`` save-flow.  The
+    buffers are sized to (max_batch, max_beams, max_decode_steps) and are
+    never reallocated after construction — this keeps every address stable
+    for ACL graph capture/replay and for the fused xllm decision operators.
+    """
+
+    def __init__(
+        self,
+        max_batch: int,
+        max_beams: int,
+        max_decode_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        self.max_beams = max_beams
+        self.device = device
+        # Sequence history: [max_batch, max_beams, max_decode_steps]
+        self.sequence = torch.zeros(
+            (max_batch, max_beams, max_decode_steps),
+            dtype=torch.int32,
+            device=device,
+        )
+        # Cumulative log-probs per beam: [max_batch, max_beams]
+        self.beam_scores = torch.zeros((max_batch, max_beams), dtype=torch.float32, device=device)
+        # Per-target-beam source-beam mapping (prefix sums consumed by the
+        # fused select_unshared_kv kernel): [max_batch, max_beams]
+        self.group_token_num = torch.zeros((max_batch, max_beams), dtype=torch.int32, device=device)
+        # Host-side token count for the worker decision (next sequence slot to
+        # write).  Mirrors the session decode_step but lives with the buffers
+        # so the decision module owns it entirely and reset() clears it.
+        self.worker_decode_steps = 0
+
+    def reset(self) -> None:
+        """Zero every decision buffer (device-side, in place)."""
+        self.sequence.zero_()
+        self.beam_scores.zero_()
+        self.group_token_num.zero_()
+        self.worker_decode_steps = 0
+
+
 class BeamAttentionContext:
     """Worker-level shared resource container for incremental decode.
 
@@ -117,6 +163,9 @@ class BeamAttentionContext:
             dtype=dtype,
             device=device,
         )
+
+        # Device-resident beam-decision state (ACS BeamSearchBufferPool analog).
+        self.decision = BeamDecisionBuffers(max_batch, max_beams, max_decode_steps, device, dtype)
 
     def get_suffix_buf(self, slot: int, beam_width: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get suffix KV buffer slice for a specific slot.

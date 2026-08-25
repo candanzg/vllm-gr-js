@@ -43,6 +43,7 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
 
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
+    logger.info("vllm-gr: apply_worker_patches called")
     platform_module = _get_active_platform_module()
     runners_to_patch = [
         (runner_name, runner_class)
@@ -63,6 +64,14 @@ def apply_worker_patches() -> None:
         # without the hook fails at injection (worker_inject), never here.
         if hasattr(runner_class, "_sample"):
             runner_class._sample = platform_module.make_patched_sample(runner_class._sample)
+
+        # Async scheduling: sampling (and the worker-side beam decision that
+        # runs inside the patched ``_sample``) happens in ``sample_tokens``
+        # after ``execute_model`` returns.  Attach the decision to the output
+        # there.  NPU-only hook (the platform module provides it).
+        sample_tokens_patch = getattr(platform_module, "make_patched_sample_tokens", None)
+        if sample_tokens_patch is not None and hasattr(runner_class, "sample_tokens"):
+            runner_class.sample_tokens = sample_tokens_patch(runner_class.sample_tokens)
 
         # After native capture_model() finishes, run the startup dummy capture
         # of the beam-decode FULL graph (only when GRConfig enables it —

@@ -31,6 +31,11 @@ class ConstraintTableBackendEnum(str, Enum):
 # by validation.py (as fallbacks).  Keep all three sites in sync.
 _BEAM_MAX_DECODE_STEPS_DEFAULT: int = 3  # OneRec SID: max_tokens=5 minus begin/end
 
+# Sentinel catalog_path for the NPU default Constraint Table backend: the
+# tables are auto-built from the tokenizer's s_a/s_b/s_c token groups instead
+# of a catalog triples document (ACS-aligned OneRec default).
+AUTO_CONSTRAINT_TABLE_PATH: str = "__vllm_gr_auto_constraint_table__"
+
 
 @dataclass(frozen=True, slots=True)
 class ConstraintTableConfig:
@@ -124,6 +129,13 @@ class GRConfig:
     # positional construction of the pre-schema dataclass remains compatible.
     schema_version: int = GR_CONFIG_SCHEMA_VERSION
     constraint_table: ConstraintTableConfig | None = None
+    # None = unset (safest: keep the frontend NumPy decision path).  True moves
+    # the beam decision (beam_search_group / beam_search_rec_final_select +
+    # select_unshared_kv) into the NPU worker and returns the result via
+    # ModelRunnerOutput.beam_search_result, aligning with the ACS save flow.
+    # Only takes effect on NPU + xllm decode execution; False explicitly keeps
+    # the frontend NumPy path.
+    beam_worker_decision: bool | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -131,6 +143,7 @@ class GRConfig:
             validate_beam_graph_enabled,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
+            validate_beam_worker_decision,
             validate_catalog_path,
             validate_constraint_backend,
             validate_npu_decode_execution,
@@ -175,6 +188,11 @@ class GRConfig:
             self.constraint_table, ConstraintTableConfig
         ):
             raise ValueError("vllm-gr constraint_table must be a ConstraintTableConfig or None")
+        object.__setattr__(
+            self,
+            "beam_worker_decision",
+            validate_beam_worker_decision(self.beam_worker_decision),
+        )
         if (
             self.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
             and self.catalog_path is None
@@ -196,6 +214,7 @@ class GRConfig:
             or self.vocab_slice_size is not None
             or self.npu_decode_execution is not None
             or (self.constraint_table is not None and self.constraint_table.enabled)
+            or self.beam_worker_decision is not None
         )
 
     @classmethod

@@ -141,6 +141,8 @@ def test_npu_sample_patch_is_signature_agnostic(
         events.append("override")
 
     monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", override)
+    # Short-circuit gate off: no beam decision active → legacy path.
+    monkeypatch.setattr("vllm_gr.v1.beam.beam_decision.worker_decision_enabled", lambda r: False)
     wrapped = npu_patch.make_patched_sample_npu(original)
     assert getattr(wrapped, _WORKER_SAMPLE_PATCH_MARKER, False)
     assert npu_patch.make_patched_sample_npu(wrapped) is wrapped
@@ -148,6 +150,257 @@ def test_npu_sample_patch_is_signature_agnostic(
     runner = SimpleNamespace()
     assert wrapped(runner, "logits", "extra") is sample_output
     assert events == ["sample", "override"]
+
+
+# ---------------------------------------------------------------------------
+# patched_sample — constrained sampler short-circuit (P1-1)
+# ---------------------------------------------------------------------------
+
+
+def _shortcut_stub(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool,
+    rows: list[Any] | None,
+) -> None:
+    """Stub the short-circuit gates with controllable results.
+
+    ``rows`` non-empty simulates a homogeneous constrained step; the built
+    sampler output mirrors ``build_constrained_sampler_output``'s contract
+    ([rows, W] tensors, top-1 candidate in column 0).
+    """
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    from vllm_gr.v1.beam import beam_decision
+    from vllm_gr.v1.worker import constraint_hook
+
+    monkeypatch.setattr(beam_decision, "worker_decision_enabled", lambda r: enabled)
+
+    def fake_build(runner: Any, logits: Any, collected_rows: list[Any]) -> Any:
+        width = 4
+        top_tokens = torch.arange(2 * width, dtype=torch.int32).reshape(2, width)
+        top_logprobs = -torch.rand(2, width, dtype=torch.float32)
+        return SamplerOutput(
+            sampled_token_ids=top_tokens[:, :1].clone(),
+            logprobs_tensors=LogprobsTensors(
+                top_tokens, top_logprobs, torch.ones(2, dtype=torch.int32)
+            ),
+        )
+
+    if rows is None:
+        monkeypatch.setattr(constraint_hook, "collect_constrained_override_rows", lambda r: [])
+        monkeypatch.setattr(constraint_hook, "build_constrained_sampler_output", fake_build)
+    else:
+        monkeypatch.setattr(constraint_hook, "collect_constrained_override_rows", lambda r: rows)
+        monkeypatch.setattr(constraint_hook, "build_constrained_sampler_output", fake_build)
+
+
+def test_npu_sample_shortcircuits_original_sampler_when_constrained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker decision + constrained rows → _orig_sample never runs."""
+    _shortcut_stub(monkeypatch, enabled=True, rows=[("s", 0, 4, {"beam_width": 4})])
+
+    calls: list[str] = []
+
+    def original(self: Any, logits: Any, spec: Any = None) -> Any:
+        calls.append("orig_sample")
+        raise AssertionError("original sampler must not run on the shortcut path")
+
+    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+        calls.append("override")
+        raise AssertionError("override must not run on the shortcut path")
+
+    monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", override)
+    monkeypatch.setattr(
+        npu_patch, "_maybe_run_worker_beam_decision", lambda r, s: calls.append("decision")
+    )
+
+    wrapped = npu_patch.make_patched_sample_npu(original)
+    logits = torch.zeros(2, 16)
+    out = wrapped(SimpleNamespace(), logits)
+
+    assert calls == ["decision"]  # only the beam decision ran
+    assert out.sampled_token_ids.dtype is torch.int32
+    assert out.sampled_token_ids.shape == (2, 1)
+    assert out.logprobs_tensors.logprob_token_ids.shape == (2, 4)
+    assert out.logprobs_tensors.logprobs.dtype is torch.float32
+    # Top-1 candidate sits in column 0 of both the sampled ids and the
+    # candidate row (the _select_candidates `n_cols == W` contract).
+    assert torch.equal(out.sampled_token_ids[:, 0], out.logprobs_tensors.logprob_token_ids[:, 0])
+    assert torch.equal(out.logprobs_tensors.selected_token_ranks, torch.ones(2, dtype=torch.int32))
+
+
+def test_npu_sample_shortcircuit_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every gate miss keeps the untouched legacy path."""
+    logits = torch.zeros(2, 16)
+    sample_output = object()
+    events: list[str] = []
+
+    def original(self: Any, logits: Any, spec: Any = None) -> Any:
+        events.append("orig_sample")
+        return sample_output
+
+    def override(self: Any, logits: Any, sampler_output: Any) -> None:
+        events.append("override")
+
+    monkeypatch.setattr(npu_patch, "apply_constrained_sample_override", override)
+    monkeypatch.setattr(
+        npu_patch, "_maybe_run_worker_beam_decision", lambda r, s: events.append("decision")
+    )
+    wrapped = npu_patch.make_patched_sample_npu(original)
+
+    # Gate 1: worker decision disabled (even with constrained rows present).
+    _shortcut_stub(monkeypatch, enabled=False, rows=[("s", 0, 4, {"beam_width": 4})])
+    assert wrapped(SimpleNamespace(), logits) is sample_output
+    assert events == ["orig_sample", "override", "decision"]
+
+    # Gate 2: decision enabled but no constrained rows.
+    events.clear()
+    _shortcut_stub(monkeypatch, enabled=True, rows=None)
+    assert wrapped(SimpleNamespace(), logits) is sample_output
+    assert events == ["orig_sample", "override", "decision"]
+
+    # Gate 3: spec-decode metadata present.
+    events.clear()
+    _shortcut_stub(monkeypatch, enabled=True, rows=[("s", 0, 4, {"beam_width": 4})])
+    assert wrapped(SimpleNamespace(), logits, object()) is sample_output
+    assert events == ["orig_sample", "override", "decision"]
+
+    # Gate 4: logits is None (no tensor to feed the operator).
+    events.clear()
+    _shortcut_stub(monkeypatch, enabled=True, rows=[("s", 0, 4, {"beam_width": 4})])
+    assert wrapped(SimpleNamespace(), None) is sample_output
+    assert events == ["orig_sample", "override", "decision"]
+
+
+def test_npu_sample_shortcircuit_build_failure_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator failure inside the shortcut falls back to the sampler."""
+    from vllm_gr.v1.beam import beam_decision
+    from vllm_gr.v1.worker import constraint_hook
+
+    monkeypatch.setattr(beam_decision, "worker_decision_enabled", lambda r: True)
+    monkeypatch.setattr(
+        constraint_hook, "collect_constrained_override_rows", lambda r: [("s", 0, 4, {})]
+    )
+
+    def boom(runner: Any, logits: Any, rows: list[Any]) -> Any:
+        raise RuntimeError("operator unavailable")
+
+    monkeypatch.setattr(constraint_hook, "build_constrained_sampler_output", boom)
+
+    sample_output = object()
+    events: list[str] = []
+
+    def original(self: Any, logits: Any, spec: Any = None) -> Any:
+        events.append("orig_sample")
+        return sample_output
+
+    monkeypatch.setattr(
+        npu_patch, "apply_constrained_sample_override", lambda *a: events.append("override")
+    )
+    wrapped = npu_patch.make_patched_sample_npu(original)
+
+    assert wrapped(SimpleNamespace(), torch.zeros(2, 16)) is sample_output
+    assert events == ["orig_sample", "override"]
+
+
+# ---------------------------------------------------------------------------
+# _maybe_run_worker_beam_decision — kv_reorder record derivation
+# ---------------------------------------------------------------------------
+
+
+def _decision_stub(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: dict[str, Any] | None,
+) -> None:
+    """Stub the beam-decision gate + runner with a canned decision dict."""
+    from vllm_gr.v1.beam import beam_decision
+
+    monkeypatch.setattr(beam_decision, "worker_decision_enabled", lambda r: decision is not None)
+    monkeypatch.setattr(
+        beam_decision,
+        "run_beam_decision",
+        lambda runner, session, sampler_output, is_last_step, result_width: decision,
+    )
+
+
+def _decision_runner(is_last_step: bool) -> tuple[Any, Any]:
+    state = SimpleNamespace(is_last_step=is_last_step, kv_reorder=None)
+    session = SimpleNamespace(_state=state)
+    runner = SimpleNamespace(
+        _current_beam_info={
+            "beam_session": session,
+            "beam_data": {"s": {"is_beam_decode": True, "result_width": None}},
+        },
+        _beam_decision_result="unset",
+    )
+    return runner, state
+
+
+def test_npu_worker_decision_derives_kv_reorder_from_host_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """kv_reorder is derived from the return channel's host copy.
+
+    ``_finalize_decision`` no longer materializes the record (its
+    ``local_idx[0].tolist()`` was a per-step device→host sync, ~30ms on NPU).
+    The return channel already copies ``out_token_index`` to host for the
+    frontend; its request-0 row carries global offset 0, so it IS the
+    request-local mapping applied by ``_reorder_kv_same_step``.
+    """
+    beam_width = 4
+    decision = {
+        "out_token_ids": torch.zeros(1, beam_width, dtype=torch.int32),
+        "out_token_index": torch.tensor([[0, 1, 0, 1]], dtype=torch.int32),
+        "out_log_probs": torch.zeros(1, beam_width, dtype=torch.float32),
+    }
+    _decision_stub(monkeypatch, decision)
+    runner, state = _decision_runner(is_last_step=False)
+
+    npu_patch._maybe_run_worker_beam_decision(runner, object())
+
+    result = runner._beam_decision_result
+    assert set(result) == {"out_token_ids", "out_token_index", "out_log_probs"}
+    assert all(t.device.type == "cpu" for t in result.values())
+    assert state.kv_reorder == [0, 1, 0, 1]
+
+
+def test_npu_worker_decision_skips_kv_reorder_on_last_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final step applies no reorder (ACS skips select_unshared_kv)."""
+    beam_width = 4
+    decision = {
+        "out_token_ids": torch.zeros(1, beam_width, dtype=torch.int32),
+        "out_token_index": torch.tensor([[0, 1, 0, 1]], dtype=torch.int32),
+        "out_log_probs": torch.zeros(1, beam_width, dtype=torch.float32),
+        "out_sequence": torch.zeros(1, beam_width, 2, dtype=torch.int32),
+    }
+    _decision_stub(monkeypatch, decision)
+    runner, state = _decision_runner(is_last_step=True)
+
+    npu_patch._maybe_run_worker_beam_decision(runner, object())
+
+    assert "out_sequence" in runner._beam_decision_result
+    assert state.kv_reorder is None
+
+
+def test_npu_worker_decision_disabled_clears_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate closed → no decision, no record."""
+    _decision_stub(monkeypatch, None)
+    runner, state = _decision_runner(is_last_step=False)
+
+    npu_patch._maybe_run_worker_beam_decision(runner, object())
+
+    assert runner._beam_decision_result is None
+    assert state.kv_reorder is None
 
 
 # ---------------------------------------------------------------------------

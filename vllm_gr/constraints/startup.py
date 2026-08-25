@@ -154,9 +154,53 @@ def compile_constraint_table_resource(
     return resource
 
 
+def compile_constraint_table_resource_from_tokenizer(
+    tokenizer: Any,
+    vocab_size: int,
+    max_valid_items: int = 500,
+    valid_item_ids: list[int] | None = None,
+    prefix1_file: str | None = None,
+    prefix2_file: str | None = None,
+) -> ConstraintTableResource:
+    """Build Constraint Tables directly from the tokenizer's s_a/s_b/s_c groups.
+
+    Port of the ACS ``build_constraint_tables_from_tokenizer`` flow: when the
+    tokenizer carries ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` special tokens
+    (OneRec-style), the six CSR tables are constructed without a catalog JSON
+    document, so ``constraint_backend=constraint_table`` can run by default on
+    models that declare the three token groups.
+
+    Returns:
+        A validated :class:`ConstraintTableResource` ready for worker injection.
+
+    Raises:
+        ValueError: when the tokenizer has no s_a/s_b/s_c groups (caller must
+            not silently fall back — see :func:`prepare_constraint_table`).
+    """
+    from vllm_gr.constraints.tokenizer_builder import (
+        build_constraint_tables_from_tokenizer,
+    )
+
+    resource = build_constraint_tables_from_tokenizer(
+        tokenizer,
+        vocab_size=vocab_size,
+        max_valid_items=max_valid_items,
+        valid_item_ids=valid_item_ids,
+        prefix1_file=prefix1_file,
+        prefix2_file=prefix2_file,
+    )
+    if resource is None:
+        raise ValueError(
+            "constraint_backend='constraint_table' without a catalog document "
+            "requires a tokenizer with <s_a_*>/<s_b_*>/<s_c_*> special tokens "
+            "to auto-build the tables"
+        )
+    return resource
+
+
 def prepare_constraint_table(
     *,
-    catalog_path: str,
+    catalog_path: str | None,
     tokenizer: Any,
     vocab_size: int,
     gr_config: GRConfig | None = None,
@@ -167,11 +211,18 @@ def prepare_constraint_table(
     broadcast is deferred to the first ``beam_search`` (see
     :func:`~vllm_gr.entrypoints.openai.serving_models.OpenAIServingModels._ensure_constraint_tables_injected`).
 
+    ``catalog_path`` may be ``None`` — the tables are then built directly from
+    the tokenizer's ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` groups (ACS-aligned
+    default for OneRec-style models).  The sentinel
+    :data:`~vllm_gr.config.models.AUTO_CONSTRAINT_TABLE_PATH` selects the same
+    tokenizer path explicitly (used by the NPU platform default).
+
     The platform adapter is probed *at startup* via
     :func:`create_constraint_execution` — a CUDA host (no adapter) or an NPU
     host whose custom operator is unavailable must fail here, before any
     constrained request runs, never at the first constrained step.
     """
+    from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
     from vllm_gr.platforms.loader import activate_current_backend
 
     activate_current_backend()
@@ -180,13 +231,15 @@ def prepare_constraint_table(
     # Startup-time fail-fast (issue #246 §7): the probe adapter is discarded;
     # the Worker lazily creates its own with the runner device (N3).
     create_constraint_execution()
+    if catalog_path is None or catalog_path == AUTO_CONSTRAINT_TABLE_PATH:
+        return compile_constraint_table_resource_from_tokenizer(tokenizer, vocab_size)
     return compile_constraint_table_resource(catalog_path, tokenizer, vocab_size)
 
 
 def install_constraint_table(
     engine: Any,
     *,
-    catalog_path: str,
+    catalog_path: str | None,
     tokenizer: Any,
     vocab_size: int,
     gr_config: GRConfig | None = None,
@@ -201,7 +254,8 @@ def install_constraint_table(
     Args:
         engine: offline ``LLM``/``LLMEngine`` exposing ``engine_core``.
         catalog_path / tokenizer / vocab_size: see
-            :func:`compile_constraint_table_resource`.
+            :func:`compile_constraint_table_resource`.  ``catalog_path`` may be
+            ``None`` to auto-build from the tokenizer's s_a/s_b/s_c groups.
         gr_config: optional; derived from ``engine.vllm_config`` when omitted.
 
     Returns:

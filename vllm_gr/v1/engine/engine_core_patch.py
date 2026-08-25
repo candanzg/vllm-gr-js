@@ -309,3 +309,65 @@ def apply_scheduler_patch():
     setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)
     Scheduler._patched_for_beam_requests = True
     logger.debug("Scheduler.schedule patched for beam-requests propagation.")
+
+    # Also wrap update_from_output so the worker's beam decision
+    # (ModelRunnerOutput.beam_search_result) reaches the frontend via
+    # EngineCoreOutput.kv_transfer_params (ACS-aligned save flow).
+    _patch_scheduler_update_from_output(Scheduler)
+
+
+def _patch_scheduler_update_from_output(scheduler_cls) -> None:
+    """Carry ``ModelRunnerOutput.beam_search_result`` through kv_transfer_params.
+
+    The NPU worker attaches the beam decision dict to the ModelRunnerOutput
+    it returns (see ``_attach_beam_search_result`` in model_runner_common).
+    This wrapper reads it and injects it into the first EngineCoreOutput's
+    ``kv_transfer_params`` so the frontend can consume it from the streamed
+    RequestOutput without an extra round trip.  Pure beam-decode batches carry
+    exactly one logical session request by design (max_batch=1), so attaching
+    to the first output of a beam session is unambiguous.
+    """
+    marker = "_vllm_gr_update_from_output_patch"
+    if getattr(scheduler_cls.update_from_output, marker, False):
+        return
+
+    _original_update = scheduler_cls.update_from_output
+
+    @wraps(_original_update)
+    def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
+        result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+
+        beam_search_result = getattr(model_runner_output, "beam_search_result", None)
+        if beam_search_result is None:
+            return result
+
+        # Attach to exactly one EngineCoreOutput (the first beam-session
+        # output in this step).  The dict payload carries host tensors; the
+        # IPC envelope only serialises the kv_transfer_params mapping, so host
+        # tensors are safe here (they were D2H'd by the worker).
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        beam_ids = {
+            req_id for req_id, mdata in beam_data.items() if mdata.get("is_beam_decode", False)
+        }
+        attached = False
+        for ec_outputs in result.values():
+            if attached:
+                break
+            for out in getattr(ec_outputs, "outputs", []):
+                if out.request_id not in beam_ids:
+                    continue
+                kv_params = dict(out.kv_transfer_params or {})
+                kv_params["beam_search_result"] = beam_search_result
+                out.kv_transfer_params = kv_params
+                attached = True
+                break
+        if not attached:
+            logger.debug(
+                "vllm-gr: beam_search_result present but no matching EngineCoreOutput "
+                "in this step; the decision was dropped (num_beam_ids=%d)",
+                len(beam_ids),
+            )
+        return result
+
+    setattr(patched_update_from_output, marker, True)
+    scheduler_cls.update_from_output = patched_update_from_output

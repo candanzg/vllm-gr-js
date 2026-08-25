@@ -48,6 +48,34 @@ def test_position_helpers_support_buffer_forms_and_partial_beam() -> None:
     assert torch.equal(device, host)
 
 
+def test_incremental_beam_decode_fills_constant_position_ids() -> None:
+    device = torch.full((6,), -1, dtype=torch.long)
+    host = torch.full((6,), -1, dtype=torch.long)
+
+    logits_indices: list[int] = []
+    result = common._process_beam_decode_request(
+        {
+            "prefix_len": 10,
+            "beam_width": 3,
+            "beam_decode_steps": 4,
+            "cache_len": 12,
+            "decode_step": 2,
+        },
+        seq_len=3,
+        token_offset=1,
+        gpu_pos=device,
+        cpu_pos=host,
+        new_logits_indices=logits_indices,
+        is_incremental=True,
+    )
+
+    assert result == (3, 3, 4, [0, 1, 2])
+    assert logits_indices == [1, 2, 3]
+    # Every beam consumes one token at position prefix_len + decode_step.
+    assert device.tolist() == [-1, 12, 12, 12, -1, -1]
+    assert torch.equal(device, host)
+
+
 def test_mixed_batch_remap_installs_functional_proxy() -> None:
     sampling_metadata = SimpleNamespace(
         temperature=torch.tensor([10, 20, 30, 40]),
@@ -109,6 +137,111 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
     proxy.passthrough = "updated"
     assert input_batch.passthrough == "updated"
     assert input_batch.logprob_token_ids == {}
+
+
+def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
+    """The remap runs once at proxy install; repeated reads hit the cache."""
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([20]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch = SimpleNamespace(
+        req_ids=["beam"],
+        logprob_token_ids={},
+        sampling_metadata=sampling_metadata,
+    )
+    runner = SimpleNamespace(
+        input_batch=input_batch,
+        positions=SimpleNamespace(
+            gpu=torch.zeros(8, dtype=torch.long),
+            cpu=torch.zeros(8, dtype=torch.long),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "beam": {
+                "is_beam_decode": True,
+                "prefix_len": 4,
+                "beam_width": 2,
+                "beam_decode_steps": 2,
+                "cache_len": 4,
+            }
+        }
+    )
+
+    common._beam_remap_inputs(runner, scheduler_output, [4])
+    proxy = runner.input_batch
+
+    # Eager warm: the metadata was remapped during _beam_remap_inputs
+    # (prepare phase), not deferred to the first _sample access.  One beam
+    # request with beam_width=2 → the 1-row temperature expands to 2 rows.
+    assert sampling_metadata.temperature.tolist() == [20, 20]
+    cache = object.__getattribute__(proxy, "_sampling_metadata_cache")
+    assert cache is sampling_metadata
+    idx_cache = object.__getattribute__(proxy, "_logits_idx_tensor_cache")
+    assert idx_cache is not None and idx_cache[1].tolist() == [0, 0]
+
+    # Cache hit: a fresh request-length tensor planted after the first read
+    # must NOT be re-expanded (the remap loop is skipped entirely on the
+    # second access).
+    sampling_metadata.temperature = torch.tensor([30])
+    assert proxy.sampling_metadata is sampling_metadata
+    assert proxy.sampling_metadata.temperature.tolist() == [30]
+
+
+def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None:
+    """A metadata swap (refresh_metadata / setattr) forces a fresh remap."""
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([10]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch = SimpleNamespace(req_ids=["beam"])
+    proxy = common.InputBatchProxy(input_batch, ["beam", "beam"], [0, 0], [0, 0])
+    input_batch.sampling_metadata = sampling_metadata
+
+    assert proxy.sampling_metadata is sampling_metadata
+    assert sampling_metadata.temperature.tolist() == [10, 10]
+
+    # Mid-step rebuild (refresh_metadata): a new metadata object with fresh
+    # per-request tensors is picked up and remapped despite the cache.
+    rebuilt = SimpleNamespace(
+        temperature=torch.tensor([7]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch.sampling_metadata = rebuilt
+    assert proxy.sampling_metadata is rebuilt
+    assert rebuilt.temperature.tolist() == [7, 7]
+
+    # Assignment through the proxy forwards to the underlying batch AND
+    # invalidates the cache, so the next read remaps the new object.
+    replaced = SimpleNamespace(
+        temperature=torch.tensor([5]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    proxy.sampling_metadata = replaced
+    assert input_batch.sampling_metadata is replaced
+    assert proxy.sampling_metadata is replaced
+    assert replaced.temperature.tolist() == [5, 5]
 
 
 def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:
@@ -193,15 +326,14 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     should_raise = False
 
     def execute_model(self: Any, output: Any) -> str:
-        assert output is scheduler_output
         assert BEAM_DATA_VAR.get() is self._current_beam_info
         assert self._current_beam_info == {
-            "beam_data": scheduler_output.beam_data,
+            "beam_data": output.beam_data,
             "req_ids": [],
         }
         # The Constraint Tables _sample hook reads the scheduler output to find
         # _gr_request_row_configs; it must be published for the whole run.
-        assert self._current_scheduler_output is scheduler_output
+        assert self._current_scheduler_output is output
         if should_raise:
             raise ExpectedError
         return "result"
@@ -219,11 +351,28 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
         with pytest.raises(ExpectedError):
             wrapped(runner, scheduler_output)
         assert BEAM_DATA_VAR.get() is outer
+        should_raise = False
     finally:
         BEAM_DATA_VAR.reset(token)
 
+    # The beam context deliberately OUTLIVES execute_model: with async
+    # scheduling, sample_tokens (constraint hook + worker beam decision)
+    # runs AFTER execute_model returns and still needs the published
+    # context — including on the exception path (only the ContextVar is
+    # reset in the finally block).
+    assert runner._current_beam_data is scheduler_output.beam_data
+    assert runner._current_scheduler_output is scheduler_output
+    assert runner._current_beam_info == {
+        "beam_data": scheduler_output.beam_data,
+        "req_ids": [],
+    }
+
+    # A subsequent non-beam step overwrites the stale context at entry.
+    plain_output = SimpleNamespace(beam_data={})
+    assert wrapped(runner, plain_output) == "result"
     assert runner._current_beam_data == {}
-    assert runner._current_beam_info is None
+    assert runner._current_scheduler_output is plain_output
+    assert runner._current_beam_info == {"beam_data": {}, "req_ids": []}
 
 
 @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]

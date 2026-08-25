@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, Mapping
 
+import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput, tokens_input
@@ -37,6 +38,56 @@ from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
+
+
+def _worker_decision_flatten(
+    decision: Mapping[str, object],
+    num_beams: int,
+    parents: list,
+) -> tuple[list[int], list[float], list[int], list] | None:
+    """Flatten a worker beam decision into per-beam candidate lists.
+
+    The worker has already selected the surviving beams, so ``out_token_ids`` /
+    ``out_log_probs`` / ``out_token_index`` each hold exactly ``num_beams``
+    entries.  The per-parent cache entries ("local" logprob = cumulative minus
+    the parent's cumulative) let ``materialize_selected_beams`` reconstruct
+    ``_lp_step_data`` identically to the flat-logprobs path.
+
+    Returns ``(token_ids, cumulative_logprobs, parent_indices, parent_cache)``
+    or ``None`` when the payload cannot be mapped to ``num_beams`` winners.
+    """
+    out_token_ids = decision.get("out_token_ids")
+    out_token_index = decision.get("out_token_index")
+    out_log_probs = decision.get("out_log_probs")
+    if out_token_ids is None or out_token_index is None or out_log_probs is None:
+        return None
+    for tensor in (out_token_ids, out_token_index, out_log_probs):
+        if hasattr(tensor, "numel") and int(tensor.numel()) == 0:
+            return None
+    ids = [int(v) for v in out_token_ids.reshape(-1).tolist()]
+    lps = [float(v) for v in out_log_probs.reshape(-1).tolist()]
+    parent = [int(v) for v in out_token_index.reshape(-1).tolist()]
+    if len(ids) != num_beams or len(ids) != len(lps) or len(ids) != len(parent):
+        return None
+    # out_token_index keeps the request offset; strip it (batch == 1).
+    parent = [p - num_beams if p >= num_beams else p for p in parent]
+    cache: list = []
+    for i, (pid, tid, lp) in enumerate(zip(parent, ids, lps)):
+        parent_cum = parents[pid].cum_logprob if pid < len(parents) else 0.0
+        cache.append(([tid], [lp - parent_cum], [0], [None]))
+    return ids, lps, parent, cache
+
+
+def _worker_decision_from_result(beam_result) -> Mapping[str, object] | None:
+    """Extract the worker beam-decision dict from a step's RequestOutput."""
+    kv_params = getattr(beam_result, "kv_transfer_params", None)
+    if not kv_params:
+        return None
+    decision = kv_params.get("beam_search_result")
+    if not isinstance(decision, Mapping):
+        return None
+    return decision
+
 
 _dp_rank_counter = 0
 _dp_rank_lock = asyncio.Lock()
@@ -501,6 +552,11 @@ async def beam_search(
                 else CandidateLayout.STANDARD_SAMPLER
             )
         )
+        # Worker-side beam decision result (NPU xllm path).  Initialised here so
+        # the per-beam extraction below can overwrite it and the bottom-of-loop
+        # selection always has a defined value even on the prefill/batch path
+        # (where the use_beam_request branch never runs).
+        worker_candidates = None
 
         # -------------------------------------------------------------------------
         # STRIDE-AWARE METADATA EXTRACTION FOR GENERATED BEAMS
@@ -531,8 +587,20 @@ async def beam_search(
                 )
                 return
 
+            # Worker-side beam decision (NPU xllm path, ACS-aligned): the worker
+            # already selected the surviving beams, so skip the frontend flat
+            # logprobs extraction + NumPy top-k entirely and feed the worker's
+            # winners into the existing EOS / materialisation pipeline.
+            worker_decision = _worker_decision_from_result(beam_result)
+            worker_candidates = None
+            if worker_decision is not None:
+                worker_candidates = _worker_decision_flatten(worker_decision, beam_width, all_beams)
+
             flat = beam_result.outputs[0].logprobs
-            if flat is not None:
+            if worker_candidates is not None:
+                # Workers already decided: no per-beam flat segment to parse.
+                pass
+            elif flat is not None:
                 # Extract tracking attributes cleanly
                 raw_token_ids = flat.token_ids
                 raw_logprobs = flat.logprobs
@@ -672,10 +740,24 @@ async def beam_search(
                     )
 
         candidate_batch = candidate_builder.build()
-        all_beams_token_id = candidate_batch.token_ids
-        all_beams_logprob = candidate_batch.cumulative_logprobs
-        all_beams_beam_idx_arr = candidate_batch.parent_indices
-        beam_flat_cache = candidate_batch.parent_cache
+        if worker_candidates is not None:
+            # Worker side already selected the surviving beams; the candidate
+            # batch built from the (skipped) flat segments is meaningless, so
+            # swap in the worker's winners directly.
+            (
+                all_beams_token_id,
+                all_beams_logprob,
+                all_beams_beam_idx_arr,
+                beam_flat_cache,
+            ) = worker_candidates
+            all_beams_token_id = np.asarray(all_beams_token_id, dtype=np.int64)
+            all_beams_logprob = np.asarray(all_beams_logprob, dtype=np.float64)
+            all_beams_beam_idx_arr = np.asarray(all_beams_beam_idx_arr, dtype=np.intp)
+        else:
+            all_beams_token_id = candidate_batch.token_ids
+            all_beams_logprob = candidate_batch.cumulative_logprobs
+            all_beams_beam_idx_arr = candidate_batch.parent_indices
+            beam_flat_cache = candidate_batch.parent_cache
 
         if not ignore_eos:
             stop_token_ids = {eos_token_id}

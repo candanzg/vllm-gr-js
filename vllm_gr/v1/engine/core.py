@@ -28,6 +28,13 @@ def _constraint_table_backend_active() -> bool:
     Reads the process-global vLLM config (same source as ``ascend_compat``) so
     both the driver and the EngineCore process agree without passing the flag
     around the request path.
+
+    NOTE: ``get_current_vllm_config_or_none()`` can return ``None`` inside the
+    EngineCore process (the global config hook is not always installed there),
+    which would silently read as the default TRIE backend.  Callers inside the
+    EngineCore must prefer the engine's own ``vllm_config`` (see
+    :func:`_handle_beam_request_step_update`); this fallback only fires when no
+    config is available at all.
     """
     from vllm.config import get_current_vllm_config_or_none
 
@@ -35,6 +42,21 @@ def _constraint_table_backend_active() -> bool:
 
     return (
         GRConfig.from_vllm_config(get_current_vllm_config_or_none()).constraint_backend
+        == ConstraintBackend.CONSTRAINT_TABLE
+    )
+
+
+def _engine_constraint_table_active(engine: Any) -> bool:
+    """Whether the EngineCore's own config selects Constraint Tables.
+
+    The EngineCore holds ``self.vllm_config``; reading the constraint backend
+    from it is authoritative and does not depend on the process-global config
+    hook (which may be None in the EngineCore subprocess).
+    """
+    from vllm_gr.config import ConstraintBackend, GRConfig
+
+    return (
+        GRConfig.from_vllm_config(getattr(engine, "vllm_config", None)).constraint_backend
         == ConstraintBackend.CONSTRAINT_TABLE
     )
 
@@ -125,7 +147,7 @@ def _cache_beam_request(self, request) -> None:
             "num_prompt_tokens": request.num_prompt_tokens,
         }
 
-    if _constraint_table_backend_active():
+    if _engine_constraint_table_active(self):
         # Constraint Tables generate the step-0 candidates in the Worker from
         # the raw prefill logits.  Only beam-session prefills reach this cache
         # (ADD_BATCH), so any such request is the session's constrained prefill.
@@ -293,7 +315,7 @@ def _handle_beam_request_step_update(self, update) -> None:
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
 
-    if _constraint_table_backend_active():
+    if _engine_constraint_table_active(self):
         # Constraint Table decode: the Worker runs the constrained top-k
         # operator at raw-logits time.  constraint_step equals the number of
         # generated tokens so far (1 or 2 under the 3-step cap); beam_suffix

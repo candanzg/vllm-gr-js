@@ -42,7 +42,7 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
-from vllm_gr.config import ConstraintBackend
+from vllm_gr.config import ConstraintBackend, GRConfig
 from vllm_gr.constraints import (
     BeamConstraintCoordinator,
     ParentCandidateBuilder,
@@ -492,8 +492,44 @@ def _custom_beam_search_batch(
             if result is None:
                 continue
 
-            is_error, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache = (
-                _parse_step_logprobs(
+            # Worker-side beam decision (NPU xllm path): when the worker
+            # already selected the surviving beams, use its winners directly
+            # and skip the frontend flat-logprobs parsing + NumPy top-k.  The
+            # downstream EOS handling / beam materialisation is unchanged.
+            from vllm_gr.entrypoints.openai.serving_engine import (
+                _worker_decision_flatten,
+                _worker_decision_from_result,
+            )
+
+            worker_decision = _worker_decision_from_result(result)
+            worker_candidates = None
+            if worker_decision is not None:
+                worker_candidates = _worker_decision_flatten(
+                    worker_decision, beam_width, instance.beams
+                )
+
+            if worker_candidates is not None:
+                (
+                    all_beams_token_id,
+                    all_beams_logprob,
+                    all_beams_beam_idx_arr,
+                    beam_flat_cache,
+                ) = worker_candidates
+                if not all_beams_token_id:
+                    is_error = True
+                else:
+                    is_error = False
+                    all_beams_token_id = np.asarray(all_beams_token_id, dtype=np.int64)
+                    all_beams_logprob = np.asarray(all_beams_logprob, dtype=np.float64)
+                    all_beams_beam_idx_arr = np.asarray(all_beams_beam_idx_arr, dtype=np.intp)
+            else:
+                (
+                    is_error,
+                    all_beams_token_id,
+                    all_beams_logprob,
+                    all_beams_beam_idx,
+                    beam_flat_cache,
+                ) = _parse_step_logprobs(
                     result=result,
                     instance=instance,
                     token=token,
@@ -504,7 +540,7 @@ def _custom_beam_search_batch(
                     constraint_coordinator=constraint_coordinator,
                     return_arrays=True,
                 )
-            )
+                all_beams_beam_idx_arr = all_beams_beam_idx
 
             if is_error:
                 _beam_request_cleanup(
@@ -518,7 +554,6 @@ def _custom_beam_search_batch(
 
             # _parse_step_logprobs returns the builder's NumPy arrays for the
             # internal path; do not convert them through Python lists again.
-            all_beams_beam_idx_arr = all_beams_beam_idx
             if not ignore_eos:
                 eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
@@ -570,7 +605,7 @@ class GRLLM(LLM):
         model: str = "",
         *,
         catalog_path: str | None = None,
-        constraint_backend: ConstraintBackend | str = ConstraintBackend.TRIE,
+        constraint_backend: ConstraintBackend | str | None = None,
         beam_graph_enabled: bool | None = None,
         beam_max_width: int | None = None,
         beam_max_decode_steps: int | None = None,
@@ -582,6 +617,24 @@ class GRLLM(LLM):
         from vllm_gr._env_check import configure_model_runner_default
 
         configure_model_runner_default()
+
+        # Ensure the vllm-gr runtime patches are installed (EngineArgs
+        # arg-threading, worker hooks, EngineCore entrypoint) before building
+        # EngineArgs.  The vLLM general-plugin loader normally does this at
+        # process start, but offline GRLLM construction can precede that;
+        # calling it explicitly is idempotent and self-contained.
+        from vllm_gr.plugin import initialize_runtime
+
+        initialize_runtime()
+        # Force the EngineCore process entrypoint swap: re_apply_patches may
+        # skip an already-marked batch_and_fork patch (e.g. when the general
+        # plugin ran first), and without the swap a spawn child re-imports the
+        # original run_engine_core and loses every worker hook.
+        from vllm_gr.entrypoints.openai.beam_search_patch import (
+            patch_engine_core_process_entrypoint,
+        )
+
+        patch_engine_core_process_entrypoint()
 
         self._shutdown_complete = False
 
@@ -599,11 +652,29 @@ class GRLLM(LLM):
         # below), so ``catalog_path`` with the default backend must not demand
         # the plugin — vLLM 0.22 loads general plugins lazily from inside
         # EngineArgs.__init__, which has not run yet at this point.
+        # Resolve the effective constraint backend here (before EngineArgs is
+        # built): on NPU with no explicit choice the platform default is
+        # Constraint Tables, auto-built from the tokenizer's s_a/s_b/s_c
+        # groups — catalog_path becomes the sentinel so the strategy + worker
+        # injection pick the tokenizer build path.  Explicit user choices
+        # (any backend, any catalog) pass through unchanged.
+        from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
+        from vllm_gr.engine.arg_utils_gr import _is_npu_platform
+
+        if (
+            constraint_backend is None
+            and catalog_path is None
+            and beam_max_width is not None
+            and _is_npu_platform()
+        ):
+            constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
+            catalog_path = AUTO_CONSTRAINT_TABLE_PATH
+
         gr_engine_args: dict[str, object] = {}
         if engine_args_accepts_gr_values():
             gr_engine_args["catalog_path"] = catalog_path
             gr_engine_args["constraint_backend"] = constraint_backend
-        elif constraint_backend != ConstraintBackend.TRIE:
+        elif constraint_backend not in (None, ConstraintBackend.TRIE):
             raise RuntimeError(
                 "vllm-gr runtime patches are not active: EngineArgs cannot "
                 "carry constraint_backend into VllmConfig. Ensure the vllm-gr "
@@ -636,11 +707,19 @@ class GRLLM(LLM):
         self.catalog = None
         self.constraint_strategy = None
         self.constraint_coordinator = BeamConstraintCoordinator(None)
-        if catalog_path is not None:
+        # Resolve the effective constraint backend from the engine config
+        # (create_engine_config already applied the NPU platform default: a
+        # sentinel catalog_path when Constraint Tables are auto-selected).
+        # Explicit user choices pass through unchanged.
+        resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
+        effective_backend = resolved_gr.constraint_backend
+        effective_catalog_path = resolved_gr.catalog_path
+
+        if effective_catalog_path is not None:
             self.constraint_strategy = create_constraint_strategy(
-                backend=constraint_backend,
+                backend=effective_backend,
                 tokenizer=self.get_tokenizer(),
-                catalog_path=catalog_path,
+                catalog_path=effective_catalog_path,
             )
             self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
             if isinstance(self.constraint_strategy, TrieConstraintStrategy):
@@ -651,9 +730,9 @@ class GRLLM(LLM):
                 # is a hard startup error — never a silent fall back to Trie.
                 resource = install_constraint_table(
                     self.llm_engine,
-                    catalog_path=catalog_path,
+                    catalog_path=effective_catalog_path,
                     tokenizer=self.get_tokenizer(),
-                    vocab_size=self.llm_engine.model_config.vocab_size,
+                    vocab_size=self.llm_engine.model_config.get_vocab_size(),
                 )
                 self.constraint_strategy.digest = resource.digest
 

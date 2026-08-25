@@ -194,22 +194,31 @@ def run_constrained_partition(
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """Run the constrained operator on every constrained row group.
 
-    Each request is run independently (its own sequence_group geometry and
-    ``constraint_step``), so requests at different FSM steps can share one
-    scheduler step.  The operator output rows are returned in the order of the
-    global sampler/logits row indices collected in ``global_rows``.
+    Requests are grouped by their ``constraint_step`` and each step group is
+    submitted as a *single* batch ``rec_constrained_topk`` call (the operator
+    contract is already ``[B*W, vocab]`` logits + ``[B, W, max_step]``
+    sequence_group), replacing the previous one call per request.  Requests at
+    different FSM steps still run in separate batches because the operator's
+    candidate table selection depends on ``current_step``.  The operator
+    output rows are returned in the order of the global sampler/logits row
+    indices collected in ``global_rows``.
     """
     device = getattr(runner, "device", logits.device)
     top_tokens_parts: list[torch.Tensor] = []
     top_logprobs_parts: list[torch.Tensor] = []
     global_rows: list[int] = []
 
-    for req_id, row_start, W_logits, mdata in rows:
-        step = validate_constraint_step(mdata.get("constraint_step", 0))
-        sequence_group = build_sequence_group_for_step(
-            [(req_id, row_start, W_logits, mdata)], device, step
-        )
-        group_rows = list(range(row_start, row_start + W_logits))
+    by_step: dict[int, list[tuple[Any, int, int, dict[str, Any]]]] = {}
+    for item in rows:
+        step = validate_constraint_step(item[3].get("constraint_step", 0))
+        by_step.setdefault(step, []).append(item)
+
+    for step in sorted(by_step):
+        step_rows = by_step[step]
+        sequence_group = build_sequence_group_for_step(step_rows, device, step)
+        group_rows: list[int] = []
+        for _, row_start, W_logits, _ in step_rows:
+            group_rows.extend(range(row_start, row_start + W_logits))
         result = adapter.run(
             logits[group_rows],
             sequence_group,
@@ -271,6 +280,39 @@ def patch_sampler_output_for_constrained(
         lp_tensors.logprob_token_ids.resize_(num_rows, width)
 
     st_ids = sampler_output.sampled_token_ids
+
+    # Contiguous row ranges (the common pure-beam-decode case: global_rows
+    # covers [0, W)) use slice assignment.  Advanced indexing (``[rows_idx]``)
+    # dispatches the IndexPut AI_CPU kernel, which profiling (bw128_1k_t2)
+    # showed as the single largest device-side cost — 10.3ms per step, 15.7%
+    # of total kernel time, with the matching IndexPutImplGetWorkspaceSize
+    # host call reaching 47ms — for what is a whole-tensor overwrite when the
+    # rows are contiguous.  Slices stay on the vector-core fast path.
+    contiguous = global_rows == list(range(global_rows[0], global_rows[-1] + 1))
+    n_rows = len(global_rows)
+    if contiguous:
+        r0 = global_rows[0]
+
+        if st_ids is not None:
+            best_tokens = top_tokens[:, 0].to(st_ids.dtype)
+            if st_ids.dim() == 2:
+                st_ids[r0 : r0 + n_rows, 0] = best_tokens
+            else:
+                st_ids[r0 : r0 + n_rows] = best_tokens
+
+        # ``logprob_token_ids`` is nullable in the sampler-output contract;
+        # see the non-contiguous branch below for the full note.
+        if lp_tensors.logprob_token_ids is not None:
+            lp_tensors.logprob_token_ids[r0 : r0 + n_rows, :width] = top_tokens.to(
+                lp_tensors.logprob_token_ids.dtype
+            )
+        lp_tensors.logprobs[r0 : r0 + n_rows, :width] = top_logprobs.to(lp_tensors.logprobs.dtype)
+
+        ranks = getattr(lp_tensors, "selected_token_ranks", None)
+        if ranks is not None:
+            ranks[r0 : r0 + n_rows] = torch.zeros(n_rows, dtype=ranks.dtype, device=ranks.device)
+        return
+
     if st_ids is not None:
         best_tokens = top_tokens[:, 0].to(st_ids.dtype)
         if st_ids.dim() == 2:
@@ -392,4 +434,77 @@ def apply_constrained_sample_override(
     )
     patch_sampler_output_for_constrained(
         sampler_output, global_rows, top_tokens, top_logprobs, width
+    )
+
+
+def collect_constrained_override_rows(runner: Any) -> list[tuple[Any, int, int, dict[str, Any]]]:
+    """Return the constrained rows for the runner's current step, if any.
+
+    Thin pre-check for the sampler short-circuit path: same collection walk
+    as ``apply_constrained_sample_override`` (rows + homogeneous validation)
+    without running the operator, so ``patched_sample`` can decide whether
+    the original sampler is needed before paying for it.
+    """
+    beam_data = getattr(runner, "_current_beam_data", None)
+    if not beam_data:
+        return []
+    scheduler_output = getattr(runner, "_current_scheduler_output", None)
+    request_row_configs = (
+        getattr(scheduler_output, "_gr_request_row_configs", None)
+        if scheduler_output is not None
+        else None
+    )
+    if not request_row_configs:
+        return []
+
+    rows = collect_constrained_rows(request_row_configs, beam_data)
+    if not rows:
+        return []
+
+    _validate_homogeneous_step(request_row_configs, beam_data)
+    widths = {mdata["beam_width"] for _, _, _, mdata in rows}
+    if len(widths) != 1:
+        raise RuntimeError(
+            f"constrained step mixes beam_widths {sorted(widths)}; "
+            "mixed-width Constraint Table batches are not supported yet (P8)"
+        )
+    return rows
+
+
+def build_constrained_sampler_output(
+    runner: Any,
+    logits: torch.Tensor,
+    rows: Sequence[tuple[Any, int, int, dict[str, Any]]],
+) -> Any:
+    """Run the constrained operator and build a SamplerOutput directly.
+
+    ACS-aligned sampler short-circuit (``model_runner_v1`` decode path):
+    when every sampling row is constrained, the sampler's log_softmax +
+    topk + gather_logprobs is dead work — the operator already produces the
+    fixed-width ``W`` candidates the beam decision consumes.  This builds
+    the final sampler output from the operator result in one pass.
+
+    Shape contract (matches ``patch_sampler_output_for_constrained``):
+    ``logprob_token_ids``/``logprobs`` are ``[rows, W]`` with the top-1
+    candidate in column 0 (``_select_candidates`` takes the ``n_cols == W``
+    branch); ``sampled_token_ids`` is ``[rows, 1]`` int32; ranks are all 1
+    (the top-1 candidate is rank 1 by definition).
+    """
+    from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+
+    width = next(iter({mdata["beam_width"] for _, _, _, mdata in rows}))
+    adapter = get_or_create_execution_adapter(runner)
+    top_tokens, top_logprobs, global_rows = run_constrained_partition(
+        runner, logits, rows, width, adapter
+    )
+
+    num_rows = top_tokens.shape[0]
+    token_ranks = torch.ones(num_rows, dtype=torch.int32, device=top_tokens.device)
+    return SamplerOutput(
+        sampled_token_ids=top_tokens[:, :1].to(torch.int32),
+        logprobs_tensors=LogprobsTensors(
+            top_tokens.to(torch.int32),
+            top_logprobs.to(torch.float32),
+            token_ranks,
+        ),
     )

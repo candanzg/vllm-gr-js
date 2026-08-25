@@ -20,9 +20,12 @@ def patch_sampling():
 
 def patch_engine_core_process_entrypoint() -> None:
     """Wrap the EngineCore process entrypoint for spawn-based runtimes."""
+    from vllm.logger import init_logger
     from vllm.v1.engine.core import EngineCoreProc
 
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
+
+    init_logger(__name__).info("vllm-gr: patch_engine_core_process_entrypoint called")
 
     # Save the original so the wrapper can delegate without recursion
     # even if run_patch() is called again in a spawned child process.

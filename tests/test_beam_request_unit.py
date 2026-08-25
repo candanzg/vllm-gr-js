@@ -811,7 +811,7 @@ class TestBeamCache:
         eng = _make_engine_self()
         req = _make_mock_request(request_id="r0")
         req.sampling_params.logprobs = 4
-        with patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True):
+        with patch("vllm_gr.v1.engine.core._engine_constraint_table_active", return_value=True):
             _cache_beam_request(eng, req)
 
         assert req.is_constraint_prefill is True
@@ -828,7 +828,7 @@ class TestBeamCache:
         eng = _make_engine_self()
         req = _make_mock_request(request_id="r0")
         req.sampling_params.logprobs = None  # beam width is carried on logprobs
-        with patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True):
+        with patch("vllm_gr.v1.engine.core._engine_constraint_table_active", return_value=True):
             _cache_beam_request(eng, req)
 
         assert req.is_constraint_prefill is True
@@ -846,7 +846,7 @@ class TestBeamCache:
         )
         with (
             patch("vllm.v1.request.Request") as MockReq,
-            patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True),
+            patch("vllm_gr.v1.engine.core._engine_constraint_table_active", return_value=True),
         ):
             mock_req = SimpleNamespace(block_hashes=[], num_computed_tokens=6)
             MockReq.return_value = mock_req

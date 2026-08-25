@@ -62,6 +62,13 @@ def extract_and_dedup_segment(
     ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
     decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
 
+    # Optional metadata (ranks / decoded) may be shorter than the candidate
+    # arrays when a fused operator widens rows; drop them rather than crash.
+    if ranks_pos is not None and len(ranks_pos) < len(logprobs_pos):
+        ranks_pos = None
+    if decoded_pos is not None and len(decoded_pos) < len(logprobs_pos):
+        decoded_pos = None
+
     if len(token_ids_pos) > logprobs_num:
         if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
             selected = slice(1, logprobs_num + 1)
@@ -135,9 +142,18 @@ def extract_constrained_segment(
     token_ids_pos = [token_ids_pos[i] for i in keep]
     logprobs_pos = [logprobs_pos[i] for i in keep]
     if ranks_pos is not None:
-        ranks_pos = [ranks_pos[i] for i in keep]
+        # ranks is optional metadata; a length mismatch (e.g. the Constraint
+        # Table operator widens rows to W candidates while the sampler only
+        # tracks one rank per row) must not break candidate extraction.
+        if len(ranks_pos) < len(logprobs_pos):
+            ranks_pos = None
+        else:
+            ranks_pos = [ranks_pos[i] for i in keep]
     if decoded_pos is not None:
-        decoded_pos = [decoded_pos[i] for i in keep]
+        if len(decoded_pos) < len(logprobs_pos):
+            decoded_pos = None
+        else:
+            decoded_pos = [decoded_pos[i] for i in keep]
     return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
 
 

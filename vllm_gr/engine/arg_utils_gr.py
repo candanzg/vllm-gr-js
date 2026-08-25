@@ -16,6 +16,7 @@ from vllm_gr.config import (
     GRConfigInput,
     write_canonical_gr_config,
 )
+from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
 from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
     KNOWN_GR_CONFIG_KEYS,
@@ -142,6 +143,24 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Upper bound on beam decode steps for the persistent beam KV "
         "pool (default 3, matching OneRec SID: max_tokens=5 minus begin/end).",
     )
+    model_group.add_argument(
+        "--beam-worker-decision",
+        action="store_true",
+        default=None,
+        help="Move the beam decision (beam_search_group / rec_final_select + "
+        "select_unshared_kv) into the NPU worker and return results via "
+        "ModelRunnerOutput.beam_search_result (ACS-aligned save flow). Only "
+        "takes effect on NPU + xllm decode execution with the xllm op library "
+        "present. Without this flag the frontend NumPy decision path is kept.",
+    )
+    model_group.add_argument(
+        "--no-beam-worker-decision",
+        action="store_false",
+        dest="beam_worker_decision",
+        default=None,
+        help="Explicitly keep the frontend NumPy beam decision path (opt-out "
+        "of worker-side beam decision).",
+    )
     return parser
 
 
@@ -159,6 +178,7 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     for attr in ("beam_max_width", "beam_max_decode_steps"):
         setattr(engine_args, attr, getattr(args, attr, None))
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
+    engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -238,6 +258,34 @@ def _apply_npu_default_block_size(config) -> None:
         cache_config.block_size = 128
 
 
+def _is_npu_platform() -> bool:
+    """Return whether the active platform is an Ascend NPU."""
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+    return getattr(current_platform, "device_type", None) == "npu"
+
+
+def _constraint_explicitly_configured(
+    engine_args: object,
+    existing_gr_config: GRConfig,
+) -> bool:
+    """Whether the user explicitly chose a constraint backend / catalog.
+
+    The NPU platform default (Constraint Tables + worker decision) must not
+    override an explicit user choice.  Any explicit backend (including an
+    explicit ``TRIE`` opt-out), or any explicit catalog path, suppresses the
+    promotion to Constraint Tables.
+    """
+    explicit_backend = getattr(engine_args, "constraint_backend", None) is not None
+    explicit_catalog = (
+        getattr(engine_args, "catalog_path", None) is not None
+        or existing_gr_config.catalog_path is not None
+    )
+    return explicit_backend or explicit_catalog
+
+
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
     _apply_npu_default_block_size(config)
@@ -303,8 +351,47 @@ def create_engine_config(self, usage_context=None, headless=False):
             if constraint_backend is not None
             else existing_gr_config.constraint_backend
         )
+        effective_beam_worker_decision = (
+            getattr(self, "beam_worker_decision", None)
+            if getattr(self, "beam_worker_decision", None) is not None
+            else existing_gr_config.beam_worker_decision
+        )
+        # NPU platform default for beam-serve deployments: when the user
+        # enables beam search (beam_max_width) without an explicit choice,
+        # run Constraint Tables (auto-built from the tokenizer's s_a/s_b/s_c
+        # groups) and worker-side beam decision by default.  This only fires
+        # on a real NPU device with an active beam pool, so non-GR / non-beam
+        # configs and non-NPU platforms are untouched.  beam_max_width is read
+        # from the parsed config (GRLLM rides it in additional_config) or the
+        # EngineArgs attribute (serve CLI).
+        beam_width_configured = (
+            getattr(self, "beam_max_width", None) is not None
+            or existing_gr_config.beam_max_width is not None
+        )
+        worker_decision_explicit = (
+            getattr(self, "beam_worker_decision", None) is not None
+            or existing_gr_config.beam_worker_decision is not None
+        )
+        if (
+            _is_npu_platform()
+            and effective_catalog_path is None
+            and beam_width_configured
+            and not _constraint_explicitly_configured(self, existing_gr_config)
+        ):
+            effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
+            effective_catalog_path = AUTO_CONSTRAINT_TABLE_PATH
+        # Worker-side beam decision is enabled on NPU by default for any beam
+        # deployment unless the user explicitly disabled it.  Independent of
+        # the Constraint Table promotion above (which may already be explicit
+        # via GRLLM passing the auto-build sentinel).
+        if _is_npu_platform() and beam_width_configured and not worker_decision_explicit:
+            if effective_beam_worker_decision is None:
+                effective_beam_worker_decision = True
         offset, slice_size = None, None
-        if effective_catalog_path is not None:
+        if (
+            effective_catalog_path is not None
+            and effective_catalog_path != AUTO_CONSTRAINT_TABLE_PATH
+        ):
             model_name = getattr(self, "model", None)
             if model_name is not None:
                 from vllm_gr.utils.catalog import (
@@ -345,6 +432,7 @@ def create_engine_config(self, usage_context=None, headless=False):
                 if getattr(self, "beam_max_decode_steps", None) is not None
                 else existing_gr_config.beam_max_decode_steps
             ),
+            beam_worker_decision=effective_beam_worker_decision,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )

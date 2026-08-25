@@ -30,6 +30,18 @@ class SessionSlotState:
     prefix_len: int = 0
     is_last_step: bool = False
     is_active: bool = False
+    # Worker-side same-step KV reorder record (ACS decode_select timing).
+    # ``kv_reorder`` holds the request-local parent mapping the worker's beam
+    # decision already applied to the KV pool inside the *same* execute_model
+    # step (``beam_decision.run_beam_decision`` → ``select_unshared_kv``).
+    # It is derived in ``_maybe_run_worker_beam_decision`` from the return
+    # channel's host copy of ``out_token_index`` (its request-0 row IS the
+    # request-local mapping), so no extra device→host sync is spent on it.
+    # The next step's ``_get_or_create_beam_session`` consumes it: an exact
+    # match against the frontend-returned ``parent_beam_ids`` skips the
+    # duplicate reorder; a mismatch triggers the composite reorder instead.
+    # ``None`` means no same-step reorder happened (frontend-driven path).
+    kv_reorder: list[int] | None = None
 
 
 class BeamSessionRegistry:

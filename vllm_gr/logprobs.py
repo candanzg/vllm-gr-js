@@ -25,11 +25,18 @@ def append_fast(
     # ranks/decoded_tokens may be lazy or infinite iterators
     # (e.g. itertools.chain, itertools.repeat) -- use islice to bound them.
     # When they are already lists, extend directly (C-level memcpy).
-    if isinstance(ranks, list):
+    # A fused operator may drop the optional metadata entirely (ranks /
+    # decoded_tokens == None): pad with None entries so every candidate has a
+    # rank slot, matching the FlatLogprobs per-token contract.
+    if ranks is None:
+        self.ranks.extend(itertools.repeat(None, len(token_ids)))
+    elif isinstance(ranks, list):
         self.ranks.extend(ranks)
     else:
         self.ranks.extend(itertools.islice(ranks, len(token_ids)))
-    if isinstance(decoded_tokens, list):
+    if decoded_tokens is None:
+        self.decoded_tokens.extend(itertools.repeat(None, len(token_ids)))
+    elif isinstance(decoded_tokens, list):
         self.decoded_tokens.extend(decoded_tokens)
     else:
         self.decoded_tokens.extend(itertools.islice(decoded_tokens, len(token_ids)))

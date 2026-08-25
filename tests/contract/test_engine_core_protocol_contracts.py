@@ -193,6 +193,9 @@ def test_scheduler_beam_metadata_shape() -> None:
         "decode_step": 1,
         "parent_beam_ids": [0, 0],
         "max_decode_steps": 4,
+        # Final-step output width for the worker beam decision; falls back
+        # to beam_width on the worker when the request does not carry one.
+        "result_width": None,
     }
 
 

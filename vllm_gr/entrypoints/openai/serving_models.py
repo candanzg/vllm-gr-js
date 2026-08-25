@@ -51,11 +51,18 @@ def init_gr(
             # Compile synchronously (cheap, no workers touched); the collective
             # RPC broadcast is deferred to the first beam_search so the async
             # client cannot race it (issue #246 §7).
-            vocab_size = getattr(getattr(vllm_config, "model_config", None), "vocab_size", None)
+            vocab_size = None
+            model_config = getattr(vllm_config, "model_config", None)
+            if model_config is not None:
+                vocab_size = (
+                    model_config.get_vocab_size()
+                    if hasattr(model_config, "get_vocab_size")
+                    else getattr(model_config, "vocab_size", None)
+                )
             if vocab_size is None:
                 raise ValueError(
                     "constraint_backend='constraint_table' requires "
-                    "engine_client.vllm_config.model_config.vocab_size"
+                    "engine_client.vllm_config.model_config vocab size"
                 )
             resource = prepare_constraint_table(
                 catalog_path=gr_config.catalog_path,
