@@ -49,6 +49,64 @@ refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark related test 
 - Please refer to [offline inference](examples/offline_inference/beam_search/README.md) for offline beam search example.
 - Please refer to [online inference](examples/online_serving/beam_search/README.md) for online inference example.
 
+## NPU Serving with Constraint Tables
+
+When serving on NPU with beam search enabled (e.g. `--beam-max-width` +
+`--beam-worker-decision`), the platform auto-promotes the constraint backend
+to Constraint Tables. In that mode you **must** pass
+`--catalog-path <triples_document>`, where the document is produced by
+`tools/build_constraint_triples.py` from the real catalog (e.g.
+`video_constraint_triples.json`).
+
+Without it, the tables are auto-built from the tokenizer's `<s_a_*>` /
+`<s_b_*>` / `<s_c_*>` groups; a model whose groups exceed `max_valid_items`
+(currently 500) fails fast at startup:
+
+```text
+ValueError: tokenizer constraint tables would be truncated: item groups
+s_a/s_b/s_c have 8192/8192/8192 items but max_valid_items=500. ... Provide
+--constraint-data built from the real catalog via tools/build_constraint_triples.py,
+or pass valid_item_ids/prefix files covering the full universe.
+```
+
+The triples document is generated from the real recommendation catalog:
+
+```bash
+python tools/build_constraint_triples.py \
+  --catalog /workspace/ckpt/OpenOneRec-RecIF/generated_data/video_catalog.json \
+  --output /workspace/ckpt/OpenOneRec-RecIF/generated_data/video_constraint_triples.json \
+  --begin "<|sid_begin|>" \
+  --end "<|sid_end|>"
+```
+
+The catalog itself is converted from the OpenOneRec dataset's `sid2pid.json`
+(= list of acceptable SIDs), see
+[examples/online_serving/catalog/README.md](examples/online_serving/catalog/README.md):
+
+```bash
+python benchmarks/open_one_rec/tools/convert_catalog.py \
+  --dataset-path /workspace/ckpt/OpenOneRec-RecIF/benchmark_data \
+  --output-path /workspace/ckpt/OpenOneRec-RecIF/generated_data/video_catalog.json
+```
+
+`tests/system/run_benchmark_and_verify.sh` builds it on demand when the file
+is missing (from `TRIPLES_PATH` or the catalog directory).
+
+Example:
+
+```bash
+vllm-gr serve $REC_MODEL \
+  --port 9312 \
+  --trust-remote-code \
+  --max-logprobs 1024 \
+  --beam-max-width 128 \
+  --beam-worker-decision \
+  --catalog-path $REC_TRIPLES \  # video_constraint_triples.json
+  --attention-backend CUSTOM
+```
+
+See `server.sh` for a complete working NPU serve script.
+
 ## Uninstall
 
 ```bash

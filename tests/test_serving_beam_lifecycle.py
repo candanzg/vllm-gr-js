@@ -99,6 +99,7 @@ def _engine_output(
     flat: FlatLogprobs | None,
     *,
     finish_reason: str | None = None,
+    kv_transfer_params: dict[str, Any] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         outputs=[
@@ -108,6 +109,7 @@ def _engine_output(
             )
         ],
         finished=True,
+        kv_transfer_params=kv_transfer_params,
     )
 
 
@@ -413,3 +415,111 @@ def test_eos_and_distinct_sid_end_token_both_complete() -> None:
     assert [choice.finish_reason for choice in choices] == ["stop", "stop"]
     assert [choice.stop_reason for choice in choices] == [3, 2]
     assert [choice.token_ids for choice in choices] == [[], []]
+
+
+def test_self_advance_chained_step_skips_frontend_update(
+    monkeypatch: Any,
+) -> None:
+    """EngineCore self-advance coordination (beam_self_advance).
+
+    When a decode step's worker decision carries
+    ``beam_self_advance_chained=True``, EngineCore already chained the next
+    decode request under the same session id. The next loop iteration must
+    NOT send its own beam_request_step_update (the session request is still
+    running — a second ADD would trip the scheduler's "duplicate request
+    id" assert), while still registering the output queue and awaiting the
+    chained step's result."""
+    _install_deterministic_request_ids(monkeypatch)
+    decision = {
+        "out_token_ids": [[21, 31]],
+        "out_token_index": [[0, 1]],
+        "out_log_probs": [[-0.3, -0.7]],
+        "beam_self_advance_chained": True,
+    }
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            # Step 1 (frontend-driven): worker decision chained the next
+            # step in-process.
+            _engine_output(None, kv_transfer_params={"beam_search_result": decision}),
+            # Step 2 (chained by EngineCore): plain flat logprobs, no
+            # worker decision — the flag must reset for the final step.
+            _engine_output(
+                _combined_flat(
+                    [
+                        ([41, 42], [-0.1, -0.4]),
+                        ([51, 52], [-0.1, -0.4]),
+                    ]
+                )
+            ),
+        ],
+    )
+
+    outputs = _run_search(engine, max_tokens=3)
+
+    # Only the step-1 decode update and the final cleanup were sent; the
+    # step-2 update was suppressed because that step was self-advanced.
+    assert len(engine.beam_updates) == 2
+    decode_update, cleanup_update = engine.beam_updates
+    assert decode_update.session_id == "request-0-step-0-beam-0"
+    assert decode_update.beam_width == 2
+    assert decode_update.beam_tokens == [[11], [12]]
+    assert cleanup_update.session_id == "request-0-step-0-beam-0"
+    assert cleanup_update.beam_width == 0
+    assert cleanup_update.pruned_ids == [
+        "request-0-step-2-beam-0",
+        "request-0-step-2-beam-1",
+    ]
+
+    # Both decode iterations still registered their output queue and
+    # awaited the engine result.
+    assert len(engine.register_calls) == 2
+    assert all(call.session_id == "request-0-step-0-beam-0" for call in engine.register_calls)
+
+    assert len(outputs) == 1
+    _assert_normal_output(outputs[0], "request-0")
+
+
+def test_self_advance_unflagged_decision_keeps_frontend_driven(
+    monkeypatch: Any,
+) -> None:
+    """Without the chained flag (self-advance disabled or a skip path in
+    EngineCore), the frontend keeps driving every step with its own
+    beam_request_step_update."""
+    _install_deterministic_request_ids(monkeypatch)
+    decision = {
+        "out_token_ids": [[21, 31]],
+        "out_token_index": [[0, 1]],
+        "out_log_probs": [[-0.3, -0.7]],
+    }
+    engine = _GroupedEngineClient(
+        prepare_outputs=[_engine_output(_flat([11, 12], [-0.1, -0.2]))],
+        grouped_outputs=[
+            _engine_output(None, kv_transfer_params={"beam_search_result": decision}),
+            _engine_output(
+                _combined_flat(
+                    [
+                        ([41, 42], [-0.1, -0.4]),
+                        ([51, 52], [-0.1, -0.4]),
+                    ]
+                )
+            ),
+        ],
+    )
+
+    outputs = _run_search(engine, max_tokens=3)
+
+    # Both decode steps sent their frontend-driven updates.
+    decode_step_1, decode_step_2, _cleanup = engine.beam_updates
+    assert decode_step_1.child_beam_ids == [
+        "request-0-step-1-beam-0",
+        "request-0-step-1-beam-1",
+    ]
+    assert decode_step_2.child_beam_ids == [
+        "request-0-step-2-beam-0",
+        "request-0-step-2-beam-1",
+    ]
+    assert len(engine.register_calls) == 2
+
+    assert len(outputs) == 1
+    _assert_normal_output(outputs[0], "request-0")

@@ -44,6 +44,57 @@ def get_worker_manager() -> ConstraintResourceManager:
     return _WORKER_MANAGER
 
 
+def load_constraint_tables_on_worker(worker: Any) -> bool:
+    """Preload the injected constraint tables onto the runner device.
+
+    Idempotent: a runner that already owns a loaded adapter (``_gr_constraint_execution``)
+    is left untouched.  When the worker has injected tables (the driver
+    broadcast them via ``EngineCore.collective_rpc``) and a runner is
+    available, the platform adapter is created and ``load_tables`` moves the
+    resource to the device — at weight-load time (``init_device``) or as soon
+    as the injection arrives (``set_gr_constraint_resources``), so the runtime
+    never pays a lazy build / H2D on the first constrained step.
+
+    ``worker`` may be the worker object (with ``model_runner``) or the runner
+    itself (which owns ``device`` / ``_gr_constraint_execution`` directly).
+
+    Returns:
+        ``True`` when tables were loaded (or already present), ``False`` when
+        nothing was injected yet or the runner is not available (the caller
+        keeps the current lazy path as a fallback).
+    """
+    runner = getattr(worker, "model_runner", None)
+    if runner is None and getattr(worker, "device", None) is not None:
+        # The caller passed the runner itself (constraint_hook path).
+        runner = worker
+    if runner is None:
+        return False
+    if getattr(runner, "_gr_constraint_execution", None) is not None:
+        return True
+    if getattr(runner, "device", None) is None:
+        # No device yet (mocked runners in tests, or device not initialised):
+        # keep the lazy runtime path — do not build an adapter against the
+        # default device here.
+        return False
+
+    manager = get_worker_manager()
+    digest = manager.current_digest
+    if digest is None:
+        return False
+
+    from vllm_gr.constraints.startup import create_constraint_execution
+
+    adapter = create_constraint_execution(device=getattr(runner, "device", None))
+    adapter.load_tables(manager.require(digest))
+    runner._gr_constraint_execution = adapter
+    logger.info(
+        "vllm-gr: worker preloaded constraint tables digest=%s onto %s",
+        digest,
+        getattr(runner, "device", None),
+    )
+    return True
+
+
 def set_gr_constraint_resources(
     self: Any,
     payload: dict,
@@ -86,6 +137,11 @@ def set_gr_constraint_resources(
     # request must never silently sample unconstrained.  Inert when ``self``
     # has no model_runner yet (unit tests / mocked workers).
     _verify_runner_sample_hook(self)
+    # Preload the tables onto the device now that the resource is registered
+    # (the runner is built when injection happens after init_device).  This is
+    # the Step-B half of moving load_tables to weight-load time: if the tables
+    # arrived after init_device, this closes the gap with no lazy runtime load.
+    load_constraint_tables_on_worker(self)
     logger.info(
         "vllm-gr: worker constraint tables digest=%s cached=%s",
         resource.digest,

@@ -215,6 +215,81 @@ def test_valid_candidate_mask_marks_padding() -> None:
     ]
 
 
+def test_load_constraint_tables_on_worker_preloads_to_device(
+    tokenizer: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Injected + device-backed runner preloads tables at weight-load time."""
+    from vllm_gr.constraints import worker_inject
+    from vllm_gr.constraints.worker_inject import (
+        load_constraint_tables_on_worker,
+    )
+
+    resource = _build_resource(tokenizer)
+    manager = ConstraintResourceManager()
+    manager.ensure(resource)
+    monkeypatch.setattr(worker_inject, "get_worker_manager", lambda: manager)
+
+    adapter = MagicMock()
+    monkeypatch.setattr(
+        "vllm_gr.constraints.startup.create_constraint_execution",
+        lambda **kw: adapter,
+    )
+
+    class FakeRunner:
+        device = "npu:0"
+        # Set by load_constraint_tables_on_worker; declared here so mypy can
+        # see the dynamic attribute, matching how the real runner exposes it.
+        _gr_constraint_execution: Any = None
+
+    runner = FakeRunner()
+    loaded = load_constraint_tables_on_worker(runner)
+
+    assert loaded is True
+    adapter.load_tables.assert_called_once()
+    assert runner._gr_constraint_execution is adapter
+    # Idempotent: second call reuses the cached adapter, no rebuild.
+    adapter.reset_mock()
+    assert load_constraint_tables_on_worker(runner) is True
+    adapter.load_tables.assert_not_called()
+
+
+def test_load_constraint_tables_on_worker_no_device_returns_false(
+    tokenizer: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner without a device (mocked) keeps the lazy runtime path."""
+    from vllm_gr.constraints import worker_inject
+    from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
+
+    resource = _build_resource(tokenizer)
+    manager = ConstraintResourceManager()
+    manager.ensure(resource)
+    monkeypatch.setattr(worker_inject, "get_worker_manager", lambda: manager)
+
+    class FakeRunner:
+        device = None
+
+    runner = FakeRunner()
+    assert load_constraint_tables_on_worker(runner) is False
+    assert not hasattr(runner, "_gr_constraint_execution")
+
+
+def test_load_constraint_tables_on_worker_nothing_injected_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.constraints import worker_inject
+    from vllm_gr.constraints.worker_inject import load_constraint_tables_on_worker
+
+    monkeypatch.setattr(worker_inject, "get_worker_manager", lambda: ConstraintResourceManager())
+
+    class FakeRunner:
+        device = "npu:0"
+
+    runner = FakeRunner()
+    assert load_constraint_tables_on_worker(runner) is False
+
+
 @pytest.mark.asyncio  # type: ignore[misc]
 async def test_inject_constraint_resources_async_forwards_to_collective_rpc_async(
     tokenizer: MagicMock,

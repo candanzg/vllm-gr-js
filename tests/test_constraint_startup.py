@@ -38,6 +38,20 @@ def _make_tokenizer() -> MagicMock:
     return result
 
 
+def _make_group_tokenizer() -> SimpleNamespace:
+    """Tokenizer with small s_a/s_b/s_c groups (IDs < vocab_size=1000)."""
+    added_vocab = {
+        "<s_a_0>": 10,
+        "<s_a_1>": 11,
+        "<s_b_0>": 20,
+        "<s_b_1>": 21,
+        "<s_b_2>": 22,
+        "<s_c_0>": 30,
+        "<s_c_1>": 31,
+    }
+    return SimpleNamespace(get_added_vocab=lambda: dict(added_vocab))
+
+
 @pytest.fixture  # type: ignore[misc]
 def tokenizer() -> MagicMock:
     return _make_tokenizer()
@@ -283,5 +297,54 @@ class TestPrepareConstraintTable:
                 catalog_path=str(triples_path),
                 tokenizer=_make_tokenizer(),
                 vocab_size=100,
+                gr_config=GRConfig(),
+            )
+
+    def test_auto_builds_from_tokenizer_groups(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """catalog_path=None builds the tables from s_a/s_b/s_c groups (ACS default)."""
+        _fake_activate_provider(monkeypatch, device_type="npu", adapter=_available_adapter())
+
+        resource = prepare_constraint_table(
+            catalog_path=None,
+            tokenizer=_make_group_tokenizer(),
+            vocab_size=1000,
+            gr_config=GRConfig(),
+        )
+
+        assert resource is not None
+        assert resource.vocab_size == 1000
+        assert resource.first_token_ids.tolist() == [10, 11]
+        assert resource.max_prefix1_degree == 3
+        assert resource.max_prefix2_degree == 2
+        assert resource.digest
+
+    def test_sentinel_path_selects_tokenizer_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The AUTO_CONSTRAINT_TABLE_PATH sentinel behaves like catalog_path=None."""
+        from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
+
+        _fake_activate_provider(monkeypatch, device_type="npu", adapter=_available_adapter())
+
+        resource = prepare_constraint_table(
+            catalog_path=AUTO_CONSTRAINT_TABLE_PATH,
+            tokenizer=_make_group_tokenizer(),
+            vocab_size=1000,
+            gr_config=GRConfig(),
+        )
+
+        assert resource is not None
+        assert resource.first_token_ids.tolist() == [10, 11]
+
+    def test_auto_build_fails_without_token_groups(
+        self, monkeypatch: pytest.MonkeyPatch, tokenizer: MagicMock
+    ) -> None:
+        """A tokenizer without s_a/s_b/s_c groups must fail, not fall back."""
+        _fake_activate_provider(monkeypatch, device_type="npu", adapter=_available_adapter())
+        tokenizer.get_added_vocab.return_value = {}
+
+        with pytest.raises(ValueError, match="requires a tokenizer with"):
+            prepare_constraint_table(
+                catalog_path=None,
+                tokenizer=tokenizer,
+                vocab_size=1000,
                 gr_config=GRConfig(),
             )

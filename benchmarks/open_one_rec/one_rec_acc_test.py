@@ -196,6 +196,17 @@ def main():
         "--catalog-path", type=str, default=None, help="Path to item validation (catalog) json file"
     )
     parser.add_argument(
+        "--constraint-backend",
+        type=str,
+        default=None,
+        choices=["trie", "constraint_table"],
+        help=(
+            "Constraint backend for constrained beam search. 'constraint_table' "
+            "requires --catalog-path to point at a tools/build_constraint_triples.py "
+            "triples document."
+        ),
+    )
+    parser.add_argument(
         "--beam-max-width",
         type=int,
         default=None,
@@ -258,6 +269,7 @@ def main():
                 trust_remote_code=True,
                 max_logprobs=gen_config.get("num_beams", 1) * 2,
                 catalog_path=args.catalog_path if args.catalog_path is not None else None,
+                constraint_backend=args.constraint_backend,
                 beam_max_width=beam_max_width,
                 attention_config={
                     "backend": args.backend if args.backend is not None else "CUSTOM"

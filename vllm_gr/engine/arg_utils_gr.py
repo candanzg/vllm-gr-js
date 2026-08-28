@@ -16,11 +16,39 @@ from vllm_gr.config import (
     GRConfigInput,
     write_canonical_gr_config,
 )
+from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
 from vllm_gr.config.parser import (
     GR_CONFIG_KEY,
     KNOWN_GR_CONFIG_KEYS,
     normalize_gr_config_input,
 )
+
+# Upper bound on beam_max_width for the NPU Constraint Table auto-promotion.
+# Mirrors vllm_gr.constraints.strategies.MAX_CONSTRAINT_BEAM_WIDTH (imported
+# lazily to keep the config-import graph flat here).
+_MAX_CONSTRAINT_TABLE_BEAM_WIDTH: Final = 256
+
+
+def _catalog_is_triples_document(catalog_path: str) -> bool:
+    """Return whether ``catalog_path`` holds a Constraint Tables triples doc.
+
+    The triples document produced by ``tools/build_constraint_triples.py`` is a
+    JSON object keyed by ``format_version`` / ``triples`` / ``sentinels`` /
+    ``relations``.  The Trie frontend catalog (``convert_catalog.py`` output,
+    and the inline serving-catalog tests) is a JSON *list* of token sequences.
+    The NPU auto-promotion must only fire on a triples document — promoting a
+    Trie-list catalog to the Worker-side Constraint Tables backend would feed a
+    list to ``compile_constraint_table_resource`` and fail fast.
+    """
+    try:
+        with open(catalog_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        # Unreadable / malformed: let the downstream compiler surface the
+        # precise error rather than guessing here.
+        return False
+    return isinstance(document, dict)
+
 
 origin_add_cli_args = EngineArgs.add_cli_args
 origin_create_engine_config = EngineArgs.create_engine_config
@@ -142,6 +170,41 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help="Upper bound on beam decode steps for the persistent beam KV "
         "pool (default 3, matching OneRec SID: max_tokens=5 minus begin/end).",
     )
+    model_group.add_argument(
+        "--beam-worker-decision",
+        action="store_true",
+        default=None,
+        help="Move the beam decision (beam_search_group / rec_final_select + "
+        "select_unshared_kv) into the NPU worker and return results via "
+        "ModelRunnerOutput.beam_search_result (ACS-aligned save flow). Only "
+        "takes effect on NPU + xllm decode execution with the xllm op library "
+        "present. Without this flag the frontend NumPy decision path is kept.",
+    )
+    model_group.add_argument(
+        "--no-beam-worker-decision",
+        action="store_false",
+        dest="beam_worker_decision",
+        default=None,
+        help="Explicitly keep the frontend NumPy beam decision path (opt-out "
+        "of worker-side beam decision).",
+    )
+    model_group.add_argument(
+        "--beam-self-advance",
+        action="store_true",
+        default=None,
+        help="Let EngineCore drive intermediate beam steps itself: the "
+        "worker's beam decision result is applied in-process to enqueue the "
+        "next beam-decode step, eliminating the per-step frontend RPC "
+        "round-trip. Requires --beam-worker-decision (NPU xllm path).",
+    )
+    model_group.add_argument(
+        "--no-beam-self-advance",
+        action="store_false",
+        dest="beam_self_advance",
+        default=None,
+        help="Explicitly keep the frontend RPC beam step-update loop (opt-out "
+        "of EngineCore self-advance).",
+    )
     return parser
 
 
@@ -159,6 +222,8 @@ def from_cli_args(cls, args: argparse.Namespace) -> EngineArgs:
     for attr in ("beam_max_width", "beam_max_decode_steps"):
         setattr(engine_args, attr, getattr(args, attr, None))
     engine_args.no_beam_graph = getattr(args, "no_beam_graph", False)
+    engine_args.beam_worker_decision = getattr(args, "beam_worker_decision", None)
+    engine_args.beam_self_advance = getattr(args, "beam_self_advance", None)
     # AttentionConfig normalizes explicit "auto" and JSON null to None. Keep
     # the CLI source information so both values can override a stale CUSTOM
     # marker rather than becoming indistinguishable from an omitted backend.
@@ -238,6 +303,36 @@ def _apply_npu_default_block_size(config) -> None:
         cache_config.block_size = 128
 
 
+def _is_npu_platform() -> bool:
+    """Return whether the active platform is an Ascend NPU."""
+    try:
+        from vllm.platforms import current_platform
+    except Exception:
+        return False
+    return getattr(current_platform, "device_type", None) == "npu"
+
+
+def _constraint_explicitly_configured(
+    engine_args: object,
+    existing_gr_config: GRConfig,
+) -> bool:
+    """Whether the user explicitly chose a constraint backend.
+
+    The NPU platform default (Constraint Tables + worker decision) must not
+    override an explicit user choice.  Any explicit backend (including an
+    explicit ``TRIE`` opt-out) suppresses the promotion to Constraint
+    Tables.  A catalog path alone does NOT suppress the promotion: on NPU
+    it is the constraint data source for the promoted backend (a Triples
+    document when Constraint Tables are promoted, the Trie catalog when
+    ``trie`` is explicit).
+    """
+    explicit_backend = (
+        getattr(engine_args, "constraint_backend", None) is not None
+        or existing_gr_config.constraint_backend is not ConstraintBackend.TRIE
+    )
+    return explicit_backend
+
+
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
     _apply_npu_default_block_size(config)
@@ -267,6 +362,8 @@ def create_engine_config(self, usage_context=None, headless=False):
         or getattr(self, "beam_max_width", None) is not None
         or getattr(self, "beam_max_decode_steps", None) is not None
         or bool(getattr(self, "no_beam_graph", False))
+        or getattr(self, "beam_worker_decision", None) is not None
+        or getattr(self, "beam_self_advance", None) is not None
         or backend_is_explicit
     )
 
@@ -303,8 +400,114 @@ def create_engine_config(self, usage_context=None, headless=False):
             if constraint_backend is not None
             else existing_gr_config.constraint_backend
         )
+        effective_beam_worker_decision = (
+            getattr(self, "beam_worker_decision", None)
+            if getattr(self, "beam_worker_decision", None) is not None
+            else existing_gr_config.beam_worker_decision
+        )
+        effective_beam_self_advance = (
+            getattr(self, "beam_self_advance", None)
+            if getattr(self, "beam_self_advance", None) is not None
+            else existing_gr_config.beam_self_advance
+        )
+        # Self-advance only applies when the worker decision path is active
+        # (the self-advance step consumes the worker's beam_search_result).
+        # Never silently enable it on the frontend NumPy decision path.
+        if effective_beam_self_advance and not effective_beam_worker_decision:
+            raise ValueError(
+                "beam_self_advance=True requires beam_worker_decision=True "
+                "(CLI --beam-worker-decision or additional_config "
+                "'vllm_gr_beam_worker_decision')"
+            )
+        # NPU platform default for beam-serve deployments: when the user
+        # enables beam search (beam_max_width) with a constraint catalog
+        # (a Triples document) and no explicit backend choice, run Constraint
+        # Tables with worker-side beam decision by default.  Promotion requires
+        # a catalog: the tokenizer auto-build sentinel would fail fast on
+        # models whose s_a/s_b/s_c groups exceed max_valid_items (e.g. OneRec
+        # 8192 > 500), so a catalog-free beam deployment stays unconstrained
+        # (legacy) instead.  This only fires on a real NPU device with an
+        # active beam pool, so non-GR / non-beam configs and non-NPU platforms
+        # are untouched.  beam_max_width is read from the parsed config (GRLLM
+        # rides it in additional_config) or the EngineArgs attribute (serve
+        # CLI).
+        beam_width_configured = (
+            getattr(self, "beam_max_width", None) is not None
+            or existing_gr_config.beam_max_width is not None
+        )
+        worker_decision_explicit = (
+            getattr(self, "beam_worker_decision", None) is not None
+            or existing_gr_config.beam_worker_decision is not None
+        )
+        # The auto-promotion must respect the Constraint Table capacity: the
+        # fused ``rec_constrained_topk`` kernel's top_k (== beam_width) is
+        # hard-capped at 256 (vllm_gr.constraints.strategies.
+        # MAX_CONSTRAINT_BEAM_WIDTH / ops.npu.rec_constrained_topk.MAX_TOP_K).
+        # Promoting a wider deployment (e.g. beam_max_width=512) would make
+        # every request fail the limit validation, so such deployments keep
+        # the default (unconstrained) backend instead.
+        effective_beam_max_width = (
+            getattr(self, "beam_max_width", None)
+            if getattr(self, "beam_max_width", None) is not None
+            else existing_gr_config.beam_max_width
+        )
+        beam_width_within_constraint_capacity = (
+            effective_beam_max_width is None
+            or effective_beam_max_width <= _MAX_CONSTRAINT_TABLE_BEAM_WIDTH
+        )
+        if (
+            _is_npu_platform()
+            and beam_width_configured
+            and beam_width_within_constraint_capacity
+            and not _constraint_explicitly_configured(self, existing_gr_config)
+            and effective_catalog_path is not None
+            and _catalog_is_triples_document(effective_catalog_path)
+        ):
+            # Promote to Constraint Tables on NPU beam deployments.  A user
+            # catalog_path is kept as-is: it is expected to be a
+            # tools/build_constraint_triples.py Triples document (the
+            # constraint data source for the promoted backend); only a triples
+            # document (JSON object) triggers the promotion, so a Trie-list
+            # catalog keeps its Trie semantics.  The sentinel auto-build path is
+            # NOT used here: a tokenizer whose s_a/s_b/s_c groups exceed
+            # max_valid_items fails fast (e.g. OneRec 8192>500), and a
+            # catalog-free GRLLM (no constraint data at all) must stay
+            # unconstrained (legacy) instead of force-building tables.  A
+            # catalog document is therefore required for the promotion.
+            effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
+        elif (
+            _is_npu_platform()
+            and effective_catalog_path is None
+            and beam_width_configured
+            and not beam_width_within_constraint_capacity
+            and not _constraint_explicitly_configured(self, existing_gr_config)
+        ):
+            logger.warning(
+                "NPU Constraint Table auto-promotion skipped: beam_max_width %s "
+                "exceeds the constraint_table beam-width cap %s "
+                "(fused rec_constrained_topk top_k limit); running beam "
+                "decode without constraint tables.",
+                effective_beam_max_width,
+                _MAX_CONSTRAINT_TABLE_BEAM_WIDTH,
+            )
+        # Worker-side beam decision is enabled on NPU by default for any beam
+        # deployment unless the user explicitly disabled it.  Independent of
+        # the Constraint Table promotion above (which may already be explicit
+        # via GRLLM passing the auto-build sentinel).
+        if _is_npu_platform() and beam_width_configured and not worker_decision_explicit:
+            if effective_beam_worker_decision is None:
+                effective_beam_worker_decision = True
         offset, slice_size = None, None
-        if effective_catalog_path is not None:
+        # Vocab slicing is computed from the Trie catalog's token-sequence
+        # list.  A Constraint Tables triples document is a relations dict (not
+        # a sequence list), and the two features are mutually exclusive anyway
+        # (validate_constraint_table_platform rejects the combination), so the
+        # slice computation must be skipped for the constraint_table backend.
+        if (
+            effective_catalog_path is not None
+            and effective_catalog_path != AUTO_CONSTRAINT_TABLE_PATH
+            and effective_constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
+        ):
             model_name = getattr(self, "model", None)
             if model_name is not None:
                 from vllm_gr.utils.catalog import (
@@ -345,6 +548,8 @@ def create_engine_config(self, usage_context=None, headless=False):
                 if getattr(self, "beam_max_decode_steps", None) is not None
                 else existing_gr_config.beam_max_decode_steps
             ),
+            beam_worker_decision=effective_beam_worker_decision,
+            beam_self_advance=effective_beam_self_advance,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )

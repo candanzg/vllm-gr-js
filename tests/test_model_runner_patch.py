@@ -139,3 +139,71 @@ def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
 
     assert getattr(Runner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
     assert model_runner_patch.is_worker_runner_patched(Runner)
+
+
+def test_npu_module_exports_sample_tokens_alias() -> None:
+    """The dispatcher looks up ``make_patched_sample_tokens`` by exact name.
+
+    The NPU module defines the implementation with an ``_npu`` suffix; the
+    module-level alias must exist or the hook is silently skipped and the
+    worker beam decision never reaches the ModelRunnerOutput under async
+    scheduling (regression: bw128_1k_t10 trace had 0 patched_sample_tokens
+    frames while the frontend kept its per-step RPC loop).
+    """
+    from vllm_gr.v1.worker import npu_model_runner_patch
+
+    assert npu_model_runner_patch.make_patched_sample_tokens is (
+        npu_model_runner_patch.make_patched_sample_tokens_npu
+    )
+
+
+def test_dispatcher_installs_sample_tokens_hook_when_exposed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker.model_runner_common import _WORKER_SAMPLE_TOKENS_PATCH_MARKER
+
+    class Runner:
+        def execute_model(self, scheduler_output: Any) -> None:
+            return None
+
+        def _prepare_inputs(
+            self,
+            scheduler_output: Any,
+            num_scheduled_tokens: Any,
+        ) -> tuple[object, object]:
+            return object(), object()
+
+        def _bookkeeping_sync(
+            self,
+            scheduler_output: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            return None
+
+        def sample_tokens(self, grammar_output: Any = None) -> Any:
+            return object()
+
+    def fake_sample_tokens_patch(orig: Any) -> Any:
+        def patched(self: Any, grammar_output: Any = None) -> Any:
+            return orig(self, grammar_output)
+
+        setattr(patched, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, True)
+        return patched
+
+    platform_module = SimpleNamespace(
+        discover_worker_runners=lambda: (("NPUModelRunner", Runner),),
+        make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
+        make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
+        make_patched_sample=gpu_model_runner_patch.make_patched_sample,
+        make_patched_sample_tokens=fake_sample_tokens_patch,
+    )
+    monkeypatch.setattr(
+        model_runner_patch,
+        "_get_active_platform_module",
+        lambda: platform_module,
+    )
+
+    model_runner_patch.apply_worker_patches()
+
+    assert getattr(Runner.sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False)

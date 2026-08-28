@@ -86,12 +86,32 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
             raise NotImplementedError
 
     class LLM:
-        """Stand-in for vLLM's LLM base; records the super().__init__ kwargs."""
+        """Stand-in for vLLM's LLM base; records the super().__init__ kwargs.
+
+        Models the contract ``GRLLM.__init__`` relies on after the runtime
+        wiring landed: ``llm_engine.vllm_config.additional_config`` carries
+        the GR values the (patched) ``EngineArgs.create_engine_config``
+        threaded through ``super().__init__`` kwargs — the same round-trip
+        the real flow produces, so GRLLM's post-super resolution reads back
+        exactly what it passed down.
+        """
 
         def __init__(self, model: str = "", **kwargs: Any) -> None:
             self.model = model
             self._last_kwargs = kwargs
-            self.llm_engine = SimpleNamespace(model_config=SimpleNamespace(vocab_size=100))
+            additional_config: dict[str, Any] = {}
+            catalog_path = kwargs.get("catalog_path")
+            constraint_backend = kwargs.get("constraint_backend")
+            if catalog_path is not None:
+                additional_config["vllm_gr_catalog_path"] = catalog_path
+            if constraint_backend is not None:
+                additional_config["vllm_gr_constraint_backend"] = str(constraint_backend)
+            self.llm_engine = SimpleNamespace(
+                # Post-wiring GRLLM calls model_config.get_vocab_size() for
+                # the Constraint Table install; model the method form.
+                model_config=SimpleNamespace(vocab_size=100, get_vocab_size=lambda: 100),
+                vllm_config=SimpleNamespace(additional_config=additional_config),
+            )
 
         def get_tokenizer(self) -> Any:
             return SimpleNamespace()
@@ -150,6 +170,16 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
         "vllm.engine": ModuleType("vllm.engine"),
         "vllm.engine.arg_utils": _module("vllm.engine.arg_utils", EngineArgs=EngineArgs),
         "vllm.utils": ModuleType("vllm.utils"),
+        # ``GRLLM.__init__`` calls ``vllm_gr.plugin.initialize_runtime()`` →
+        # ``check_environment()`` → ``from vllm.platforms import
+        # current_platform``.  The real ``vllm.platforms`` would import
+        # ``vllm.utils.import_utils`` through the fake non-package
+        # ``vllm.utils`` above, so it must be faked as well.  A non-npu
+        # device_type keeps the check on the version-only path.
+        "vllm.platforms": _module(
+            "vllm.platforms",
+            current_platform=SimpleNamespace(device_type="cpu"),
+        ),
         # ``vllm_gr.utils.catalog`` imports ``TokenizerLike`` at runtime; the
         # real ``vllm.tokenizers`` package pulls in ``vllm.utils.import_utils``,
         # which the fake ``vllm.utils`` above shadows.  Faking it here keeps
@@ -291,6 +321,7 @@ class TestGrllmThreadsBackendIntoSuper:
     def _import_gr_and_patch_strategy(self, monkeypatch: pytest.MonkeyPatch) -> Any:
         """Import GRLLM with the strategy/install call sites stubbed out."""
         import vllm_gr.entrypoints.gr as gr
+        import vllm_gr.plugin as plugin
         from vllm_gr.constraints.strategies import ConstraintTableStrategy
 
         monkeypatch.setattr(
@@ -303,6 +334,18 @@ class TestGrllmThreadsBackendIntoSuper:
             "install_constraint_table",
             lambda engine, *, catalog_path, tokenizer, vocab_size: SimpleNamespace(digest="d-123"),
         )
+        # ``GRLLM.__init__`` runs the full runtime initialization
+        # (check_environment + re_apply_patches + EngineCore entrypoint swap).
+        # The patch plan imports real vLLM serving/engine modules, which the
+        # fake non-package ``vllm.utils`` above shadows; the entrypoint swap
+        # additionally patches the real ``EngineCoreProc``.  Neither belongs
+        # to the wiring contract under test here (see
+        # test_pangu_llm_passthrough.py for initialize_runtime coverage), so
+        # both are stubbed at the plugin boundary.
+        monkeypatch.setattr(plugin, "initialize_runtime", lambda: {"patch_count": 0})
+        import vllm_gr.entrypoints.openai.beam_search_patch as beam_search_patch
+
+        monkeypatch.setattr(beam_search_patch, "patch_engine_core_process_entrypoint", lambda: None)
         return gr
 
     def test_grllm_forwards_constraint_table_to_super(
@@ -337,8 +380,11 @@ class TestGrllmThreadsBackendIntoSuper:
 
         llm = GRLLM(model="Qwen/Qwen3-1.7B")
 
+        # constraint_backend default is None (not the TRIE enum): the
+        # arg_utils_gr patch treats the enum default as omitted so a
+        # canonical config can pass through **kwargs unchanged.
         assert llm._last_kwargs["catalog_path"] is None
-        assert llm._last_kwargs["constraint_backend"] is ConstraintBackend.TRIE
+        assert llm._last_kwargs["constraint_backend"] is None
         assert llm.constraint_strategy is None
         assert llm.catalog is None
 
@@ -369,18 +415,26 @@ class TestGrllmThreadsBackendIntoSuper:
     def test_grllm_trie_catalog_without_patch_is_unchanged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A Trie catalog (default backend) must not demand the arg_utils patch.
+        """A Trie catalog (default backend) must not demand an explicit backend.
 
         Regression: the Pangu OneRec offline benchmark constructs
-        ``GRLLM(model, catalog_path=...)`` with the default Trie backend.  The
-        Trie catalog is handled driver-side, so this must not raise even when
-        the vllm-gr plugin has not run yet (vLLM 0.22 loads general plugins
-        lazily from inside ``EngineArgs.__init__``).
+        ``GRLLM(model, catalog_path=...)`` with the default Trie backend.
+        ``GRLLM.__init__`` now runs ``initialize_runtime()`` explicitly, so the
+        EngineArgs patch is always active by the time the kwargs are threaded;
+        the catalog reaches ``vllm_config.additional_config`` and the strategy
+        is built from the resolved config.  With the patch genuinely absent
+        (a defensive-only state) construction must still not raise — the
+        strategy is simply not built.
         """
         self._import_gr_and_patch_strategy(monkeypatch)
+        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
         from vllm_gr.entrypoints.gr import GRLLM
 
+        # Patch-active (the guaranteed post-initialize_runtime state): the
+        # catalog threads through and the strategy builds from the config.
+        patch_add_cli_args()
         llm = GRLLM(model="Qwen/Qwen3-1.7B", catalog_path="/models/catalog.json")
 
-        assert llm._last_kwargs == {}  # no values threaded (patch inactive)
+        assert llm._last_kwargs["catalog_path"] == "/models/catalog.json"
+        assert llm._last_kwargs["constraint_backend"] is None
         assert llm.constraint_strategy is not None

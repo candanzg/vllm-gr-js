@@ -344,11 +344,17 @@ jobs:
             -t video \
             -d ./OpenOneRec/benchmark_data \
             -o generated_data/video_catalog.json
+          python ./tools/build_constraint_triples.py \
+            --catalog generated_data/video_catalog.json \
+            --output generated_data/video_constraint_triples.json \
+            --begin "<|sid_begin|>" \
+            --end "<|sid_end|>"
 
       - name: Execute decode benchmark gates
         env:
           DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
           CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
+          TRIPLES_PATH: ${{ github.workspace }}/generated_data/video_constraint_triples.json
         run: ./tests/system/run_benchmark_and_verify.sh
 
       - name: Check clear device

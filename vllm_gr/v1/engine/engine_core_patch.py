@@ -5,6 +5,7 @@ ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 
+import time
 from functools import wraps
 
 from vllm.logger import init_logger
@@ -16,6 +17,7 @@ logger = init_logger(__name__)
 
 _BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
+_ENGINE_STEP_PATCH_MARKER = "_vllm_gr_beam_self_advance_step"
 
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
@@ -43,6 +45,56 @@ def make_patched_engine_core_init(original_init):
 
 
 # ---------------------------------------------------------------------------
+# EngineCoreProc._process_engine_step wrapper (beam_self_advance hook)
+# ---------------------------------------------------------------------------
+
+
+def make_patched_process_engine_step(original_step):
+    """Wrap ``_process_engine_step`` to drive EngineCore self-advance.
+
+    The wrapper runs between ``step_fn()`` producing the step's
+    ``EngineCoreOutputs`` and those outputs being forwarded to the output
+    queue: the scheduler patch has already injected the worker's beam
+    decision into ``kv_transfer_params['beam_search_result']``, and
+    ``_beam_self_advance`` turns a non-terminal decision into the next
+    ``BeamRequestStepUpdate`` applied in-process (no frontend RPC).  The
+    chained step's ADD lands in ``input_queue`` before this iteration ends,
+    so the busy loop continues straight into the next decode step.
+
+    ``_beam_self_advance`` itself is a no-op when the beam_self_advance
+    config is off, so the wrapper is safe for every engine.
+    """
+
+    if getattr(original_step, _ENGINE_STEP_PATCH_MARKER, False):
+        return original_step
+
+    @wraps(original_step)
+    def patched_process_engine_step(self):
+        from vllm_gr.v1.engine.core import _beam_self_advance
+
+        outputs, model_executed = self.step_fn()
+        if outputs:
+            try:
+                _beam_self_advance(self, outputs)
+            except Exception:
+                logger.exception(
+                    "vllm-gr: beam self-advance failed; falling back to the "
+                    "frontend step-update loop for this step"
+                )
+        for output in outputs.items() if outputs else ():
+            self.output_queue.put_nowait(output)
+        self.post_step(model_executed)
+
+        if not model_executed and self.scheduler.has_requests():
+            time.sleep(0.001)
+
+        return model_executed
+
+    setattr(patched_process_engine_step, _ENGINE_STEP_PATCH_MARKER, True)
+    return patched_process_engine_step
+
+
+# ---------------------------------------------------------------------------
 # Child-process patch applicator — called from patched run_engine_core
 # ---------------------------------------------------------------------------
 
@@ -52,6 +104,8 @@ def apply_engine_core_request_patches() -> None:
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
+        _apply_beam_step,
+        _beam_self_advance,
         _cache_beam_request,
         _handle_beam_request_step_update,
         process_input_sockets,
@@ -69,11 +123,23 @@ def apply_engine_core_request_patches() -> None:
     # Bind request handlers explicitly on both classes.
     EngineCore._cache_beam_request = _cache_beam_request
     EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCore._apply_beam_step = _apply_beam_step
+    EngineCore._beam_self_advance = _beam_self_advance
     EngineCoreProc._cache_beam_request = _cache_beam_request
     EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
+    EngineCoreProc._apply_beam_step = _apply_beam_step
+    EngineCoreProc._beam_self_advance = _beam_self_advance
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
+
+    # Self-advance hook: _process_engine_step feeds each step's outputs to
+    # _beam_self_advance BEFORE they reach the output queue, so the chained
+    # BeamRequestStepUpdate (built from the worker decision) can enqueue the
+    # next beam-decode ADD in the same busy-loop iteration.
+    EngineCoreProc._process_engine_step = make_patched_process_engine_step(
+        EngineCoreProc._process_engine_step
+    )
 
     EngineCore._patched_for_beam_requests = True
     EngineCoreProc._patched_for_beam_requests = True
@@ -309,3 +375,65 @@ def apply_scheduler_patch():
     setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)
     Scheduler._patched_for_beam_requests = True
     logger.debug("Scheduler.schedule patched for beam-requests propagation.")
+
+    # Also wrap update_from_output so the worker's beam decision
+    # (ModelRunnerOutput.beam_search_result) reaches the frontend via
+    # EngineCoreOutput.kv_transfer_params (ACS-aligned save flow).
+    _patch_scheduler_update_from_output(Scheduler)
+
+
+def _patch_scheduler_update_from_output(scheduler_cls) -> None:
+    """Carry ``ModelRunnerOutput.beam_search_result`` through kv_transfer_params.
+
+    The NPU worker attaches the beam decision dict to the ModelRunnerOutput
+    it returns (see ``_attach_beam_search_result`` in model_runner_common).
+    This wrapper reads it and injects it into the first EngineCoreOutput's
+    ``kv_transfer_params`` so the frontend can consume it from the streamed
+    RequestOutput without an extra round trip.  Pure beam-decode batches carry
+    exactly one logical session request by design (max_batch=1), so attaching
+    to the first output of a beam session is unambiguous.
+    """
+    marker = "_vllm_gr_update_from_output_patch"
+    if getattr(scheduler_cls.update_from_output, marker, False):
+        return
+
+    _original_update = scheduler_cls.update_from_output
+
+    @wraps(_original_update)
+    def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
+        result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
+
+        beam_search_result = getattr(model_runner_output, "beam_search_result", None)
+        if beam_search_result is None:
+            return result
+
+        # Attach to exactly one EngineCoreOutput (the first beam-session
+        # output in this step).  The dict payload carries host tensors; the
+        # IPC envelope only serialises the kv_transfer_params mapping, so host
+        # tensors are safe here (they were D2H'd by the worker).
+        beam_data = getattr(scheduler_output, "beam_data", {})
+        beam_ids = {
+            req_id for req_id, mdata in beam_data.items() if mdata.get("is_beam_decode", False)
+        }
+        attached = False
+        for ec_outputs in result.values():
+            if attached:
+                break
+            for out in getattr(ec_outputs, "outputs", []):
+                if out.request_id not in beam_ids:
+                    continue
+                kv_params = dict(out.kv_transfer_params or {})
+                kv_params["beam_search_result"] = beam_search_result
+                out.kv_transfer_params = kv_params
+                attached = True
+                break
+        if not attached:
+            logger.debug(
+                "vllm-gr: beam_search_result present but no matching EngineCoreOutput "
+                "in this step; the decision was dropped (num_beam_ids=%d)",
+                len(beam_ids),
+            )
+        return result
+
+    setattr(patched_update_from_output, marker, True)
+    scheduler_cls.update_from_output = patched_update_from_output

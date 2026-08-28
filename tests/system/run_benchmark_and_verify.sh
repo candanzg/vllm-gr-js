@@ -77,6 +77,40 @@ elapsed_time_offline_th="$ELAPSED_TIME_OFFLINE_THRESHOLD"
 p99_ttft_th="$P99_TTFT_THRESHOLD"
 p99_tpot_th="$P99_TPOT_THRESHOLD"
 
+# Constraint Tables are only available on NPU (the CUDA platform provider has
+# no constrained-top-k execution adapter and fails fast at startup), so the
+# constraint_table backend is enabled only there.  The branch keys off the
+# actual hardware (npu-smi presence, same probe the CI policy resolver uses),
+# not the BENCHMARK_DEVICE policy label: a gpu-labeled local run on an NPU box
+# would otherwise hand the raw Trie catalog to the NPU platform default
+# (auto-promoted constraint_table), which rejects it as a non-triples document.
+#
+# The triples document follows the video_catalog.json generation flow: CI
+# pre-generates it in the "Build catalog" step (tools/build_constraint_triples.py)
+# and passes TRIPLES_PATH, mirroring CATALOG_PATH.  When it is absent (local
+# runs) it is derived from the catalog location and built on demand.
+constraint_backend_args=(--catalog-path "$CATALOG_PATH")
+if [[ "$device" == "npu" ]] || command -v npu-smi > /dev/null 2>&1; then
+  triples_path="${TRIPLES_PATH:-$(dirname "$CATALOG_PATH")/video_constraint_triples.json}"
+  if [[ ! -f "$triples_path" ]]; then
+    echo "Building Constraint Tables triples: $triples_path"
+    if ! python tools/build_constraint_triples.py \
+        --catalog "$CATALOG_PATH" \
+        --output "$triples_path" \
+        --begin "<|sid_begin|>" \
+        --end "<|sid_end|>"; then
+      echo "Error: failed to build video_constraint_triples.json from $CATALOG_PATH" >&2
+      exit 1
+    fi
+  else
+    echo "Using pre-built Constraint Tables triples: $triples_path"
+  fi
+  constraint_backend_args=(
+    --constraint-backend constraint_table
+    --catalog-path "$triples_path"
+  )
+fi
+
 echo "Using model: $MODEL_PATH"
 echo "Using dataset: $DATASET_PATH"
 echo "Using catalog: $CATALOG_PATH"
@@ -132,7 +166,7 @@ output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --max-concurrency 1 \
   --use-beam-search \
   --task-type video \
-  --catalog-path "$CATALOG_PATH" \
+  "${constraint_backend_args[@]}" \
   --backend CUSTOM \
   "${beam_graph_args[@]}" \
   --n "$beam_width")
@@ -197,7 +231,7 @@ vllm-gr serve \
   --max_num_seqs 2048 \
   --max_num_batched_tokens 16384 \
   --scheduling-policy priority \
-  --catalog-path "$CATALOG_PATH" \
+  "${constraint_backend_args[@]}" \
   --attention-backend CUSTOM \
   "$MODEL_PATH" &
 SERVER_PID=$!

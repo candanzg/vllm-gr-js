@@ -811,7 +811,7 @@ class TestBeamCache:
         eng = _make_engine_self()
         req = _make_mock_request(request_id="r0")
         req.sampling_params.logprobs = 4
-        with patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True):
+        with patch("vllm_gr.v1.engine.core._engine_constraint_table_active", return_value=True):
             _cache_beam_request(eng, req)
 
         assert req.is_constraint_prefill is True
@@ -828,7 +828,7 @@ class TestBeamCache:
         eng = _make_engine_self()
         req = _make_mock_request(request_id="r0")
         req.sampling_params.logprobs = None  # beam width is carried on logprobs
-        with patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True):
+        with patch("vllm_gr.v1.engine.core._engine_constraint_table_active", return_value=True):
             _cache_beam_request(eng, req)
 
         assert req.is_constraint_prefill is True
@@ -846,7 +846,7 @@ class TestBeamCache:
         )
         with (
             patch("vllm.v1.request.Request") as MockReq,
-            patch("vllm_gr.v1.engine.core._constraint_table_backend_active", return_value=True),
+            patch("vllm_gr.v1.engine.core._engine_constraint_table_active", return_value=True),
         ):
             mock_req = SimpleNamespace(block_hashes=[], num_computed_tokens=6)
             MockReq.return_value = mock_req
@@ -2011,3 +2011,100 @@ class TestBeamKernelsDynamicBeamCount:
         )
         for i in range(W):
             assert torch.equal(key_cache[slot, i, :, 0, :], curr_key[(i + 1) % W])
+
+
+# ---------------------------------------------------------------------------
+# 8 — Worker decision payload flattening  (frontend consumer)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerDecisionFlatten:
+    """_worker_decision_flatten must accept every payload shape that reaches
+    the frontend via ``kv_transfer_params['beam_search_result']``.
+
+    The untyped mapping only round-trips plain containers through msgpack,
+    so the worker normalizes tensors to nested lists at the D2H boundary;
+    in-process paths may still hand over host tensors.  The historical
+    ``reshape(-1).tolist()`` crashed on lists (AttributeError)."""
+
+    @staticmethod
+    def _parents(num_beams: int = 2) -> list[Any]:
+        from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
+
+        return [
+            BeamSearchSequence(
+                orig_prompt={"type": "token", "prompt_token_ids": [1]},
+                tokens=[1],
+                logprobs=[],
+                cum_logprob=-1.0 * i,
+            )
+            for i in range(num_beams)
+        ]
+
+    def test_list_payload_flattens(self) -> None:
+        from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_flatten
+
+        decision = {
+            "out_token_ids": [[11, 12]],
+            "out_token_index": [[0, 1]],
+            "out_log_probs": [[-1.5, -2.5]],
+            "is_last_step": False,
+        }
+        ids, lps, parent, cache = _worker_decision_flatten(decision, 2, self._parents())
+
+        assert ids == [11, 12]
+        assert lps == [-1.5, -2.5]
+        assert parent == [0, 1]
+        # local logprob = cumulative - parent cumulative
+        # (parents carry cum_logprob -0.0 / -1.0)
+        assert cache == [([11], [-1.5], [0], [None]), ([12], [-1.5], [0], [None])]
+
+    def test_tensor_payload_flattens(self) -> None:
+        import torch
+
+        from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_flatten
+
+        decision = {
+            "out_token_ids": torch.tensor([[11, 12]], dtype=torch.int32),
+            "out_token_index": torch.tensor([[0, 1]], dtype=torch.int32),
+            "out_log_probs": torch.tensor([[-1.5, -2.5]], dtype=torch.float32),
+        }
+        ids, lps, parent, _ = _worker_decision_flatten(decision, 2, self._parents())
+
+        assert ids == [11, 12]
+        assert lps == [-1.5, -2.5]
+        assert parent == [0, 1]
+
+    def test_request_offset_stripped_from_parents(self) -> None:
+        """out_token_index keeps the GLOBAL request offset (batch == 1: offset 0)."""
+        from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_flatten
+
+        decision = {
+            "out_token_ids": [[11, 12]],
+            "out_token_index": [[2, 3]],  # == 0 + beam_width offset
+            "out_log_probs": [[-1.5, -2.5]],
+        }
+        _, _, parent, _ = _worker_decision_flatten(decision, 2, self._parents())
+        assert parent == [0, 1]
+
+    def test_width_mismatch_returns_none(self) -> None:
+        from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_flatten
+
+        decision = {
+            "out_token_ids": [[11, 12, 13]],
+            "out_token_index": [[0, 1, 2]],
+            "out_log_probs": [[-1.5, -2.5, -3.5]],
+        }
+        assert _worker_decision_flatten(decision, 2, self._parents()) is None
+
+    def test_serialized_tensor_triple_returns_none(self) -> None:
+        """An unnormalized encoder-triple payload is unrecoverable data:
+        fall back to the legacy flat-logprobs path, never crash."""
+        from vllm_gr.entrypoints.openai.serving_engine import _worker_decision_flatten
+
+        decision = {
+            "out_token_ids": ["int64", [1, 2], 0],
+            "out_token_index": ["int64", [1, 2], 1],
+            "out_log_probs": ["float32", [1, 2], 2],
+        }
+        assert _worker_decision_flatten(decision, 2, self._parents()) is None

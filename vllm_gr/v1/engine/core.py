@@ -28,6 +28,13 @@ def _constraint_table_backend_active() -> bool:
     Reads the process-global vLLM config (same source as ``ascend_compat``) so
     both the driver and the EngineCore process agree without passing the flag
     around the request path.
+
+    NOTE: ``get_current_vllm_config_or_none()`` can return ``None`` inside the
+    EngineCore process (the global config hook is not always installed there),
+    which would silently read as the default TRIE backend.  Callers inside the
+    EngineCore must prefer the engine's own ``vllm_config`` (see
+    :func:`_handle_beam_request_step_update`); this fallback only fires when no
+    config is available at all.
     """
     from vllm.config import get_current_vllm_config_or_none
 
@@ -35,6 +42,21 @@ def _constraint_table_backend_active() -> bool:
 
     return (
         GRConfig.from_vllm_config(get_current_vllm_config_or_none()).constraint_backend
+        == ConstraintBackend.CONSTRAINT_TABLE
+    )
+
+
+def _engine_constraint_table_active(engine: Any) -> bool:
+    """Whether the EngineCore's own config selects Constraint Tables.
+
+    The EngineCore holds ``self.vllm_config``; reading the constraint backend
+    from it is authoritative and does not depend on the process-global config
+    hook (which may be None in the EngineCore subprocess).
+    """
+    from vllm_gr.config import ConstraintBackend, GRConfig
+
+    return (
+        GRConfig.from_vllm_config(getattr(engine, "vllm_config", None)).constraint_backend
         == ConstraintBackend.CONSTRAINT_TABLE
     )
 
@@ -125,7 +147,7 @@ def _cache_beam_request(self, request) -> None:
             "num_prompt_tokens": request.num_prompt_tokens,
         }
 
-    if _constraint_table_backend_active():
+    if _engine_constraint_table_active(self):
         # Constraint Tables generate the step-0 candidates in the Worker from
         # the raw prefill logits.  Only beam-session prefills reach this cache
         # (ADD_BATCH), so any such request is the session's constrained prefill.
@@ -139,9 +161,27 @@ def _cache_beam_request(self, request) -> None:
 
 def _handle_beam_request_step_update(self, update) -> None:
     """Apply a grouped step update using only the prefill cache entry."""
+    _ensure_beam_state(self)
+    _apply_beam_step(self, update)
+
+
+def _apply_beam_step(self, update) -> bool:
+    """Reusable body of the BEAM_REQUEST_STEP_UPDATE handler.
+
+    Validates the parallel arrays on ``update``, rebuilds a single beam
+    decode ``Request`` from the session's prefill cache entry, enqueues it,
+    and drains pruned children.  Split from
+    :func:`_handle_beam_request_step_update` so future EngineCore-internal
+    callers (e.g. self-resume) can drive a step without going through the
+    ZMQ input socket.
+
+    Returns True only when a beam-decode Request was actually enqueued
+    (ADD landed in ``input_queue``); every validation / cleanup path that
+    chains nothing returns False so callers can tell whether the engine is
+    now running the next step.
+    """
     from vllm.v1.request import Request
 
-    _ensure_beam_state(self)
     session_id = update.session_id
     beam_width = update.beam_width
 
@@ -168,7 +208,7 @@ def _handle_beam_request_step_update(self, update) -> None:
         self.aborts_queue.put_nowait(session_id)
         for abort_id in update.pruned_ids:
             self.aborts_queue.put_nowait(abort_id)
-        return
+        return False
 
     # Validate parallel arrays
     if (
@@ -194,7 +234,7 @@ def _handle_beam_request_step_update(self, update) -> None:
                     ),
                 )
             )
-        return
+        return False
 
     # Fetch the shared prefill cache entry
     with self.beam_cache_lock:
@@ -219,7 +259,7 @@ def _handle_beam_request_step_update(self, update) -> None:
                     ),
                 )
             )
-        return
+        return False
 
     arrival = time.time()
     prefill_tokens = session_cached["all_token_ids"]
@@ -293,7 +333,7 @@ def _handle_beam_request_step_update(self, update) -> None:
     # Store max decode steps for KV pool pre-allocation
     req.max_decode_steps = update.max_decode_steps
 
-    if _constraint_table_backend_active():
+    if _engine_constraint_table_active(self):
         # Constraint Table decode: the Worker runs the constrained top-k
         # operator at raw-logits time.  constraint_step equals the number of
         # generated tokens so far (1 or 2 under the 3-step cap); beam_suffix
@@ -309,6 +349,181 @@ def _handle_beam_request_step_update(self, update) -> None:
 
     for abort_id in update.pruned_ids:
         self.aborts_queue.put_nowait(abort_id)
+
+    # Record the running step state so EngineCore self-advance
+    # (beam_self_advance) can construct the NEXT BeamRequestStepUpdate from
+    # the worker's beam decision without a frontend round-trip: the new beam
+    # suffixes extend the recorded ones, and the routing fields (client,
+    # wave, priority, sampling params) are replayed unchanged.
+    with self.beam_cache_lock:
+        cached = self.beam_cache.get(session_id)
+        if cached is not None:
+            cached["running_suffix"] = {
+                "beam_tokens": [list(t) for t in update.beam_tokens],
+                "prefix_len": update.prefix_len,
+                "beam_width": beam_width,
+                "sampling_params": update.sampling_params,
+                "eos_token_id": eos_token_id,
+                "client_index": update.client_index,
+                "current_wave": update.current_wave,
+                "priority": update.priority,
+                "data_parallel_rank": update.data_parallel_rank,
+                "lora_request": (update.lora_request or lora_request),
+                "cache_salt": (update.cache_salt or cache_salt),
+                "trace_headers": update.trace_headers,
+                "max_decode_steps": update.max_decode_steps,
+                "is_constrained": bool(getattr(req, "is_constrained", False)),
+            }
+    return True
+
+
+def _engine_self_advance_active(engine: Any) -> bool:
+    """Whether EngineCore self-advance (beam_self_advance) is enabled.
+
+    The result is cached on the engine instance so the per-step hook stays
+    cheap; the underlying GRConfig read parses additional_config once.
+    """
+    cached = getattr(engine, "_vllm_gr_self_advance", None)
+    if cached is not None:
+        return cached
+    from vllm_gr.config import GRConfig
+
+    active = bool(GRConfig.from_vllm_config(getattr(engine, "vllm_config", None)).beam_self_advance)
+    engine._vllm_gr_self_advance = active
+    return active
+
+
+def _beam_self_advance(self, engine_core_outputs) -> None:
+    """Chain the next beam-decode step from the worker's beam decision.
+
+    Called after ``scheduler.update_from_output`` produced the step's
+    outputs (the scheduler patch already injected the worker decision into
+    ``EngineCoreOutput.kv_transfer_params['beam_search_result']``).  When
+    self-advance is enabled and the decision is non-terminal, assemble the
+    next :class:`BeamRequestStepUpdate` in-process and apply it directly —
+    no frontend RPC round-trip.  Terminal decisions stop the chain; the
+    frontend then only needs the final output + cleanup.
+    """
+    if not engine_core_outputs:
+        return
+    if not _engine_self_advance_active(self):
+        return
+    for ec_outputs in engine_core_outputs.values():
+        for out in getattr(ec_outputs, "outputs", []):
+            kv_params = getattr(out, "kv_transfer_params", None) or {}
+            decision = kv_params.get("beam_search_result")
+            if decision is None:
+                continue
+            _beam_advance_from_decision(self, out.request_id, decision)
+            return
+
+
+def _beam_advance_from_decision(self, session_id: str, decision: Any) -> None:
+    """Build and apply the next step update from a worker beam decision."""
+    from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+
+    # A non-Mapping payload cannot be a worker decision; leave the frontend
+    # path untouched rather than failing the step.
+    if not isinstance(decision, dict):
+        return
+
+    if decision.get("is_last_step"):
+        # Terminal decision: stop chaining.  The frontend consumes the final
+        # output (out_sequence + cumulative scores) and sends the cleanup
+        # update (beam_width=0) which pops the beam_cache entry.
+        return
+
+    out_token_ids = decision.get("out_token_ids")
+    out_token_index = decision.get("out_token_index")
+    if out_token_ids is None or out_token_index is None:
+        logger.debug("vllm-gr: beam self-advance skipped (no candidate tensors) for %s", session_id)
+        return
+
+    from vllm_gr.v1.beam.beam_decision import flatten_decision_value
+
+    tokens_flat = flatten_decision_value(out_token_ids)
+    parents_flat = flatten_decision_value(out_token_index)
+    if tokens_flat is None or parents_flat is None:
+        logger.debug(
+            "vllm-gr: beam self-advance skipped (unflattenable candidate payload) for %s",
+            session_id,
+        )
+        return
+
+    _ensure_beam_state(self)
+    with self.beam_cache_lock:
+        session_cached = self.beam_cache.get(session_id)
+        running_raw = session_cached.get("running_suffix") if session_cached else None
+        running = dict(running_raw) if running_raw is not None else None
+
+    if running is None:
+        # The session was never seeded with running-suffix state (e.g. the
+        # flag was enabled mid-session); nothing to chain from.
+        logger.debug("vllm-gr: beam self-advance skipped (no running_suffix) for %s", session_id)
+        return
+
+    # Worker decision row 0 is this session's row (pure beam-decode batches
+    # carry exactly one session, max_batch=1); the request offset is 0 so the
+    # indices are already request-local parents.  The payload may be host
+    # tensors (in-process) or nested lists (post-IPC normalization).
+    parents = [int(p) for p in parents_flat]
+    new_tokens = [int(t) for t in tokens_flat]
+    beam_width = running["beam_width"]
+    if len(parents) != len(new_tokens) or not parents:
+        logger.warning(
+            "vllm-gr: beam self-advance skipped (decision width %d != recorded %d)",
+            len(parents),
+            beam_width,
+        )
+        return
+
+    prev_suffixes = running["beam_tokens"]
+    if any(p < 0 or p >= len(prev_suffixes) for p in parents):
+        logger.warning(
+            "vllm-gr: beam self-advance skipped (parent index out of range) for %s",
+            session_id,
+        )
+        return
+
+    new_suffixes = [prev_suffixes[p] + [t] for p, t in zip(parents, new_tokens)]
+    step = len(new_suffixes[0])
+
+    update = BeamRequestStepUpdate(
+        session_id=session_id,
+        # Tracking-only ids: EngineCore requests run under the single
+        # session_id, so these are never scheduler request ids.  pruned_ids
+        # are empty for the same reason (aborting unknown ids is a no-op).
+        parent_beam_ids=[f"{session_id}-sa-{step}-{p}" for p in parents],
+        child_beam_ids=[f"{session_id}-sa-{step}-{i}" for i in range(len(new_suffixes))],
+        beam_tokens=new_suffixes,
+        pruned_ids=[],
+        prefix_len=running["prefix_len"],
+        beam_width=beam_width,
+        sampling_params=running["sampling_params"],
+        eos_token_id=running["eos_token_id"],
+        client_index=running["client_index"],
+        current_wave=running["current_wave"],
+        priority=running["priority"],
+        data_parallel_rank=running["data_parallel_rank"],
+        lora_request=running["lora_request"],
+        cache_salt=running["cache_salt"],
+        trace_headers=running["trace_headers"],
+        parent_beam_indices=parents,
+        max_decode_steps=running["max_decode_steps"],
+        constraint_step=(step if running["is_constrained"] else 0),
+    )
+    if _apply_beam_step(self, update):
+        # Signal the frontend that this step was already chained in-process:
+        # the beam_search loop must skip its own beam_request_step_update
+        # for the next iteration, or scheduler.add_request would assert
+        # "duplicate request id" (the chained request is still running
+        # under session_id).  Mutating the shared decision dict is safe: it
+        # is the same object referenced by
+        # EngineCoreOutput.kv_transfer_params, which is forwarded to the
+        # frontend right after this hook returns.  Every skip path above
+        # (and _apply_beam_step's validation failures) leaves the flag
+        # unset, so the frontend-driven loop remains the automatic fallback.
+        decision["beam_self_advance_chained"] = True
 
 
 # ---------------------------------------------------------------------------

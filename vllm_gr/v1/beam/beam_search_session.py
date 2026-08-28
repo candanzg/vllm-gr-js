@@ -50,9 +50,20 @@ class BeamSearchSession:
         state.prefix_len = prefix_len
         state.is_last_step = False
         state.is_active = True
+        state.kv_reorder = None
         # Reset pool KV for this slot (clear stale data from previous sessions)
         for pool in self.context.pools:
             pool.reset_slot(self.slot)
+        # Reset the device-resident beam-decision state the same way (ACS
+        # ``BeamSearchBufferPool.reset_buffers`` semantics): without this a
+        # second session reusing the slot inherits the previous session's
+        # ``sequence`` / ``beam_scores`` / ``worker_decode_steps``, and
+        # ``init_beam_decision_state`` is silently skipped because
+        # ``worker_decode_steps != 0`` — every subsequent decision then reads
+        # a corrupted cumulative state.
+        decision = getattr(self.context, "decision", None)
+        if decision is not None:
+            decision.reset()
 
     def end_session(self):
         """End a beam search session. Releases slot from registry."""

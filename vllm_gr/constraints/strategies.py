@@ -186,14 +186,22 @@ def create_constraint_strategy(
     tokenizer: TokenizerLike,
     catalog_path: str | None,
 ) -> ConstraintStrategy | None:
-    """Create the configured strategy without silently changing backends."""
+    """Create the configured strategy without silently changing backends.
+
+    ``catalog_path`` may be ``None`` or the
+    :data:`~vllm_gr.config.models.AUTO_CONSTRAINT_TABLE_PATH` sentinel for the
+    Constraint Table backend: the tables are auto-built from the tokenizer's
+    s_a/s_b/s_c groups by ``install_constraint_table``, so no triples document
+    is required.  Trie still requires a real catalog path.
+    """
+    from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
 
     normalized_backend = (
         backend if isinstance(backend, ConstraintBackend) else ConstraintBackend(backend.lower())
     )
-    if catalog_path is None:
+    if catalog_path is None or catalog_path == AUTO_CONSTRAINT_TABLE_PATH:
         if normalized_backend is ConstraintBackend.CONSTRAINT_TABLE:
-            raise ValueError("constraint_backend='constraint_table' requires catalog_path")
+            return ConstraintTableStrategy(catalog_path)
         return None
     if normalized_backend is ConstraintBackend.TRIE:
         return TrieConstraintStrategy.load(tokenizer, catalog_path)

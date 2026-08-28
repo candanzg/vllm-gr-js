@@ -15,6 +15,7 @@ import gc
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,13 +41,48 @@ class TestPanguGrllmPassthrough(unittest.TestCase):
         """GRLLM should delegate construction to vLLM's LLM.__init__."""
         from vllm_gr.entrypoints.gr import GRLLM
 
-        with mock.patch(
-            "vllm.entrypoints.llm.LLM.__init__",
-            return_value=None,
-        ) as mock_llm_init:
+        # The mocked LLM.__init__ must leave behind the llm_engine attribute
+        # GRLLM.__init__ reads after super() (vllm_config resolution + the
+        # Constraint Table install).  The real vLLM initializer always sets it.
+        # ``mock.patch`` on an unbound __init__ receives only the call's
+        # kwargs (self is pre-bound), so the instance is captured by the
+        # wrapper below instead of a side_effect argument.
+        calls: list[dict] = []
+
+        # Assign a plain function as the class __init__: when GRLLM calls
+        # super().__init__(model=...), Python invokes it as a normal method
+        # with the instance as the first argument.
+        def bound_llm_init(llm_self, **kwargs):
+            # The real vLLM initializer always leaves ``llm_engine`` behind;
+            # GRLLM.__init__ reads it right after super() (vllm_config
+            # resolution + the Constraint Table install).
+            llm_self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(additional_config={}),
+                model_config=SimpleNamespace(get_vocab_size=lambda: 100),
+            )
+            llm_self.get_tokenizer = lambda: SimpleNamespace()
+            calls.append(kwargs)
+
+        with (
+            mock.patch(
+                "vllm.entrypoints.llm.LLM.__init__",
+                new=bound_llm_init,
+            ),
+            # GRLLM.__init__ explicitly runs the full runtime initialization
+            # (plugin patches + EngineCore entrypoint swap) before super();
+            # stub it so this test stays focused on the delegation contract
+            # and does not mutate real vLLM classes process-wide.
+            mock.patch(
+                "vllm_gr.plugin.initialize_runtime",
+                return_value={"patch_count": 0},
+            ),
+            mock.patch(
+                "vllm_gr.entrypoints.openai.beam_search_patch.patch_engine_core_process_entrypoint"
+            ),
+        ):
             GRLLM(model="/fake/pangu")
 
-        mock_llm_init.assert_called_once()
+        assert calls == [{"model": "/fake/pangu"}]
 
 
 class TestPanguPluginInitializeRuntime(unittest.TestCase):

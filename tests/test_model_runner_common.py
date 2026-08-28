@@ -48,6 +48,34 @@ def test_position_helpers_support_buffer_forms_and_partial_beam() -> None:
     assert torch.equal(device, host)
 
 
+def test_incremental_beam_decode_fills_constant_position_ids() -> None:
+    device = torch.full((6,), -1, dtype=torch.long)
+    host = torch.full((6,), -1, dtype=torch.long)
+
+    logits_indices: list[int] = []
+    result = common._process_beam_decode_request(
+        {
+            "prefix_len": 10,
+            "beam_width": 3,
+            "beam_decode_steps": 4,
+            "cache_len": 12,
+            "decode_step": 2,
+        },
+        seq_len=3,
+        token_offset=1,
+        gpu_pos=device,
+        cpu_pos=host,
+        new_logits_indices=logits_indices,
+        is_incremental=True,
+    )
+
+    assert result == (3, 3, 4, [0, 1, 2])
+    assert logits_indices == [1, 2, 3]
+    # Every beam consumes one token at position prefix_len + decode_step.
+    assert device.tolist() == [-1, 12, 12, 12, -1, -1]
+    assert torch.equal(device, host)
+
+
 def test_mixed_batch_remap_installs_functional_proxy() -> None:
     sampling_metadata = SimpleNamespace(
         temperature=torch.tensor([10, 20, 30, 40]),
@@ -109,6 +137,111 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
     proxy.passthrough = "updated"
     assert input_batch.passthrough == "updated"
     assert input_batch.logprob_token_ids == {}
+
+
+def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
+    """The remap runs once at proxy install; repeated reads hit the cache."""
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([20]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch = SimpleNamespace(
+        req_ids=["beam"],
+        logprob_token_ids={},
+        sampling_metadata=sampling_metadata,
+    )
+    runner = SimpleNamespace(
+        input_batch=input_batch,
+        positions=SimpleNamespace(
+            gpu=torch.zeros(8, dtype=torch.long),
+            cpu=torch.zeros(8, dtype=torch.long),
+        ),
+    )
+    scheduler_output = SimpleNamespace(
+        beam_data={
+            "beam": {
+                "is_beam_decode": True,
+                "prefix_len": 4,
+                "beam_width": 2,
+                "beam_decode_steps": 2,
+                "cache_len": 4,
+            }
+        }
+    )
+
+    common._beam_remap_inputs(runner, scheduler_output, [4])
+    proxy = runner.input_batch
+
+    # Eager warm: the metadata was remapped during _beam_remap_inputs
+    # (prepare phase), not deferred to the first _sample access.  One beam
+    # request with beam_width=2 → the 1-row temperature expands to 2 rows.
+    assert sampling_metadata.temperature.tolist() == [20, 20]
+    cache = object.__getattribute__(proxy, "_sampling_metadata_cache")
+    assert cache is sampling_metadata
+    idx_cache = object.__getattribute__(proxy, "_logits_idx_tensor_cache")
+    assert idx_cache is not None and idx_cache[1].tolist() == [0, 0]
+
+    # Cache hit: a fresh request-length tensor planted after the first read
+    # must NOT be re-expanded (the remap loop is skipped entirely on the
+    # second access).
+    sampling_metadata.temperature = torch.tensor([30])
+    assert proxy.sampling_metadata is sampling_metadata
+    assert proxy.sampling_metadata.temperature.tolist() == [30]
+
+
+def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None:
+    """A metadata swap (refresh_metadata / setattr) forces a fresh remap."""
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([10]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch = SimpleNamespace(req_ids=["beam"])
+    proxy = common.InputBatchProxy(input_batch, ["beam", "beam"], [0, 0], [0, 0])
+    input_batch.sampling_metadata = sampling_metadata
+
+    assert proxy.sampling_metadata is sampling_metadata
+    assert sampling_metadata.temperature.tolist() == [10, 10]
+
+    # Mid-step rebuild (refresh_metadata): a new metadata object with fresh
+    # per-request tensors is picked up and remapped despite the cache.
+    rebuilt = SimpleNamespace(
+        temperature=torch.tensor([7]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch.sampling_metadata = rebuilt
+    assert proxy.sampling_metadata is rebuilt
+    assert rebuilt.temperature.tolist() == [7, 7]
+
+    # Assignment through the proxy forwards to the underlying batch AND
+    # invalidates the cache, so the next read remaps the new object.
+    replaced = SimpleNamespace(
+        temperature=torch.tensor([5]),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    proxy.sampling_metadata = replaced
+    assert input_batch.sampling_metadata is replaced
+    assert proxy.sampling_metadata is replaced
+    assert replaced.temperature.tolist() == [5, 5]
 
 
 def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:
@@ -193,15 +326,14 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     should_raise = False
 
     def execute_model(self: Any, output: Any) -> str:
-        assert output is scheduler_output
         assert BEAM_DATA_VAR.get() is self._current_beam_info
         assert self._current_beam_info == {
-            "beam_data": scheduler_output.beam_data,
+            "beam_data": output.beam_data,
             "req_ids": [],
         }
         # The Constraint Tables _sample hook reads the scheduler output to find
         # _gr_request_row_configs; it must be published for the whole run.
-        assert self._current_scheduler_output is scheduler_output
+        assert self._current_scheduler_output is output
         if should_raise:
             raise ExpectedError
         return "result"
@@ -219,11 +351,28 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
         with pytest.raises(ExpectedError):
             wrapped(runner, scheduler_output)
         assert BEAM_DATA_VAR.get() is outer
+        should_raise = False
     finally:
         BEAM_DATA_VAR.reset(token)
 
+    # The beam context deliberately OUTLIVES execute_model: with async
+    # scheduling, sample_tokens (constraint hook + worker beam decision)
+    # runs AFTER execute_model returns and still needs the published
+    # context — including on the exception path (only the ContextVar is
+    # reset in the finally block).
+    assert runner._current_beam_data is scheduler_output.beam_data
+    assert runner._current_scheduler_output is scheduler_output
+    assert runner._current_beam_info == {
+        "beam_data": scheduler_output.beam_data,
+        "req_ids": [],
+    }
+
+    # A subsequent non-beam step overwrites the stale context at entry.
+    plain_output = SimpleNamespace(beam_data={})
+    assert wrapped(runner, plain_output) == "result"
     assert runner._current_beam_data == {}
-    assert runner._current_beam_info is None
+    assert runner._current_scheduler_output is plain_output
+    assert runner._current_beam_info == {"beam_data": {}, "req_ids": []}
 
 
 @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
@@ -347,3 +496,141 @@ def test_beam_session_rejects_concurrent_incremental_requests() -> None:
             beam_data,
             SimpleNamespace(beam_finished_session_ids=[]),
         )
+
+
+# ---------------------------------------------------------------------------
+# M2: inlined sample_tokens (merge the second collective_rpc into
+# execute_model; upstream core.py None short-circuit does the skipping)
+# ---------------------------------------------------------------------------
+
+
+def _m2_runner(
+    *,
+    beam_self_advance: bool = True,
+    beam_worker_decision: bool = True,
+    use_async_scheduling: bool = False,
+    pipeline_parallel_size: int = 1,
+    sample_tokens_return: Any = "mro",
+    sample_tokens_side_effect: Any = None,
+    state: Any = "state",
+) -> SimpleNamespace:
+    """Runner stub exercising the M2 gate + inline path in isolation."""
+    calls: list[Any] = []
+
+    def sample_tokens(grammar_output: Any) -> Any:
+        calls.append(grammar_output)
+        if sample_tokens_side_effect is not None:
+            raise sample_tokens_side_effect
+        return sample_tokens_return
+
+    runner = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(
+            beam_self_advance=beam_self_advance,
+            beam_worker_decision=beam_worker_decision,
+        ),
+        use_async_scheduling=use_async_scheduling,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size),
+        sample_tokens=sample_tokens,
+        execute_model_state=state,
+        _sample_tokens_calls=calls,
+    )
+    return runner
+
+
+def test_should_inline_sample_tokens_gate() -> None:
+    """Gate opens only with both opt-ins, sync scheduling, and PP=1."""
+    assert common._should_inline_sample_tokens(_m2_runner()) is True
+
+    assert common._should_inline_sample_tokens(_m2_runner(beam_self_advance=False)) is False
+    assert common._should_inline_sample_tokens(_m2_runner(beam_worker_decision=False)) is False
+    assert common._should_inline_sample_tokens(_m2_runner(use_async_scheduling=True)) is False
+    assert common._should_inline_sample_tokens(_m2_runner(pipeline_parallel_size=2)) is False
+    # Missing attributes read as their safe defaults (sync / PP=1).
+    minimal = SimpleNamespace(
+        _vllm_gr_config=SimpleNamespace(beam_self_advance=True, beam_worker_decision=True)
+    )
+    assert common._should_inline_sample_tokens(minimal) is True
+
+
+def test_inline_sample_tokens_runs_and_clears_state() -> None:
+    """grammar_output=None matches the engine's own second-RPC call."""
+    runner = _m2_runner()
+
+    out = common._inline_sample_tokens(runner)
+
+    assert out == "mro"
+    assert runner._sample_tokens_calls == [None]
+    assert runner.execute_model_state is None
+
+
+def test_inline_sample_tokens_clears_state_on_failure() -> None:
+    runner = _m2_runner(sample_tokens_side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        common._inline_sample_tokens(runner)
+
+    assert runner.execute_model_state is None
+
+
+def _orig_execute_model_none(self: Any, scheduler_output: Any) -> None:
+    """Upstream async-scheduling-style execute_model: stashes state, returns None."""
+    self.execute_model_state = "state"
+    return None
+
+
+def test_execute_wrapper_inlines_when_gated() -> None:
+    """M2 on: execute_model returns the ModelRunnerOutput (None short-circuit
+    upstream skips the second collective_rpc); beam context stays published
+    for the in-frame sampling."""
+    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
+    runner = _m2_runner()
+    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
+
+    out = wrapped(runner, scheduler_output)
+
+    assert out == "mro"
+    assert runner._sample_tokens_calls == [None]
+    assert runner.execute_model_state is None
+    assert runner._current_beam_info is not None
+    # The in-frame sampling consumed the context (decision attach etc.); it is
+    # NOT reset early — the next execute_model overwrites it at entry.
+    assert runner._current_scheduler_output is scheduler_output
+
+
+def test_execute_wrapper_falls_back_when_inline_fails() -> None:
+    """Inline failure returns None: the engine's fallback second RPC runs and
+    the two-RPC path is preserved verbatim."""
+    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
+    runner = _m2_runner(sample_tokens_side_effect=RuntimeError("boom"))
+    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
+
+    out = wrapped(runner, scheduler_output)
+
+    assert out is None
+    assert runner._sample_tokens_calls == [None]
+    assert runner.execute_model_state is None
+
+
+def test_execute_wrapper_does_not_inline_when_gate_closed() -> None:
+    """Gate closed (async scheduling): execute_model returns None and never
+    calls sample_tokens — the engine issues the second RPC itself."""
+    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
+    runner = _m2_runner(use_async_scheduling=True)
+    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
+
+    out = wrapped(runner, scheduler_output)
+
+    assert out is None
+    assert runner._sample_tokens_calls == []
+    # State survives for the engine-initiated sample_tokens RPC.
+    assert runner.execute_model_state == "state"
+
+
+def test_execute_wrapper_does_not_inline_non_none_output() -> None:
+    """A runner that already returned a value (e.g. pooling) is untouched."""
+    wrapped = common.make_patched_execute_model(lambda self, output: "direct")
+    runner = _m2_runner()
+    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
+
+    assert wrapped(runner, scheduler_output) == "direct"
+    assert runner._sample_tokens_calls == []

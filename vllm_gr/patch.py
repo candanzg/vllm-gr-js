@@ -210,11 +210,16 @@ def _validate_engine_core_request_patch() -> str | None:
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
+        _apply_beam_step,
+        _beam_self_advance,
         _cache_beam_request,
         _handle_beam_request_step_update,
         process_input_sockets,
     )
-    from vllm_gr.v1.engine.engine_core_patch import _BEAM_STATE_INIT_MARKER
+    from vllm_gr.v1.engine.engine_core_patch import (
+        _BEAM_STATE_INIT_MARKER,
+        _ENGINE_STEP_PATCH_MARKER,
+    )
 
     valid = (
         getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False)
@@ -223,6 +228,11 @@ def _validate_engine_core_request_patch() -> str | None:
         and EngineCoreProc._cache_beam_request is _cache_beam_request
         and EngineCore._handle_beam_request_step_update is _handle_beam_request_step_update
         and EngineCoreProc._handle_beam_request_step_update is _handle_beam_request_step_update
+        and EngineCore._apply_beam_step is _apply_beam_step
+        and EngineCoreProc._apply_beam_step is _apply_beam_step
+        and EngineCore._beam_self_advance is _beam_self_advance
+        and EngineCoreProc._beam_self_advance is _beam_self_advance
+        and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
         and EngineCoreProc.process_input_sockets is process_input_sockets
     )
     return _verified(valid, "EngineCore beam request dispatch is not fully installed")

@@ -15,6 +15,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_DETERMINE_PATCH_MARKER,
     _WORKER_PREPARE_PATCH_MARKER,
     _WORKER_SAMPLE_PATCH_MARKER,
+    _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
     InputBatchProxy,
     _beam_collapse_bookkeeping,
     _beam_full_graph_ready,
@@ -76,18 +77,214 @@ def make_patched_sample_npu(_orig_sample):
     without the hook fail at constraint-table injection instead of silently
     sampling unconstrained.  Signature-agnostic pass-through so it tolerates
     an Ascend ``_sample`` with a different metadata argument.
+
+    After the original sampling (and the Constraint Table raw-logits
+    override), the worker may run the beam decision itself (``beam_search_group``
+    / ``beam_search_rec_final_select``) when ``GRConfig.beam_worker_decision``
+    is enabled — the result is stashed on the runner as
+    ``_beam_decision_result`` and attached to ``ModelRunnerOutput.beam_search_result``
+    by ``make_patched_execute_model`` (ACS-aligned save flow).  When disabled
+    or inapplicable the decision stays in the frontend and nothing changes.
+
+    Sampler short-circuit (ACS ``model_runner_v1`` constrained decode path):
+    when the worker beam decision is active and every sampling row of the
+    step is constrained, the original sampler run is dead work — its
+    log_softmax + topk + gather_logprobs output is entirely overwritten by
+    the constrained operator (profiling bw128_1k_t3: ~3.4ms of wasted device
+    work plus the host-side gather chain per step).  The sampler output is
+    built directly from the operator result instead (``logprobs`` width
+    ``W``, top-1 candidate in column 0 — the exact shape the override path
+    and ``_select_candidates`` produce).
     """
     if getattr(_orig_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
         return _orig_sample
 
     @wraps(_orig_sample)
     def patched_sample(self, *args, **kwargs):
-        sampler_output = _orig_sample(self, *args, **kwargs)
-        apply_constrained_sample_override(self, args[0], sampler_output)
+        sampler_output = _try_constrained_sampler_shortcut(self, args, kwargs)
+        if sampler_output is None:
+            sampler_output = _orig_sample(self, *args, **kwargs)
+            apply_constrained_sample_override(self, args[0], sampler_output)
+        _maybe_run_worker_beam_decision(self, sampler_output)
         return sampler_output
 
     setattr(patched_sample, _WORKER_SAMPLE_PATCH_MARKER, True)
     return patched_sample
+
+
+def _try_constrained_sampler_shortcut(runner, args, kwargs):
+    """Build the sampler output from the constrained operator, or None.
+
+    Returns a fully populated ``SamplerOutput`` when the original sampler
+    can be skipped, ``None`` when the caller must fall back to the original
+    (then override) path.
+
+    Conditions (all must hold — any miss keeps the untouched legacy path):
+
+    - the worker beam decision is active (``worker_decision_enabled``):
+      the short-circuit is the post-processing half of the xllm pipeline,
+      and the frontend decision path still consumes a full-width sampler
+      output (P1-1 scope);
+    - raw logits are available as the first positional argument;
+    - no speculative decoding (beam decode never carries spec metadata,
+      but the check keeps the shortcut off that path defensively);
+    - the step has constrained rows and they are homogeneous (validated by
+      ``collect_constrained_override_rows``, which mirrors
+      ``apply_constrained_sample_override``'s guards).
+
+    Row-count conservation: ``_validate_homogeneous_step`` guarantees every
+    W_logits > 0 row belongs to a constrained request, so the operator
+    output covers exactly the logits rows the sampler would have produced.
+    """
+    from vllm_gr.v1.beam.beam_decision import worker_decision_enabled
+    from vllm_gr.v1.worker.constraint_hook import (
+        build_constrained_sampler_output,
+        collect_constrained_override_rows,
+    )
+
+    logits = args[0] if args else None
+    if logits is None or not torch.is_tensor(logits):
+        return None
+    # Spec-decode steps carry bonus/target logits slices; the beam decode
+    # shortcut is only defined for plain steps.
+    if len(args) > 1 and args[1] is not None:
+        return None
+    if kwargs.get("spec_decode_metadata") is not None:
+        return None
+    if not worker_decision_enabled(runner):
+        return None
+    rows = collect_constrained_override_rows(runner)
+    if not rows:
+        return None
+    try:
+        return build_constrained_sampler_output(runner, logits, rows)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        logger.warning(
+            "vllm-gr constrained sampler shortcut failed: %s; falling back to the original sampler",
+            exc,
+        )
+        return None
+
+
+def make_patched_sample_tokens_npu(_orig_sample_tokens):
+    """Wrap the NPU ``sample_tokens`` to attach the worker beam decision.
+
+    Under async scheduling the runner's ``execute_model`` returns an
+    ``ExecuteModelState`` and sampling happens later in ``sample_tokens``;
+    the worker-side beam decision runs inside the patched ``_sample`` during
+    that call.  The ModelRunnerOutput / AsyncModelRunnerOutput is only built at
+    the end of ``sample_tokens``, so the decision must be attached to it here
+    (after the original sampling) rather than in ``execute_model`` where the
+    decision does not exist yet.  ``_attach_beam_search_result`` handles both
+    the plain ModelRunnerOutput and the AsyncModelRunnerOutput inner object.
+    """
+    if getattr(_orig_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False):
+        return _orig_sample_tokens
+
+    @wraps(_orig_sample_tokens)
+    def patched_sample_tokens(self, grammar_output, *args, **kwargs):
+        from vllm_gr.v1.worker.model_runner_common import _attach_beam_search_result
+
+        out = _orig_sample_tokens(self, grammar_output, *args, **kwargs)
+        _attach_beam_search_result(self, out)
+        return out
+
+    setattr(patched_sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, True)
+    return patched_sample_tokens
+
+
+def _maybe_run_worker_beam_decision(runner, sampler_output) -> None:
+    """Run the worker-side beam decision on the NPU xllm decode path.
+
+    No-op unless the GRConfig opt-in, an active beam session, and a valid
+    incremental beam-decode step are all present; otherwise the frontend keeps
+    its NumPy decision path unchanged.  The result dict (device tensors, plus
+    host copies for the return channel) is stashed on the runner so
+    ``make_patched_execute_model`` can attach it to the ModelRunnerOutput.
+    """
+    from vllm_gr.v1.beam.beam_decision import (
+        run_beam_decision,
+        worker_decision_enabled,
+    )
+
+    if not worker_decision_enabled(runner):
+        runner._beam_decision_result = None
+        return
+    beam_info = getattr(runner, "_current_beam_info", None)
+    session = beam_info.get("beam_session") if beam_info else None
+    if session is None:
+        runner._beam_decision_result = None
+        return
+
+    state = session._state
+    # result_width is the FINAL-STEP OUTPUT WIDTH (number of returned
+    # sequences, ACS ``BeamSearchParams.result_width`` semantics) — NOT the
+    # decode step count.  Passing ``max_decode_steps`` here made the
+    # ``beam_search_rec_final_select`` vs ``beam_search_group`` dispatch
+    # depend on the step count (e.g. max_decode_steps=32 with beam_width=2
+    # dispatched a 32-wide final select).  Default to the beam width.
+    result_width = None
+    for mdata in (beam_info.get("beam_data") or {}).values():
+        if mdata.get("is_beam_decode", False):
+            result_width = mdata.get("result_width")
+            break  # single active session by design
+
+    decision = run_beam_decision(
+        runner,
+        session,
+        sampler_output,
+        is_last_step=state.is_last_step,
+        result_width=result_width,
+    )
+    if decision is not None:
+        # Plain-list host payload for the return channel.
+        # kv_transfer_params values are msgpack-encoded against the target
+        # type ``dict[str, Any]``: a CPU tensor encodes to a
+        # ``('int64', shape, data)`` triple whose decoder-side ``dec_hook``
+        # never fires (it only runs for typed fields), so the frontend would
+        # receive ``['int64', [1, 2], 0]`` — and for payloads at or above the
+        # zero-copy threshold the third element is an aux-buffer INDEX whose
+        # backing frame the consumer never receives, i.e. unrecoverable
+        # data.  Nested Python lists are the only representation that
+        # round-trips natively through the untyped mapping, so flatten at
+        # this D2H boundary.
+        # Intermediate steps omit ``out_sequence`` ([B, W, steps], grows with
+        # every step): both frontend consumers (_worker_decision_flatten in
+        # serving_engine.py and gr.py) read only out_token_ids /
+        # out_token_index / out_log_probs, and the frontend keeps its own
+        # running_sequences bookkeeping — the per-step D2H of the full
+        # history was pure overhead (profiling bw128_1k_t2: 5 tensor D2H per
+        # step contributing to 61 aclrtMemcpy / aclrtSynchronizeStream calls).
+        keys = (
+            ("out_token_ids", "out_token_index", "out_log_probs")
+            if not state.is_last_step
+            else ("out_token_ids", "out_token_index", "out_log_probs", "out_sequence")
+        )
+        payload = {}
+        for key in keys:
+            value = decision.get(key)
+            if value is None:
+                continue
+            payload[key] = value.detach().to("cpu").tolist() if torch.is_tensor(value) else value
+        # EngineCore self-advance (beam_self_advance) needs the terminal flag
+        # to know when to stop chaining steps; the frontend consumers ignore
+        # this key.
+        payload["is_last_step"] = bool(state.is_last_step)
+        if not state.is_last_step:
+            out_idx_host = payload.get("out_token_index")
+            if out_idx_host:
+                # Persist the applied same-step reorder record from this
+                # already-transferred host payload (request-0 row of the
+                # GLOBAL out_token_index == the request-local parent mapping,
+                # global offset 0).  The next step's
+                # ``_get_or_create_beam_session`` compares it against the
+                # frontend's parent_beam_ids — an exact match skips the
+                # duplicate reorder; a mismatch (e.g. EOS re-ordering)
+                # triggers the composite reorder.  Deriving it here avoids a
+                # second device→host sync inside ``_finalize_decision``.
+                state.kv_reorder = [int(p) for p in out_idx_host[0]]
+        decision = payload
+    runner._beam_decision_result = decision
 
 
 def make_patched_bookkeeping_sync_npu(_orig_bookkeeping_sync):
@@ -613,6 +810,11 @@ def discover_worker_runners() -> tuple[tuple[str, type], ...]:
 make_patched_prepare_inputs = make_patched_prepare_inputs_npu
 make_patched_bookkeeping_sync = make_patched_bookkeeping_sync_npu
 make_patched_sample = make_patched_sample_npu
+# The dispatcher (model_runner_patch.py) looks up this exact name; without the
+# alias the sample_tokens hook is silently skipped and the worker beam decision
+# never reaches the ModelRunnerOutput (async scheduling keeps the decision path
+# broken end-to-end: self-advance no-ops and the frontend keeps its RPC loop).
+make_patched_sample_tokens = make_patched_sample_tokens_npu
 make_patched_determine_batch_execution_and_padding = (
     make_patched_determine_batch_execution_and_padding_npu
 )

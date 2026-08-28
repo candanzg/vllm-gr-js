@@ -42,7 +42,7 @@ from vllm_gr.beam_search_decision_utils import (
     materialize_selected_beams,
     select_top_indices,
 )
-from vllm_gr.config import ConstraintBackend
+from vllm_gr.config import ConstraintBackend, GRConfig
 from vllm_gr.constraints import (
     BeamConstraintCoordinator,
     ParentCandidateBuilder,
@@ -117,6 +117,7 @@ def _prepare_beam_step_requests(
     instance_completed_sessions: set[int],
     max_decode_steps: int = 0,
     is_constrained: bool = False,
+    instance_self_advance_chained: set[int] | None = None,
 ) -> list["EngineCoreRequest"]:
     """Prepare EngineCoreRequest items for active instances at this step."""
     engine_core_requests = []
@@ -202,7 +203,21 @@ def _prepare_beam_step_requests(
                 # step to run (1/2 for decode; 0 reserved for the prefill).
                 constraint_step=len(beam_tokens[0]) if is_constrained else 0,
             )
-            llm_engine.engine_core.beam_request_step_update(update)
+            # EngineCore already chained this decode step from the worker's
+            # beam decision (beam_self_advance). Re-sending the update would
+            # re-ADD the session's request while it is still running under
+            # the same session_id, crashing scheduler.add_request with
+            # "duplicate request id"; the output registration above already
+            # wired this instance to the chained step's output.
+            self_advance_chained = (
+                instance_self_advance_chained is not None and j in instance_self_advance_chained
+            )
+            if self_advance_chained:
+                # The chained step consumed this tracking entry; step 0-style
+                # re-registration must not run again for this step.
+                instance_self_advance_chained.discard(j)
+            else:
+                llm_engine.engine_core.beam_request_step_update(update)
 
             # Update tracking variables
             instance_prev_beam_internal_ids[j] = child_beam_ids
@@ -422,6 +437,12 @@ def _custom_beam_search_batch(
     instance_fork_info: dict[int, ForkInfo] = {}
     instance_prefix_len: dict[int, int] = {}
     instance_completed_sessions: set[int] = set()
+    # Per-instance: EngineCore chained this step's successor from the worker's
+    # beam decision (beam_self_advance); the next iteration must skip its own
+    # beam_request_step_update send (the session request is still running
+    # under the same session id — a second ADD trips the scheduler's
+    # "duplicate request id" assert).
+    instance_self_advance_chained: set[int] = set()
 
     # Resolve the frontend catalog-strategy per backend (Trie: None → "fill";
     # Constraint Tables: an explicit value is a contradiction and is rejected).
@@ -461,6 +482,7 @@ def _custom_beam_search_batch(
             instance_completed_sessions=instance_completed_sessions,
             max_decode_steps=max_decode_steps,
             is_constrained=_is_constrained,
+            instance_self_advance_chained=instance_self_advance_chained,
         )
 
         if engine_core_requests:
@@ -492,8 +514,53 @@ def _custom_beam_search_batch(
             if result is None:
                 continue
 
-            is_error, all_beams_token_id, all_beams_logprob, all_beams_beam_idx, beam_flat_cache = (
-                _parse_step_logprobs(
+            # Worker-side beam decision (NPU xllm path): when the worker
+            # already selected the surviving beams, use its winners directly
+            # and skip the frontend flat-logprobs parsing + NumPy top-k.  The
+            # downstream EOS handling / beam materialisation is unchanged.
+            from vllm_gr.entrypoints.openai.serving_engine import (
+                _worker_decision_flatten,
+                _worker_decision_from_result,
+            )
+
+            worker_decision = _worker_decision_from_result(result)
+            worker_candidates = None
+            if worker_decision is not None:
+                worker_candidates = _worker_decision_flatten(
+                    worker_decision, beam_width, instance.beams
+                )
+            # EngineCore chained this step's successor from the worker's
+            # decision (beam_self_advance): the next iteration skips its
+            # beam_request_step_update send. A missing flag (terminal
+            # decision / skip path / self-advance disabled) keeps the
+            # frontend-driven path in charge.
+            if worker_decision is not None and worker_decision.get("beam_self_advance_chained"):
+                instance_self_advance_chained.add(j)
+            else:
+                instance_self_advance_chained.discard(j)
+
+            if worker_candidates is not None:
+                (
+                    all_beams_token_id,
+                    all_beams_logprob,
+                    all_beams_beam_idx_arr,
+                    beam_flat_cache,
+                ) = worker_candidates
+                if not all_beams_token_id:
+                    is_error = True
+                else:
+                    is_error = False
+                    all_beams_token_id = np.asarray(all_beams_token_id, dtype=np.int64)
+                    all_beams_logprob = np.asarray(all_beams_logprob, dtype=np.float64)
+                    all_beams_beam_idx_arr = np.asarray(all_beams_beam_idx_arr, dtype=np.intp)
+            else:
+                (
+                    is_error,
+                    all_beams_token_id,
+                    all_beams_logprob,
+                    all_beams_beam_idx,
+                    beam_flat_cache,
+                ) = _parse_step_logprobs(
                     result=result,
                     instance=instance,
                     token=token,
@@ -504,7 +571,7 @@ def _custom_beam_search_batch(
                     constraint_coordinator=constraint_coordinator,
                     return_arrays=True,
                 )
-            )
+                all_beams_beam_idx_arr = all_beams_beam_idx
 
             if is_error:
                 _beam_request_cleanup(
@@ -518,7 +585,6 @@ def _custom_beam_search_batch(
 
             # _parse_step_logprobs returns the builder's NumPy arrays for the
             # internal path; do not convert them through Python lists again.
-            all_beams_beam_idx_arr = all_beams_beam_idx
             if not ignore_eos:
                 eos_beams, all_beams_logprob = complete_eos_candidates(
                     parents=instance.beams,
@@ -570,7 +636,7 @@ class GRLLM(LLM):
         model: str = "",
         *,
         catalog_path: str | None = None,
-        constraint_backend: ConstraintBackend | str = ConstraintBackend.TRIE,
+        constraint_backend: ConstraintBackend | str | None = None,
         beam_graph_enabled: bool | None = None,
         beam_max_width: int | None = None,
         beam_max_decode_steps: int | None = None,
@@ -582,6 +648,24 @@ class GRLLM(LLM):
         from vllm_gr._env_check import configure_model_runner_default
 
         configure_model_runner_default()
+
+        # Ensure the vllm-gr runtime patches are installed (EngineArgs
+        # arg-threading, worker hooks, EngineCore entrypoint) before building
+        # EngineArgs.  The vLLM general-plugin loader normally does this at
+        # process start, but offline GRLLM construction can precede that;
+        # calling it explicitly is idempotent and self-contained.
+        from vllm_gr.plugin import initialize_runtime
+
+        initialize_runtime()
+        # Force the EngineCore process entrypoint swap: re_apply_patches may
+        # skip an already-marked batch_and_fork patch (e.g. when the general
+        # plugin ran first), and without the swap a spawn child re-imports the
+        # original run_engine_core and loses every worker hook.
+        from vllm_gr.entrypoints.openai.beam_search_patch import (
+            patch_engine_core_process_entrypoint,
+        )
+
+        patch_engine_core_process_entrypoint()
 
         self._shutdown_complete = False
 
@@ -599,11 +683,52 @@ class GRLLM(LLM):
         # below), so ``catalog_path`` with the default backend must not demand
         # the plugin — vLLM 0.22 loads general plugins lazily from inside
         # EngineArgs.__init__, which has not run yet at this point.
+        # Resolve the effective constraint backend here (before EngineArgs is
+        # built): on NPU with no explicit backend choice and a catalog
+        # available the platform default is Constraint Tables.  A user
+        # catalog_path is kept as the constraint data source (a Triples
+        # document for the promoted backend).  Without a catalog there is no
+        # constraint data to promote against — a GRLLM constructed with no
+        # catalog must stay unconstrained (legacy behavior) rather than force
+        # the tokenizer-based Constraint Table builder, which fails fast on
+        # tokenizers whose s_a/s_b/s_c groups exceed max_valid_items (e.g.
+        # OneRec 8192 > 500) and regresses catalog-free single-prompt tests.
+        # Explicit user choices (any backend) pass through unchanged.
+        from vllm_gr.constraints.strategies import MAX_CONSTRAINT_BEAM_WIDTH
+        from vllm_gr.engine.arg_utils_gr import (
+            _catalog_is_triples_document,
+            _is_npu_platform,
+        )
+
+        if (
+            constraint_backend is None
+            and catalog_path is not None
+            and _catalog_is_triples_document(catalog_path)
+            and beam_max_width is not None
+            and beam_max_width <= MAX_CONSTRAINT_BEAM_WIDTH
+            and _is_npu_platform()
+        ):
+            constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
+        elif (
+            constraint_backend is None
+            and beam_max_width is not None
+            and beam_max_width > MAX_CONSTRAINT_BEAM_WIDTH
+            and _is_npu_platform()
+        ):
+            logger.warning(
+                "NPU Constraint Table auto-promotion skipped: beam_max_width "
+                "%s exceeds the constraint_table beam-width cap %s (fused "
+                "rec_constrained_topk top_k limit); running beam decode "
+                "without constraint tables.",
+                beam_max_width,
+                MAX_CONSTRAINT_BEAM_WIDTH,
+            )
+
         gr_engine_args: dict[str, object] = {}
         if engine_args_accepts_gr_values():
             gr_engine_args["catalog_path"] = catalog_path
             gr_engine_args["constraint_backend"] = constraint_backend
-        elif constraint_backend != ConstraintBackend.TRIE:
+        elif constraint_backend not in (None, ConstraintBackend.TRIE):
             raise RuntimeError(
                 "vllm-gr runtime patches are not active: EngineArgs cannot "
                 "carry constraint_backend into VllmConfig. Ensure the vllm-gr "
@@ -636,11 +761,19 @@ class GRLLM(LLM):
         self.catalog = None
         self.constraint_strategy = None
         self.constraint_coordinator = BeamConstraintCoordinator(None)
-        if catalog_path is not None:
+        # Resolve the effective constraint backend from the engine config
+        # (create_engine_config already applied the NPU platform default: a
+        # sentinel catalog_path when Constraint Tables are auto-selected).
+        # Explicit user choices pass through unchanged.
+        resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
+        effective_backend = resolved_gr.constraint_backend
+        effective_catalog_path = resolved_gr.catalog_path
+
+        if effective_catalog_path is not None:
             self.constraint_strategy = create_constraint_strategy(
-                backend=constraint_backend,
+                backend=effective_backend,
                 tokenizer=self.get_tokenizer(),
-                catalog_path=catalog_path,
+                catalog_path=effective_catalog_path,
             )
             self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
             if isinstance(self.constraint_strategy, TrieConstraintStrategy):
@@ -651,9 +784,9 @@ class GRLLM(LLM):
                 # is a hard startup error — never a silent fall back to Trie.
                 resource = install_constraint_table(
                     self.llm_engine,
-                    catalog_path=catalog_path,
+                    catalog_path=effective_catalog_path,
                     tokenizer=self.get_tokenizer(),
-                    vocab_size=self.llm_engine.model_config.vocab_size,
+                    vocab_size=self.llm_engine.model_config.get_vocab_size(),
                 )
                 self.constraint_strategy.digest = resource.digest
 
@@ -807,6 +940,18 @@ class GRLLM(LLM):
             "CUSTOM" in str(attention_backend).upper()
             or getattr(attention_backend, "name", "").upper() == "CUSTOM"
         )
+        # Trie constraints are enforced in the frontend (catalog trie); the
+        # baseline generate() loop already constrains candidates correctly and
+        # returns per-beam FlatLogprobs with precise boundaries.  The CUSTOM
+        # beam-request protocol's merged-flat / fixed-stride extraction deviates
+        # from that path (regression: CI GPU pass@1 0.04), so route Trie
+        # through the native loop.  Constraint Tables keep the CUSTOM path:
+        # their candidates are produced by the Worker raw-logits hook, which is
+        # only installed on the beam-request path (see validate_constraint_table_protocol).
+        if self.constraint_coordinator is not None and isinstance(
+            self.constraint_coordinator.strategy, TrieConstraintStrategy
+        ):
+            use_custom_attn = False
         # Constraint Tables run in the Worker raw-logits hook, which is only
         # installed on the CUSTOM-attention beam-request path.  The baseline
         # generate() loop below cannot express constraint_step + beam_suffix,

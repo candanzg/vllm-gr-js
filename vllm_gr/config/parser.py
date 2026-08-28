@@ -21,6 +21,8 @@ from vllm_gr.config.validation import (
     validate_beam_graph_enabled,
     validate_beam_max_decode_steps,
     validate_beam_max_width,
+    validate_beam_self_advance,
+    validate_beam_worker_decision,
     validate_catalog_path,
     validate_constraint_backend,
     validate_constraint_table_backend,
@@ -46,6 +48,8 @@ BEAM_GRAPH_ENABLED_KEY: Final = "vllm_gr_beam_graph_enabled"
 BEAM_MAX_WIDTH_KEY: Final = "vllm_gr_beam_max_width"
 BEAM_MAX_DECODE_STEPS_KEY: Final = "vllm_gr_beam_max_decode_steps"
 NPU_DECODE_EXECUTION_KEY: Final = "vllm_gr_npu_decode_execution"
+BEAM_WORKER_DECISION_KEY: Final = "vllm_gr_beam_worker_decision"
+BEAM_SELF_ADVANCE_KEY: Final = "vllm_gr_beam_self_advance"
 GR_CONFIG_KEY_PREFIX: Final = "vllm_gr_"
 KNOWN_GR_CONFIG_KEYS: Final = frozenset(
     {
@@ -58,6 +62,8 @@ KNOWN_GR_CONFIG_KEYS: Final = frozenset(
         BEAM_MAX_WIDTH_KEY,
         BEAM_MAX_DECODE_STEPS_KEY,
         NPU_DECODE_EXECUTION_KEY,
+        BEAM_WORKER_DECISION_KEY,
+        BEAM_SELF_ADVANCE_KEY,
     }
 )
 _TOP_LEVEL_KEYS: Final = frozenset(
@@ -302,6 +308,10 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         npu_decode_execution=validate_npu_decode_execution(
             additional_config.get(NPU_DECODE_EXECUTION_KEY)
         ),
+        beam_worker_decision=validate_beam_worker_decision(
+            additional_config.get(BEAM_WORKER_DECISION_KEY)
+        ),
+        beam_self_advance=validate_beam_self_advance(additional_config.get(BEAM_SELF_ADVANCE_KEY)),
     )
 
 
@@ -375,6 +385,24 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         # Both explicit modes round-trip: an explicit 'cascade' opt-out must
         # survive a write so it cannot be silently re-defaulted to xllm.
         additional_config[NPU_DECODE_EXECUTION_KEY] = npu_decode_execution.value
+
+    beam_worker_decision = validate_beam_worker_decision(gr_config.beam_worker_decision)
+    if beam_worker_decision is None:
+        # Unset stays out of the serialized config; runtime keeps the
+        # frontend NumPy decision path.
+        additional_config.pop(BEAM_WORKER_DECISION_KEY, None)
+    else:
+        # Both explicit values round-trip (an opt-out must survive a write).
+        additional_config[BEAM_WORKER_DECISION_KEY] = beam_worker_decision
+
+    beam_self_advance = validate_beam_self_advance(gr_config.beam_self_advance)
+    if beam_self_advance is None:
+        # Unset stays out of the serialized config; runtime keeps the
+        # frontend RPC step-update loop.
+        additional_config.pop(BEAM_SELF_ADVANCE_KEY, None)
+    else:
+        # Both explicit values round-trip (an opt-out must survive a write).
+        additional_config[BEAM_SELF_ADVANCE_KEY] = beam_self_advance
 
 
 def write_canonical_gr_config(vllm_config: object, gr_config: GRConfig) -> None:

@@ -452,3 +452,278 @@ def test_beam_max_decode_steps_defaults_to_onerec_sid_length() -> None:
     overridden.write_to_vllm_config(vllm_config)
     assert vllm_config.additional_config[BEAM_MAX_DECODE_STEPS_KEY] == 8
     assert GRConfig.from_vllm_config(vllm_config).beam_max_decode_steps == 8
+
+
+def _npic_engine_args(beam_max_width: int, catalog_path: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        catalog_path=catalog_path,
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        model=None,
+        beam_max_width=beam_max_width,
+        beam_worker_decision=None,
+        beam_self_advance=None,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("beam_max_width", "promoted"),
+    [(1, True), (128, True), (256, True), (257, False), (512, False)],
+)  # type: ignore[misc]
+def test_npu_constraint_table_auto_promotion_respects_capacity(
+    beam_max_width: int, promoted: bool
+) -> None:
+    """An NPU beam deployment with a catalog promotes, capacity-limited at 256.
+
+    With a constraint data source (a Triples document) available, auto-promotion
+    to Constraint Tables fires on any beam_max_width within the fused
+    ``rec_constrained_topk`` top_k cap of 256; wider deployments must not
+    auto-promote (every request would fail
+    ``validate_constraint_generation_limits``).  The user's catalog is kept as
+    the data source — never replaced by the tokenizer auto-build sentinel.
+    """
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    catalog_path = "generated_data/video_constraint_triples.json"
+    vllm_config = _vllm_config()
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
+            return_value=True,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
+            return_value=True,
+        ),
+    ):
+        result = create_engine_config(_npic_engine_args(beam_max_width, catalog_path))
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.catalog_path == catalog_path
+    if promoted:
+        assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+    else:
+        # No auto-promotion: the constraint backend keeps its default and the
+        # catalog is not replaced by the tokenizer auto-build sentinel.
+        assert config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
+
+
+def test_npu_beam_without_catalog_stays_unconstrained() -> None:
+    """A catalog-free NPU GRLLM must not auto-promote to Constraint Tables.
+
+    Auto-promotion needs a constraint data source.  Without a catalog the
+    tokenizer auto-build sentinel path would fail fast on models whose
+    s_a/s_b/s_c groups exceed ``max_valid_items`` (e.g. OneRec 8192 > 500),
+    regressing catalog-free single-prompt beam search — so no catalog means
+    the deployment stays unconstrained (legacy Trie default, no catalog).
+    """
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
+            return_value=True,
+        ),
+    ):
+        result = create_engine_config(_npic_engine_args(128))
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.constraint_backend is not ConstraintBackend.CONSTRAINT_TABLE
+    assert config.catalog_path is None
+
+
+def test_npu_trie_list_catalog_is_not_promoted() -> None:
+    """A Trie-list catalog (JSON array) stays Trie on NPU beam deployments.
+
+    ``_catalog_is_triples_document`` gates the auto-promotion: only a
+    Constraint Tables triples document (JSON object) promotes to
+    ``CONSTRAINT_TABLE`` on NPU.  A Trie frontend catalog is a JSON list, and
+    forced promotion would feed a list to ``compile_constraint_table_resource``
+    (which requires a dict) and fail startup — exactly the failure the serving
+    catalog dead-end test hits on NPU.
+    """
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
+            return_value=True,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
+            return_value=False,
+        ),
+    ):
+        result = create_engine_config(_npic_engine_args(128, "generated_data/video_catalog.json"))
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.constraint_backend is ConstraintBackend.TRIE
+    assert config.catalog_path == "generated_data/video_catalog.json"
+
+
+@pytest.mark.parametrize(
+    ("constraint_backend", "expected_backend"),
+    [
+        (None, ConstraintBackend.CONSTRAINT_TABLE),
+        (ConstraintBackend.TRIE, ConstraintBackend.TRIE),
+        (ConstraintBackend.CONSTRAINT_TABLE, ConstraintBackend.CONSTRAINT_TABLE),
+    ],
+)  # type: ignore[misc]
+def test_npu_catalog_path_without_backend_promotes_to_constraint_table(
+    constraint_backend: object, expected_backend: ConstraintBackend
+) -> None:
+    """On NPU beam deployments a catalog path alone selects the data source.
+
+    When the backend is not explicitly declared, the auto-promotion to
+    Constraint Tables keeps the user's catalog path as the constraint data
+    source (a Triples document) instead of replacing it with the tokenizer
+    auto-build sentinel.  An explicit backend — including a ``trie``
+    opt-out — is respected unchanged.
+    """
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    engine_args = SimpleNamespace(
+        catalog_path="generated_data/video_constraint_triples.json",
+        constraint_backend=constraint_backend,
+        attention_backend=None,
+        attention_config=None,
+        model=None,
+        beam_max_width=128,
+        beam_worker_decision=None,
+        beam_self_advance=None,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+
+    vllm_config = _vllm_config()
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
+            return_value=True,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._catalog_is_triples_document",
+            return_value=True,
+        ),
+        mock.patch(
+            "vllm_gr.utils.catalog.compute_catalog_slice_config",
+            side_effect=AssertionError("vocab slice computation must not run"),
+        ),
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.constraint_backend is expected_backend
+    assert config.catalog_path == "generated_data/video_constraint_triples.json"
+
+
+def test_gpu_catalog_path_without_backend_keeps_trie_default() -> None:
+    """Off NPU the auto-promotion never fires: Trie default + user catalog."""
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    engine_args = SimpleNamespace(
+        catalog_path="generated_data/video_catalog.json",
+        constraint_backend=None,
+        attention_backend=None,
+        attention_config=None,
+        model=None,
+        beam_max_width=128,
+        beam_worker_decision=None,
+        beam_self_advance=None,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+
+    vllm_config = _vllm_config()
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
+            return_value=False,
+        ),
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.constraint_backend is ConstraintBackend.TRIE
+    assert config.catalog_path == "generated_data/video_catalog.json"
+
+
+@pytest.mark.parametrize("catalog_path", ["triples.json", "AUTO"])  # type: ignore[misc]
+def test_constraint_table_backend_skips_vocab_slice_computation(
+    catalog_path: str,
+) -> None:
+    """A Constraint Tables config must not run the Trie vocab-slice computation.
+
+    The slice helper parses the Trie catalog's sequence list; a Constraint
+    Tables triples document is a relations dict, and the two features are
+    mutually exclusive (``validate_constraint_table_platform`` rejects the
+    combination).  Running the computation on a triples document previously
+    derived a bogus (offset, size) that broke startup.
+    """
+    from vllm_gr.config.models import AUTO_CONSTRAINT_TABLE_PATH
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    effective_path = AUTO_CONSTRAINT_TABLE_PATH if catalog_path == "AUTO" else catalog_path
+    engine_args = SimpleNamespace(
+        catalog_path=effective_path,
+        constraint_backend=ConstraintBackend.CONSTRAINT_TABLE,
+        attention_backend=None,
+        attention_config=None,
+        model="test-model",
+        beam_max_width=32,
+        beam_worker_decision=None,
+        beam_self_advance=None,
+        no_beam_graph=False,
+        _vllm_gr_config_input=None,
+    )
+
+    vllm_config = _vllm_config()
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config",
+            return_value=vllm_config,
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_npu_platform",
+            return_value=False,
+        ),
+        mock.patch(
+            "vllm_gr.utils.catalog.compute_catalog_slice_config",
+            side_effect=AssertionError("vocab slice computation must not run"),
+        ) as slice_spy,
+        mock.patch("vllm_gr.ops.sliced_logits.set_vocab_slice_config") as set_slice,
+    ):
+        result = create_engine_config(engine_args)
+
+    config = GRConfig.from_vllm_config(result)
+    assert config.constraint_backend is ConstraintBackend.CONSTRAINT_TABLE
+    assert config.catalog_path == effective_path
+    assert config.vocab_offset is None
+    assert config.vocab_slice_size is None
+    slice_spy.assert_not_called()
+    set_slice.assert_not_called()

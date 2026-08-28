@@ -64,13 +64,21 @@ def rec_constrained_topk_npu(
     max_prefix1_degree: int = 0,
     max_prefix2_degree: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Call the fused NPU operator using the shared operator signature."""
+    """Call the fused NPU operator using the shared operator signature.
+
+    bf16 logits are widened to fp32 before dispatch. The fused kernel's bf16
+    load path reads stale unified-buffer data on ascend910b and produces
+    garbage logprobs, while its fp32 path is correct; bf16 -> fp32 is a
+    lossless bit extension, so results match the reference exactly.
+    """
     custom_ops = _custom_ops()
     if custom_ops is None or not callable(getattr(custom_ops, "rec_constrained_topk", None)):
         raise RuntimeError(
             f"NPU rec_constrained_topk is unavailable ({unavailable_reason()}); "
             "use the Torch implementation instead"
         )
+    if logits.dtype == torch.bfloat16:
+        logits = logits.to(torch.float32)
     return cast(
         tuple[torch.Tensor, torch.Tensor],
         custom_ops.rec_constrained_topk(
