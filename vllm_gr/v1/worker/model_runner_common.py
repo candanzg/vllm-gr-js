@@ -26,6 +26,47 @@ _WORKER_DETERMINE_PATCH_MARKER = "_vllm_gr_beam_determine_patch"
 _WORKER_CAPTURE_PATCH_MARKER = "_vllm_gr_beam_capture_patch"
 
 
+def warmup_sampler_logprobs(runner: Any, width: int | None = None) -> None:
+    """One-shot sampler ``gather_logprobs``/topk compile warmup.
+
+    The first decode step's ``sample_tokens`` pays a one-time ~300-400ms
+    ``torch.compile`` of
+    ``vllm.v1.sample.ops.logprobs.batched_count_greater_than`` (seen on every
+    first-step profile; call-stack diff vs acs).  Run it with dummy tensors on
+    the first ``execute_model`` so the compile lands at startup warmup instead
+    of inside the first request (guarded idempotent across hooks).
+    """
+    if getattr(runner, "_vllm_gr_sampler_warmup_done", False):
+        return
+    setattr(runner, "_vllm_gr_sampler_warmup_done", True)
+    try:
+        from vllm.v1.sample.sampler import Sampler
+    except Exception:
+        return
+    device = getattr(runner, "device", None)
+    vocab = getattr(runner, "vocab_size", 0)
+    if device is None or not vocab:
+        return
+    if width is None:
+        try:
+            width = int(_get_gr_config(runner).beam_max_width or 128)
+        except Exception:
+            width = 128
+    try:
+        logprobs = torch.randn(width, vocab, dtype=torch.float32, device=device)
+        token_ids = torch.zeros(width, dtype=torch.int64, device=device)
+        Sampler.gather_logprobs(logprobs, width + 1, token_ids)
+        if str(device.type) == "npu" and torch.is_npu_available():
+            torch.npu.synchronize()
+        logger.info(
+            "vllm-gr: warmed sampler gather_logprobs compile (w=%d, vocab=%d)",
+            width,
+            vocab,
+        )
+    except Exception as exc:  # pragma: no cover - warmup must never fail serve
+        logger.debug("vllm-gr: sampler logprobs warmup skipped: %s", exc)
+
+
 def _get_positions_buffers(runner: Any) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Safely extracts underlying hardware and host indexing position tensors."""
     gpu_positions = None
@@ -111,10 +152,11 @@ def _process_beam_decode_request(
     # --- Incremental decode path ---
     if is_incremental:
         decode_step = mdata.get("decode_step", 0)
-        for b in range(beam_width):
-            # Each beam: 1 token, position = prefix_len + decode_step
-            new_logits_indices.append(token_offset + b)
-            active_beam_ids.append(b)
+        # Vectorized bulk build instead of a per-beam Python loop (bw=128 on
+        # the hot decode path): one extend for the logits indices and one for
+        # the active-beam ids.
+        new_logits_indices.extend(range(token_offset, token_offset + beam_width))
+        active_beam_ids.extend(range(beam_width))
 
         # All beams share one constant position id this step, so a scalar
         # slice-fill is enough: a single device-side fill kernel, no host
@@ -982,55 +1024,65 @@ def _get_or_create_beam_session(runner, beam_data: dict, scheduler_output=None) 
                 state = session._state
                 state.is_last_step = is_last_step
 
-                # Worker-side same-step reorder record: the worker beam
-                # decision already applied ``select_unshared_kv`` inside the
-                # previous execute_model (ACS decode_select timing) and
-                # advanced decode_step there.  Consume the record —
-                # re-applying the same parent mapping is NOT idempotent
-                # (p . p != p), so an exact match with the frontend's
-                # parent_beam_ids means the KV reorder is already done.
-                recorded = state.kv_reorder
-                if recorded is not None:
-                    state.kv_reorder = None
-                    if (
-                        parent_beam_ids is not None
-                        and not is_last_step
-                        and list(parent_beam_ids) != recorded
-                    ):
-                        # Frontend mapping differs from what the worker
-                        # applied (e.g. EOS re-ordering).  The pool currently
-                        # holds pre-decision row `recorded[i]` at row i; the
-                        # frontend wants pre-decision row parent[j] at row j.
-                        # Composite via the cascade kernel (gather semantics
-                        # tolerate mappings the fused kernel cannot express).
-                        comp = []
-                        for p in parent_beam_ids:
-                            try:
-                                comp.append(recorded.index(p))
-                            except ValueError:
-                                logger.warning(
-                                    "vllm-gr: frontend parent %s not in worker "
-                                    "reorder record %r; keeping identity",
-                                    p,
-                                    recorded,
-                                )
-                                comp.append(p)
-                        from vllm_gr.v1.beam.reorder import reorder_unshared_kv
-
-                        reorder_unshared_kv(
-                            torch.tensor(comp, dtype=torch.int32, device=runner.device),
-                            session.slot,
-                            context.pools,
-                            state.decode_step - 1,  # KV range written through the previous step
-                        )
-                    # Exact match (or no parent / last step): the same-step
-                    # path already reordered and advanced decode_step.
-                elif parent_beam_ids is not None and not is_last_step:
-                    parent = torch.tensor(parent_beam_ids, dtype=torch.int32, device=runner.device)
-                    session.step_complete(parent)
+                # Worker applied the same-step reorder inside the previous decision
+                # AND advanced decode_step there (ACS decode_select timing):
+                # the pool is already in the decided order, so the next
+                # prepare must NOT re-apply nor reconcile with the frontend
+                # mapping (p·p is not idempotent).  Skipping entirely avoids
+                # any dependence on the per-step device→host decision payload
+                # on the prepare path — the worker decision is authoritative.
+                # Gated on beam_self_advance: without it the frontend may
+                # remap parents (e.g. EOS) and the composite-reorder path
+                # must stay reachable.
+                self_advance = bool(getattr(gr_cfg, "beam_self_advance", False))
+                if getattr(state, "worker_reordered", False) and self_advance:
+                    state.worker_reordered = False
                 else:
-                    # Last step or no parent: just advance decode_step
-                    state.decode_step += 1
+                    # Frontend-driven path: reconcile the previous step's
+                    # reorder record against the frontend's parent mapping.
+                    recorded = state.kv_reorder
+                    if recorded is not None:
+                        state.kv_reorder = None
+                        if (
+                            parent_beam_ids is not None
+                            and not is_last_step
+                            and list(parent_beam_ids) != recorded
+                        ):
+                            # Frontend mapping differs from what the worker
+                            # applied (e.g. EOS re-ordering).  The pool
+                            # currently holds pre-decision row `recorded[i]`
+                            # at row i; the frontend wants pre-decision row
+                            # parent[j] at row j.  Composite via the cascade
+                            # kernel (gather semantics tolerate mappings the
+                            # fused kernel cannot express).
+                            comp = []
+                            for p in parent_beam_ids:
+                                try:
+                                    comp.append(recorded.index(p))
+                                except ValueError:
+                                    logger.warning(
+                                        "vllm-gr: frontend parent %s not in worker "
+                                        "reorder record %r; keeping identity",
+                                        p,
+                                        recorded,
+                                    )
+                                    comp.append(p)
+                            from vllm_gr.v1.beam.reorder import reorder_unshared_kv
+
+                            reorder_unshared_kv(
+                                torch.tensor(comp, dtype=torch.int32, device=runner.device),
+                                session.slot,
+                                context.pools,
+                                state.decode_step - 1,  # KV range written through the previous step
+                            )
+                        # Exact match (or no parent / last step): the
+                        # same-step path already reordered + advanced.
+                    elif parent_beam_ids is not None and not is_last_step:
+                        parent = torch.tensor(parent_beam_ids, dtype=torch.int32, device=runner.device)
+                        session.step_complete(parent)
+                    else:
+                        # Last step or no parent: just advance decode_step
+                        state.decode_step += 1
         else:
             # New session
             from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
@@ -1079,6 +1131,12 @@ def make_patched_execute_model(_orig_execute_model):
 
     @wraps(_orig_execute_model)
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
+        # One-shot sampler ``gather_logprobs``/topk warmup: the first decode
+        # step otherwise pays a one-time ~300-400ms torch.compile (visible on
+        # every first-step profile).  Fires on the FIRST ``execute_model`` call
+        # — at startup warmup when the engine profiles/compiles the model, or
+        # on the first real step otherwise (never worse than today).
+        warmup_sampler_logprobs(self)
         # Clear the previous step's beam context at the START of the next
         # execute_model, not in a finally: with async scheduling the sampled
         # tokens are produced by ``sample_tokens`` AFTER execute_model returns,

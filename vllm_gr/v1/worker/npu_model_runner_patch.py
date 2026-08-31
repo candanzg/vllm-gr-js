@@ -56,7 +56,18 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
-        logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+        # Cache the per-step logits-index tensor: for pure beam decode the
+        # mapping is identical every step (one row per beam), so rebuilding
+        # the device tensor on each decode step only churns the host→device
+        # pipeline (profiling bw128: ~2ms/step in _prepare_inputs).  Keyed on
+        # the exact mapping so any real change still rebuilds.
+        cache = getattr(self, "_beam_logits_indices_cache", None)
+        cache_key = tuple(new_logits_indices)
+        if cache is None or cache[0] != cache_key:
+            logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+            self._beam_logits_indices_cache = (cache_key, logits_indices)
+        else:
+            logits_indices = cache[1]
 
         return (
             logits_indices,
@@ -193,6 +204,38 @@ def make_patched_sample_tokens_npu(_orig_sample_tokens):
     return patched_sample_tokens
 
 
+_BEAM_PAYLOAD_PIN_ATTR = "_beam_payload_pin"
+
+
+def _get_beam_payload_pin(runner, decision: dict, keys) -> dict[str, torch.Tensor]:
+    """Return persistent pinned host buffers for the payload tensors.
+
+    One pinned CPU buffer per payload key, cached on the runner (the physical
+    address is reused every step).  The caller issues ``copy_(t, non_blocking=True)``
+    for each key and drains once with a single stream synchronize + a single
+    host read, instead of one synchronous ``.to("cpu")`` + ``.tolist()`` per
+    tensor.  On this host (1 logical core, load ~15-17) every Python/ACL op
+    inflates roughly 10-30x under GIL contention, so collapsing the per-key
+    synchronous D2H chains directly shortens the step.
+    """
+    cache = getattr(runner, _BEAM_PAYLOAD_PIN_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(runner, _BEAM_PAYLOAD_PIN_ATTR, cache)
+    out = {}
+    for key in keys:
+        value = decision.get(key)
+        if value is None or not torch.is_tensor(value):
+            continue
+        key_meta = (key, tuple(value.shape), value.dtype)
+        buf = cache.get(key_meta)
+        if buf is None:
+            buf = torch.empty(tuple(value.shape), dtype=value.dtype, pin_memory=True)
+            cache[key_meta] = buf
+        out[key] = buf
+    return out
+
+
 def _maybe_run_worker_beam_decision(runner, sampler_output) -> None:
     """Run the worker-side beam decision on the NPU xllm decode path.
 
@@ -261,11 +304,29 @@ def _maybe_run_worker_beam_decision(runner, sampler_output) -> None:
             else ("out_token_ids", "out_token_index", "out_log_probs", "out_sequence")
         )
         payload = {}
+        # R1: batch the whole device→host payload as non_blocking D2H into
+        # persistent pinned buffers, drain with a single stream sync, and read
+        # once.  Each prior ``.detach().to("cpu").tolist()`` was its own
+        # synchronous D2H + host read on the GIL-starved engine thread; the
+        # single sync keeps ``state.kv_reorder`` correctness (resolved below
+        # from the same host read) while cutting the step's host-op count.
+        pins = _get_beam_payload_pin(runner, decision, keys)
+        pending_host: list[tuple[str, torch.Tensor]] = []
         for key in keys:
             value = decision.get(key)
             if value is None:
                 continue
-            payload[key] = value.detach().to("cpu").tolist() if torch.is_tensor(value) else value
+            value = value.detach()
+            buf = pins.get(key)
+            if buf is not None:
+                buf.copy_(value, non_blocking=True)
+                pending_host.append((key, buf))
+            else:
+                payload[key] = value.tolist() if torch.is_tensor(value) else value
+        if pending_host:
+            torch.npu.current_stream().synchronize()
+            for key, buf in pending_host:
+                payload[key] = buf.tolist()
         # EngineCore self-advance (beam_self_advance) needs the terminal flag
         # to know when to stop chaining steps; the frontend consumers ignore
         # this key.

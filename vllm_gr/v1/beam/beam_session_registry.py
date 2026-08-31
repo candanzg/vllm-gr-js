@@ -42,6 +42,13 @@ class SessionSlotState:
     # duplicate reorder; a mismatch triggers the composite reorder instead.
     # ``None`` means no same-step reorder happened (frontend-driven path).
     kv_reorder: list[int] | None = None
+    # One-shot marker set by the worker beam decision when it applied the
+    # same-step ``select_unshared_kv`` reorder AND advanced ``decode_step``
+    # inside the decision (ACS ``decode_select`` timing).  The next step's
+    # ``_get_or_create_beam_session`` consumes the marker to skip the
+    # kv_reorder/parent reconciliation entirely (the reorder is definitively
+    # done device-side); when absent the legacy reconciliation applies.
+    worker_reordered: bool = False
 
 
 class BeamSessionRegistry:

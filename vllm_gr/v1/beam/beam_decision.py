@@ -307,6 +307,12 @@ def _reorder_kv_same_step(
                     len(pools),
                 )
                 state.decode_step += 1
+                # One-shot marker for the next step's
+                # ``_get_or_create_beam_session``: the same-step reorder is
+                # applied AND ``decode_step`` advanced, so the next prepare
+                # must skip the kv_reorder/parent reconciliation (it would
+                # otherwise re-apply the non-idempotent p·p reorder).
+                state.worker_reordered = True
                 return
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.warning("vllm-gr fused same-step KV reorder failed: %s; fallback", exc)

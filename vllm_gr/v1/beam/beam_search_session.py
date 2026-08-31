@@ -61,6 +61,7 @@ class BeamSearchSession:
         state.is_last_step = False
         state.is_active = True
         state.kv_reorder = None
+        state.worker_reordered = False
         # Reset the device-resident beam-decision state the same way (ACS
         # ``BeamSearchBufferPool.reset_buffers`` semantics): without this a
         # second session reusing the slot inherits the previous session's
