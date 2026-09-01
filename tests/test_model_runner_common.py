@@ -244,6 +244,89 @@ def test_sampling_metadata_cache_invalidated_by_rebuild_and_assignment() -> None
     assert replaced.temperature.tolist() == [5, 5]
 
 
+def test_sampling_metadata_batched_gather_matches_per_attr_index() -> None:
+    """Mixed-dtype sampling attrs are all expanded by the shared logits map.
+
+    The batched gather must produce exactly what the legacy per-attribute
+    ``val[idx_tensor]`` produced, for both float and int attrs in one pass.
+    """
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([0.5, 1.5], dtype=torch.float32),
+        top_p=torch.tensor([0.9, 0.8], dtype=torch.float32),
+        top_k=torch.tensor([32, 16], dtype=torch.int32),
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch = SimpleNamespace(req_ids=["a", "b"], sampling_metadata=sampling_metadata)
+    proxy = common.InputBatchProxy(input_batch, ["a", "b"], [0, 0, 1], [0, 0, 1])
+
+    meta = proxy.sampling_metadata
+    assert meta is sampling_metadata
+    assert meta.temperature.tolist() == [0.5, 0.5, 1.5]
+    assert meta.top_p.dtype is torch.float32
+    assert torch.equal(meta.top_p, torch.tensor([0.9, 0.9, 0.8], dtype=torch.float32))
+    assert meta.top_k.tolist() == [32, 32, 16]
+
+
+def test_sampling_metadata_batched_gather_mixed_presence() -> None:
+    """Only present attrs are remapped; missing ones stay None."""
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([0.5], dtype=torch.float32),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    input_batch = SimpleNamespace(req_ids=["a"], sampling_metadata=sampling_metadata)
+    proxy = common.InputBatchProxy(input_batch, ["a", "a"], [0, 0], [0, 0])
+
+    meta = proxy.sampling_metadata
+    assert meta.temperature.tolist() == [0.5, 0.5]
+    assert meta.top_p is None
+    assert meta.top_k is None
+
+
+def test_materialize_logits_indices_reuses_runner_buffer() -> None:
+    """The runner-owned buffer is rewritten in place across beam steps."""
+    runner = SimpleNamespace(device=torch.device("cpu"))
+    first = common._materialize_logits_indices(runner, [3, 5, 9])
+    assert first.dtype is torch.int32
+    assert first.tolist() == [3, 5, 9]
+
+    second = common._materialize_logits_indices(runner, [10, 11])
+    assert second.dtype is torch.int32
+    assert second.tolist() == [10, 11]
+    # Both views alias the same underlying storage (reused buffer).
+    assert first.data_ptr() == second.data_ptr()
+
+
+def test_materialize_logits_indices_contiguous_device_range() -> None:
+    """A contiguous index list [0..n) is materialized device-side (no H2D)."""
+    runner = SimpleNamespace(device=torch.device("cpu"))
+    out = common._materialize_logits_indices(runner, [0, 1, 2, 3, 4])
+    assert out.dtype is torch.int32
+    assert out.tolist() == [0, 1, 2, 3, 4]
+
+    # Non-contiguous index lists still follow the host copy path and share
+    # the same backing storage.
+    other = common._materialize_logits_indices(runner, [7, 9])
+    assert other.tolist() == [7, 9]
+    assert out.data_ptr() == other.data_ptr()
+
+
+def test_is_contiguous_range() -> None:
+    assert common._is_contiguous_range([]) is True
+    assert common._is_contiguous_range([0]) is True
+    assert common._is_contiguous_range([0, 1, 2, 3]) is True
+    assert common._is_contiguous_range([0, 1, 3]) is False
+    assert common._is_contiguous_range([1, 2, 3]) is False
+    assert common._is_contiguous_range([0, 2, 3]) is False
+
+
 def test_logprob_remux_preserves_flattening_and_placeholder_rows() -> None:
     st_ids = torch.tensor([[10], [20], [30]])
     logprobs = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
