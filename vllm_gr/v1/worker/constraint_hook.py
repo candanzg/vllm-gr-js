@@ -227,9 +227,10 @@ def run_constrained_partition(
     contract is already ``[B*W, vocab]`` logits + ``[B, W, max_step]``
     sequence_group), replacing the previous one call per request.  Requests at
     different FSM steps still run in separate batches because the operator's
-    candidate table selection depends on ``current_step``.  The operator
-    output rows are returned in the order of the global sampler/logits row
-    indices collected in ``global_rows``.
+    candidate table selection depends on ``current_step``.  Operator output
+    rows are re-gathered to the canonical sampler/logits row order (the
+    ``global_rows`` returned here is ``range(n)``), so the result tensors are
+    directly aligned with the caller's ``logits`` tensor.
     """
     device = getattr(runner, "device", logits.device)
     top_tokens_parts: list[torch.Tensor] = []
@@ -237,6 +238,12 @@ def run_constrained_partition(
     valid_mask_parts: list[torch.Tensor] = []
     global_rows: list[int] = []
 
+    # Step groups are submitted in ascending constraint_step order, which is
+    # not necessarily the sampler/logits row order: requests at different FSM
+    # decode steps can occupy interleaved or inverted row ranges.  The direct
+    # constrained sampler output must stay aligned to the global sampler/logits
+    # row indices, so the group-ordered operator results are re-gathered into
+    # canonical row order before returning.
     by_step: dict[int, list[tuple[Any, int, int, dict[str, Any]]]] = {}
     for item in rows:
         step = validate_constraint_step(item[3].get("constraint_step", 0))
@@ -260,10 +267,32 @@ def run_constrained_partition(
         valid_mask_parts.append(result.valid_mask)
         global_rows.extend(group_rows)
 
+    top_tokens = torch.cat(top_tokens_parts, dim=0)
+    top_logprobs = torch.cat(top_logprobs_parts, dim=0)
+    valid_mask = torch.cat(valid_mask_parts, dim=0)
+
+    n_rows = len(global_rows)
+    if global_rows != list(range(n_rows)):
+        if sorted(global_rows) != list(range(n_rows)):
+            raise RuntimeError(
+                "constrained step partition must cover every logits row "
+                f"exactly once; mapped={global_rows}"
+            )
+        # global_rows is a permutation of range(n_rows): build the inverse
+        # position mapping and gather each row back to its canonical index.
+        inverse = [0] * n_rows
+        for position, row in enumerate(global_rows):
+            inverse[row] = position
+        order = torch.tensor(inverse, dtype=torch.long, device=top_tokens.device)
+        top_tokens = top_tokens.index_select(0, order)
+        top_logprobs = top_logprobs.index_select(0, order)
+        valid_mask = valid_mask.index_select(0, order)
+        global_rows = list(range(n_rows))
+
     return (
-        torch.cat(top_tokens_parts, dim=0),
-        torch.cat(top_logprobs_parts, dim=0),
-        torch.cat(valid_mask_parts, dim=0),
+        top_tokens,
+        top_logprobs,
+        valid_mask,
         global_rows,
     )
 

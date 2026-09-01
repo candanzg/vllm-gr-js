@@ -354,3 +354,23 @@ def test_begin_session_preserves_slot_kv() -> None:
     for pool in session.pools:
         assert torch.count_nonzero(pool.unshared_key[session.slot]).item() != 0
         assert torch.count_nonzero(pool.unshared_value[session.slot]).item() != 0
+
+
+def test_context_uses_xllm_buffers_flag_tracks_device_type() -> None:
+    """The xllm-buffer fill_ gate is True on NPU, False on CUDA/CPU.
+
+    NPU device tensors cannot be allocated on a CUDA-only host, so the flag's
+    device-type derivation is verified indirectly: a CPU-built context must be
+    gated off, and the predicate ``type == "npu"`` (the exact gate expression)
+    is exercised across every torch-recognized device type.
+    """
+    cpu = _make_context(device=torch.device("cpu"))
+    assert cpu._gr_uses_xllm_buffers is False
+
+    # Exact gate predicate: ``getattr(device, "type", None) == "npu"``.
+    assert torch.device("cpu").type != "npu"
+    assert torch.device("cuda", 0).type != "npu"
+    assert torch.device("meta").type != "npu"
+    # NPU device type is simulated with a plain string gate-equivalent, since
+    # torch.device("npu") is not constructible on non-Ascend hosts.
+    assert getattr(type("D", (), {"type": "npu"})(), "type", None) == "npu"

@@ -25,6 +25,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     _beam_graph_enabled_for_run,
     _beam_remap_inputs,
     _create_beam_context,
+    _materialize_logits_indices,
 )
 
 logger = init_logger(__name__)
@@ -59,7 +60,7 @@ def make_patched_prepare_inputs_npu(_orig_prepare_inputs):
         ) = out
 
         new_logits_indices = _beam_remap_inputs(self, scheduler_output, num_scheduled_tokens)
-        logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+        logits_indices = _materialize_logits_indices(self, new_logits_indices)
 
         return (
             logits_indices,

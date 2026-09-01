@@ -256,6 +256,14 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     max_reqs, dtype=torch.int32, device=self.device
                 )
 
+                # Single pinned host + device staging pair so every per-step
+                # seqlens / cu_seqlens int32 array is moved device-side in ONE
+                # H2D transfer instead of N independent small ones.  With W=128
+                # the per-step build() was launching ~6 tiny HtoD copies whose
+                # launch latency dominated the host time of _build_attention_metadata.
+                self._h2d_host = torch.zeros(4 * max_segs, dtype=torch.int32, pin_memory=True)
+                self._h2d_dev = torch.zeros(4 * max_segs, dtype=torch.int32, device=self.device)
+
     def _update_aot_schedule(self, fast_build: bool):
         self.aot_schedule = self.aot_schedule and not fast_build
         if self.aot_sliding_window is None:
@@ -273,6 +281,170 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         if self._is_cuda and envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
         return max_num_splits
+
+    def _geom_cache_key(
+        self,
+        num_reqs: int,
+        req_ids: list,
+        beam_data: dict,
+        q_starts: list,
+        seq_lens_cpu_list: list[int],
+        is_incremental: bool,
+    ):
+        """Return the geometry cache key for the SHAPE-ONLY (step-invariant)
+        part of the batch.
+
+        The build() geometry (prefix/suffix seqlens structure, indices,
+        cu_seqlens, block table layout) depends only on the batch composition
+        and the beam request geometry (widths / prefix_len / cache_len).  It
+        does NOT depend on ``seq_lens_cpu_list``: for a pure beam batch the
+        standard (non-beam) partition is empty and every beam length is derived
+        from ``prefix_len``/``cache_len``/``beam_width``, which are constant for
+        the lifetime of an incremental beam session.  The optimistic sequence
+        length vLLM feeds in grows every decode step, so it must not be part of
+        the key or the cache would miss every frame.  ``q_starts`` (the per-
+        step query layout) is likewise excluded: it only offsets
+        ``prefix_indices`` / block-table rows, which are written per step
+        outside this cache; the cached payloads (fixed prefix/suffix seqlens
+        + cu_seqlens_q) do not change with the query start offset.
+        ``decode_step`` is intentionally excluded — only the two suffix
+        step-derived arrays are rebuilt per step.  Returns None for non-beam or
+        mixed batches, which then fall back to the full per-step construction
+        path.
+        """
+        if not is_incremental or not beam_data or num_reqs == 0:
+            return None
+        try:
+            beam_view = []
+            for req_id in req_ids:
+                mdata = beam_data.get(req_id)
+                if mdata is None:
+                    return None
+                if not mdata.get("is_beam_decode", False):
+                    return None
+                beam_view.append(
+                    (
+                        req_id,
+                        mdata["beam_width"],
+                        mdata["prefix_len"],
+                        mdata["cache_len"],
+                    )
+                )
+        except (KeyError, TypeError):
+            return None
+        # Serializable key: request ids are stable within a session; keep the
+        # tuple hashable and deterministic across steps.
+        return (
+            tuple(beam_view),
+            self.block_size,
+        )
+
+    def _geometry_cache(self) -> dict:
+        cache = getattr(self, "_geom_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_geom_cache", cache)
+        return cache
+
+    def _cached_seqlens_views(
+        self,
+        geom_key,
+        *,
+        n_pk: int,
+        n_pc: int,
+        n_sk: int,
+        n_scq: int,
+        n_sck: int,
+    ):
+        """Return the five fixed seqlens/cu_seqlens device views for a geometry.
+
+        When ``geom_key`` has already produced these views, they are returned
+        from a cache instead of re-slicing the address-stable buffers every
+        step.  Because a cache hit means the beam geometry (widths /
+        prefix_len / cache_len) is unchanged, the slice extents ``n_*`` are
+        identical on every step, so the reused view objects stay valid (their
+        storage is the fixed-address device buffer; per-step values are updated
+        in place by the caller).
+
+        Returns ``(prefix_seqlens_kv, prefix_cu_seqlens_q, suffix_seqlens_kv,
+        suffix_cu_seqlens_q, suffix_cu_seqlens_k)`` or None when ``geom_key``
+        is None (fall back to full per-step slicing).
+        """
+        if geom_key is None:
+            return None
+        views_cache = self._geometry_cache().setdefault("views", {})
+        cached = views_cache.get(geom_key)
+        if cached is not None:
+            return cached
+        views = (
+            self._prefix_seqlens_kv_buf[:n_pk],
+            self._prefix_cu_seqlens_q_buf[:n_pc],
+            self._suffix_seqlens_kv_buf[:n_sk],
+            self._suffix_cu_seqlens_q_buf[:n_scq],
+            self._suffix_cu_seqlens_k_buf[:n_sck],
+        )
+        views_cache[geom_key] = views
+        return views
+
+    def _upload_incremental_seqlens(
+        self,
+        geom_key,
+        decode_step: int,
+        *,
+        prefix_seqlens_kv_view,
+        prefix_cu_seqlens_q_view,
+        suffix_seqlens_kv_view,
+        suffix_cu_seqlens_q_view,
+        suffix_cu_seqlens_k_view,
+        prefix_seqlens_kv_cpu,
+        prefix_cu_seqlens_q_cpu,
+        suffix_cu_seqlens_q_cpu,
+    ) -> bool:
+        """Upload fixed beam seqlens once per geometry, refresh step-derived ones.
+
+        Incremental decode: only ``suffix_seqlens_kv`` and
+        ``suffix_cu_seqlens_k`` depend on ``decode_step``.  The three fixed
+        payloads are written to the address-stable buffers exactly once per
+        ``geom_key``; later steps skip them.  The step-derived suffix arrays
+        are rebuilt on device with ``fill_`` / ``arange`` from
+        ``decode_step`` — no host list, no H2D.
+
+        Returns True when the caller should skip the generic
+        ``_pack_int32_to_dev`` path (geom_key admitted the cache), False to
+        fall back to full construction.
+        """
+        if geom_key is None or decode_step is None:
+            return False
+        cache = self._geometry_cache()
+        if not cache.get(geom_key, False):
+            self._pack_int32_to_dev(
+                [
+                    (prefix_seqlens_kv_view, list(prefix_seqlens_kv_cpu)),
+                    (prefix_cu_seqlens_q_view, [0] + list(prefix_cu_seqlens_q_cpu)),
+                    (suffix_cu_seqlens_q_view, [0] + list(suffix_cu_seqlens_q_cpu)),
+                ]
+            )
+            cache[geom_key] = True
+
+        # Device-side step update (no H2D):
+        #   suffix_seqlens_kv   = [s+1]*w
+        #   suffix_cu_seqlens_k = [0, s+1, 2(s+1), ..., w*(s+1)]
+        # A single strided arange emits the cu_seqlens_k array directly (its
+        # i-th element is i*s), avoiding the separate arange+mul_ pair — just
+        # two small launches per step instead of three.
+        s = decode_step + 1
+        num_suffix = suffix_seqlens_kv_view.numel()
+        suffix_seqlens_kv_view.fill_(s)
+        if suffix_cu_seqlens_k_view is not None:
+            torch.arange(
+                0,
+                (num_suffix + 1) * s,
+                step=s,
+                dtype=torch.int32,
+                device=self.device,
+                out=suffix_cu_seqlens_k_view,
+            )
+        return True
 
     def _get_schedule(
         self,
@@ -467,9 +639,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 decode_step = beam_decode_step_list[idx]
                 # Each beam: 1 query token, decode_step+1 suffix KV tokens
                 # Prefix: all beams share the same prefix_len
-                for b in range(w):
-                    suffix_seqlens_q_cpu.append(1)
-                    suffix_seqlens_kv_cpu.append(decode_step + 1)
+                # List-multiplication extends in C (vs a per-beam Python append
+                # loop that dominates the host time of _build_beam_mappings for
+                # beam_width=128 on every decode step).
+                suffix_seqlens_q_cpu.extend([1] * w)
+                suffix_seqlens_kv_cpu.extend([decode_step + 1] * w)
 
                 # All beams share the same prefix group
                 beam_prefix_indices.extend(range(q_start, q_start + w))
@@ -557,6 +731,46 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_prefix_blocks_count,
         )
 
+    def _pack_int32_to_dev(self, entries: list[tuple[Any, list[int]]]) -> None:
+        """Write several small host int lists to device in ONE H2D.
+
+        ``entries`` is a list of ``(dst_slice, host_list)``.  All the step's
+        seqlens / cu_seqlens / index metadata is staged into a single pinned
+        host buffer, moved across the PCIe bus once, then scattered into the
+        preallocated (address-stable) device buffers with device-to-device
+        copies.  This replaces N independent ``async torch.tensor(...).copy_``
+        HtoD calls, whose per-copy launch latency dominated the host time of
+        ``_build_attention_metadata`` for beam decode.
+
+        Needs ``self._fixed_buffers`` and the ``_h2d_host`` / ``_h2d_dev``
+        staging pair allocated by ``__init__``.
+        """
+        total = sum(len(host_list) for _dst, host_list in entries)
+        if total == 0:
+            return
+        assert total <= self._h2d_host.numel(), (
+            f"beam metadata host staging overflow: {total} > {self._h2d_host.numel()}"
+        )
+
+        # Build the host payload with one numpy concatenate instead of a
+        # per-entry ``torch.as_tensor(list)`` + ``copy_`` pair.  The Python
+        # list -> tensor conversion per entry is the dominant host cost at this
+        # size (the arrays total only a few KB), so a single bulk write into
+        # the pinned staging keeps the PCIe transfer as the only real work.
+        np_dtype = np.int32 if self._h2d_host.dtype == torch.int32 else np.int64
+        segments = [np.asarray(hl, dtype=np_dtype) for _dst, hl in entries]
+        packed = np.concatenate(segments) if len(segments) > 1 else segments[0]
+        self._h2d_host[:total].copy_(torch.from_numpy(packed))
+        # Single host -> device transfer for the whole payload.
+        self._h2d_dev[:total].copy_(self._h2d_host[:total])
+
+        off = 0
+        for dst, host_list in entries:
+            n = len(host_list)
+            if n:
+                dst.copy_(self._h2d_dev[off : off + n])
+                off += n
+
     def _create_std_tensors(
         self,
         std_indices,
@@ -577,19 +791,19 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         if self._fixed_buffers:
             std_indices_tensor = self._std_indices_buf[:num_std]
-            std_indices_tensor.copy_(torch.tensor(std_indices, dtype=torch.long, device=device))
+            std_indices_tensor.copy_(torch.as_tensor(std_indices, dtype=torch.long, device="cpu"))
             std_block_table = self._std_block_table_buf[: len(std_req_idxs), :num_std_blocks]
             std_block_table.copy_(
                 common_attn_metadata.block_table_tensor[std_req_idxs, :num_std_blocks]
             )
             num_cu = len(std_cu_seqlens_q_cpu) + 1  # +1 for leading 0
             std_cu_seqlens_q_device = self._std_cu_seqlens_q_buf[:num_cu]
-            std_cu_seqlens_q_device.copy_(
-                torch.tensor([0] + std_cu_seqlens_q_cpu, dtype=torch.int32, device=device)
-            )
             std_seqlens_kv_device = self._std_seqlens_kv_buf[: len(std_seqlens_kv_cpu)]
-            std_seqlens_kv_device.copy_(
-                torch.tensor(std_seqlens_kv_cpu, dtype=torch.int32, device=device)
+            self._pack_int32_to_dev(
+                [
+                    (std_cu_seqlens_q_device, [0] + list(std_cu_seqlens_q_cpu)),
+                    (std_seqlens_kv_device, list(std_seqlens_kv_cpu)),
+                ]
             )
         else:
             std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
@@ -637,6 +851,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_blocks_count,
         device,
         max_num_splits: int,
+        *,
+        geom_key=None,
+        decode_step: int | None = None,
     ):
         if not prefix_seqlens_q_cpu:
             # Full structured initializations for profiling warm-up model passes
@@ -673,9 +890,26 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         if self._fixed_buffers:
             prefix_indices_tensor = self._prefix_indices_buf[:num_prefix]
-            prefix_indices_tensor.copy_(
-                torch.tensor(prefix_indices, dtype=torch.long, device=device)
-            )
+            # Incremental decode produces a contiguous prefix index range
+            # (q_start .. q_start+w).  Emit it on device with a strided arange
+            # instead of converting the Python list every step (no host list,
+            # no H2D).  Only take this path when the whole list is verified
+            # contiguous; anything else (multi-request recompute layout) falls
+            # back to the host list transfer.
+            if num_prefix and all(
+                prefix_indices[i] == prefix_indices[0] + i for i in range(num_prefix)
+            ):
+                torch.arange(
+                    prefix_indices[0],
+                    prefix_indices[0] + num_prefix,
+                    dtype=torch.long,
+                    device=device,
+                    out=prefix_indices_tensor,
+                )
+            else:
+                prefix_indices_tensor.copy_(
+                    torch.as_tensor(prefix_indices, dtype=torch.long, device="cpu")
+                )
             # G1 constant prefix geometry: use a FIXED max_seqlen_k upper
             # bound (the full block-table capacity) and the FULL-WIDTH
             # block-table view, so the FA2 launch parameters baked into a
@@ -716,31 +950,65 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         if self._fixed_buffers:
             num_prefix_groups = len(prefix_seqlens_kv_cpu)
-            prefix_seqlens_kv_device = self._prefix_seqlens_kv_buf[:num_prefix_groups]
-            prefix_seqlens_kv_device.copy_(
-                torch.tensor(prefix_seqlens_kv_cpu, dtype=torch.int32, device=device)
-            )
             num_prefix_cu = len(prefix_cu_seqlens_q_cpu) + 1
-            prefix_cu_seqlens_q_device = self._prefix_cu_seqlens_q_buf[:num_prefix_cu]
-            prefix_cu_seqlens_q_device.copy_(
-                torch.tensor([0] + prefix_cu_seqlens_q_cpu, dtype=torch.int32, device=device)
-            )
-
             num_suffix_beams = len(suffix_seqlens_kv_cpu)
-            suffix_seqlens_kv_device = self._suffix_seqlens_kv_buf[:num_suffix_beams]
-            suffix_seqlens_kv_device.copy_(
-                torch.tensor(suffix_seqlens_kv_cpu, dtype=torch.int32, device=device)
-            )
             num_suffix_cu_q = len(suffix_cu_seqlens_q_cpu) + 1
-            suffix_cu_seqlens_q_device = self._suffix_cu_seqlens_q_buf[:num_suffix_cu_q]
-            suffix_cu_seqlens_q_device.copy_(
-                torch.tensor([0] + suffix_cu_seqlens_q_cpu, dtype=torch.int32, device=device)
-            )
             num_suffix_cu_k = len(suffix_cu_seqlens_kv_cpu) + 1
-            suffix_cu_seqlens_k_device = self._suffix_cu_seqlens_k_buf[:num_suffix_cu_k]
-            suffix_cu_seqlens_k_device.copy_(
-                torch.tensor([0] + suffix_cu_seqlens_kv_cpu, dtype=torch.int32, device=device)
+
+            # Reuse the fixed-address seqlens views for a known geometry
+            # instead of re-slicing the address-stable buffers every step.
+            cached_views = self._cached_seqlens_views(
+                geom_key,
+                n_pk=num_prefix_groups,
+                n_pc=num_prefix_cu,
+                n_sk=num_suffix_beams,
+                n_scq=num_suffix_cu_q,
+                n_sck=num_suffix_cu_k,
             )
+            if cached_views is not None:
+                (
+                    prefix_seqlens_kv_device,
+                    prefix_cu_seqlens_q_device,
+                    suffix_seqlens_kv_device,
+                    suffix_cu_seqlens_q_device,
+                    suffix_cu_seqlens_k_device,
+                ) = cached_views
+            else:
+                prefix_seqlens_kv_device = self._prefix_seqlens_kv_buf[:num_prefix_groups]
+                prefix_cu_seqlens_q_device = self._prefix_cu_seqlens_q_buf[:num_prefix_cu]
+                suffix_seqlens_kv_device = self._suffix_seqlens_kv_buf[:num_suffix_beams]
+                suffix_cu_seqlens_q_device = self._suffix_cu_seqlens_q_buf[:num_suffix_cu_q]
+                suffix_cu_seqlens_k_device = self._suffix_cu_seqlens_k_buf[:num_suffix_cu_k]
+
+            # Incremental decode admits the fixed-geometry cache: write the three
+            # step-invariant payloads once per geometry, then refresh the
+            # decode_step-derived suffix arrays on device (zero H2D).
+            if self._upload_incremental_seqlens(
+                geom_key,
+                decode_step,
+                prefix_seqlens_kv_view=prefix_seqlens_kv_device,
+                prefix_cu_seqlens_q_view=prefix_cu_seqlens_q_device,
+                suffix_seqlens_kv_view=suffix_seqlens_kv_device,
+                suffix_cu_seqlens_q_view=suffix_cu_seqlens_q_device,
+                suffix_cu_seqlens_k_view=suffix_cu_seqlens_k_device,
+                prefix_seqlens_kv_cpu=prefix_seqlens_kv_cpu,
+                prefix_cu_seqlens_q_cpu=prefix_cu_seqlens_q_cpu,
+                suffix_cu_seqlens_q_cpu=suffix_cu_seqlens_q_cpu,
+            ):
+                pass
+            else:
+                # One pinned host->device transfer carries prefix + suffix
+                # seqlens and cu_seqlens payloads; D2D scatter then fills the
+                # fixed buffers.
+                self._pack_int32_to_dev(
+                    [
+                        (prefix_seqlens_kv_device, list(prefix_seqlens_kv_cpu)),
+                        (prefix_cu_seqlens_q_device, [0] + list(prefix_cu_seqlens_q_cpu)),
+                        (suffix_seqlens_kv_device, list(suffix_seqlens_kv_cpu)),
+                        (suffix_cu_seqlens_q_device, [0] + list(suffix_cu_seqlens_q_cpu)),
+                        (suffix_cu_seqlens_k_device, [0] + list(suffix_cu_seqlens_kv_cpu)),
+                    ]
+                )
         elif self._is_cuda:
             # Tests / kernel harnesses that skip __init__ buffer alloc.
             prefix_seqlens_kv_device = torch.tensor(
@@ -812,7 +1080,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         req_ids = beam_info["req_ids"] if beam_info else []
 
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
-        seq_lens_cpu_list = common_attn_metadata.seq_lens.cpu().tolist()
+        # Prefer the runner's CPU mirror (populated by _prepare_inputs) to avoid
+        # a device->host .cpu() round-trip on every build().
+        seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() >= num_reqs:
+            seq_lens_cpu_list = seq_lens_cpu[:num_reqs].tolist()
+        else:
+            seq_lens_cpu_list = common_attn_metadata.seq_lens.cpu().tolist()
 
         # Get beam_session early so _segment_requests can use it for slot lookup
         beam_session = beam_info.get("beam_session") if beam_info else None
@@ -844,6 +1118,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         is_incremental = (
             beam_session is not None and beam_session.is_active and len(beam_decode_step_list) > 0
         )
+        geom_key = self._geom_cache_key(
+            num_reqs, req_ids, beam_data, q_starts, seq_lens_cpu_list, is_incremental
+        )
+        decode_step = beam_decode_step_list[0] if beam_decode_step_list else None
 
         (
             prefix_indices,
@@ -918,6 +1196,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             max_prefix_blocks_count,
             device,
             max_num_splits,
+            geom_key=geom_key,
+            decode_step=decode_step,
         )
 
         # Determine incremental decode metadata

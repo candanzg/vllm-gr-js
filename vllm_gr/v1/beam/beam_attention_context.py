@@ -164,6 +164,13 @@ class BeamAttentionContext:
         # allocation; request i maps to pool slot xllm_block_table_buf[i]).
         self.xllm_block_table_buf = torch.zeros(max_batch, dtype=torch.int32, device=device)
 
+        # Whether the attached worker consumes the NPU xllm device buffers
+        # (decode_step_1based_buf / xllm_block_table_buf).  Only NPU kernels
+        # read them; on GPU the Triton copy_suffix/cache_unshared kernels read
+        # ``decode_step_buf`` alone, so the per-step fill_ of the xllm buffers
+        # (two redundant launches on the same stream) is skipped there.
+        self._gr_uses_xllm_buffers = getattr(device, "type", None) == "npu"
+
         # aux_key_buf / aux_value_buf: pre-allocated PER-LAYER scratch buffers
         # for select_unshared_kv. The leading dim is num_layers: the fused
         # Triton path reorders all layers in one launch, so each layer must

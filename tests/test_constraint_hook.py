@@ -422,6 +422,55 @@ def test_run_constrained_partition_uses_request_temperature() -> None:
     assert seen[0].tolist() == pytest.approx([0.7, 0.7])
 
 
+def test_run_constrained_partition_restores_canonical_row_order_across_steps() -> None:
+    """Mixed FSM steps run step-grouped but output rows realign to logits rows.
+
+    The step-1 request (``b``) occupies the *higher* canonical rows, so the
+    ascending-step submission order would emit rows ``[2, 3, 0, 1]``; the
+    operator results must be gathered back to canonical sampler row order.
+    """
+    rows = [
+        ("a", 0, 2, _decode_mdata(step=2, width=2, suffix=[[7, 9], [8, 10]])),
+        ("b", 2, 2, _decode_mdata(step=1, width=2, suffix=[[1], [4]])),
+    ]
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(
+            sampling_metadata=SimpleNamespace(temperature=torch.tensor([1.0, 1.0, 0.5, 0.5]))
+        ),
+    )
+
+    class _RowIdentityAdapter:
+        def run(
+            self,
+            logits: Any,
+            sequence_group: Any,
+            temperatures: Any,
+            current_step: int,
+            top_k: int,
+        ) -> Any:
+            rows_n = logits.shape[0]
+            return SimpleNamespace(
+                top_tokens=logits[:, :top_k].to(torch.int32).contiguous(),
+                top_logprobs=torch.full((rows_n, top_k), -0.5, dtype=torch.float32),
+                valid_mask=torch.ones((rows_n, top_k), dtype=torch.bool),
+            )
+
+    # Each logits column of row ``r`` holds the value ``r``, so the adapter's
+    # identity ``top_tokens`` reveals which logits row every output row came from.
+    logits = torch.arange(4, dtype=torch.float32).unsqueeze(1).expand(4, 5).contiguous()
+
+    top_tokens, top_logprobs, valid_mask, global_rows = run_constrained_partition(
+        runner, logits, rows, width=2, adapter=_RowIdentityAdapter()
+    )
+
+    assert global_rows == [0, 1, 2, 3]
+    assert top_tokens[:, 0].tolist() == [0, 1, 2, 3]
+    assert top_tokens[:, 1].tolist() == [0, 1, 2, 3]
+    assert tuple(top_logprobs.shape) == (4, 2)
+    assert valid_mask.all()
+
+
 # --------------------------------------------------------------------------
 # apply_constrained_sample_override
 # --------------------------------------------------------------------------

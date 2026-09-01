@@ -42,6 +42,7 @@ from vllm_gr.v1.worker.model_runner_common import (
     _create_beam_context as _common_create_beam_context,
 )
 from vllm_gr.v1.worker.model_runner_common import (
+    _materialize_logits_indices,
     _reduce_sampler_output_for_worker_decision,
 )
 
@@ -205,7 +206,7 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
         with torch.autograd.profiler.record_function("prefill_constraint_prepare"):
             prepare_cuda_prefill_constraint(self, scheduler_output)
         return (
-            torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device),
+            _materialize_logits_indices(self, new_logits_indices),
             spec_decode_metadata,
         )
 

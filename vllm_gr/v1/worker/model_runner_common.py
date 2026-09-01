@@ -111,10 +111,12 @@ def _process_beam_decode_request(
     # --- Incremental decode path ---
     if is_incremental:
         decode_step = mdata.get("decode_step", 0)
-        for b in range(beam_width):
-            # Each beam: 1 token, position = prefix_len + decode_step
-            new_logits_indices.append(token_offset + b)
-            active_beam_ids.append(b)
+        # W identical single-token rows: contiguous logits rows and the full
+        # beam set.  Built with C-level list ops instead of a per-beam Python
+        # append loop (the loop dominated the host time of this function for
+        # beam_width=128 on every decode step).
+        new_logits_indices.extend(range(token_offset, token_offset + beam_width))
+        active_beam_ids = list(range(beam_width))
 
         # All beams share one constant position id this step, so a scalar
         # slice-fill is enough: a single device-side fill kernel, no host
@@ -378,14 +380,34 @@ class InputBatchProxy:
                 return cached
 
             orig_req_len = len(obj.req_ids) if hasattr(obj, "req_ids") else 1
-            idx_tensor = None
+            # Group per-request sampling tensors by dtype and remap each group
+            # with a single device gather instead of one ``aten::index`` kernel
+            # per attribute (7 kernels per decode step in profiling).  The
+            # per-attribute results are views into the gathered buffer, so no
+            # extra kernels are emitted when the sampler consumes them.
+            pending: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
             for attr in _SAMPLING_META_ATTRS:
                 val = getattr(s_meta, attr, None)
                 if isinstance(val, torch.Tensor) and val.numel() > 0:
                     if val.shape[0] == orig_req_len and val.shape[0] != len(logits_map):
-                        if idx_tensor is None:
-                            idx_tensor = self._logits_idx_tensor(val.device)
-                        object.__setattr__(s_meta, attr, val[idx_tensor])
+                        pending.setdefault(val.dtype, []).append((attr, val))
+            if pending:
+                first_val = next(iter(next(iter(pending.values()))))[1]
+                idx_tensor = self._logits_idx_tensor(first_val.device)
+                for dtype, items in pending.items():
+                    names = [n for n, _ in items]
+                    # Stack attributes on dim 0 ([num_attrs, num_reqs]) and
+                    # gather on dim 1, so each remapped attribute comes out
+                    # contiguous (stride 1).  Stacking on dim -1 then unbinding
+                    # dim -1 yields strided column views (e.g. top_p with
+                    # stride 5); vLLM 0.22.1's Triton top-p kernel loads the
+                    # row pointer without a stride, so a non-contiguous column
+                    # would silently read interleaved penalties/temperature as
+                    # top_p values and corrupt filtering.
+                    stacked = torch.stack([v for _, v in items], dim=0)
+                    gathered = stacked.index_select(1, idx_tensor)
+                    for attr_name, col in zip(names, gathered.unbind(dim=0)):
+                        object.__setattr__(s_meta, attr_name, col)
             object.__setattr__(self, "_sampling_metadata_cache", s_meta)
             return s_meta
 
@@ -513,6 +535,58 @@ def _beam_remap_inputs(runner, scheduler_output, num_scheduled_tokens) -> list[i
     _ = runner.input_batch.sampling_metadata
 
     return new_logits_indices
+
+
+def _materialize_logits_indices(runner: Any, indices: list[int]) -> torch.Tensor:
+    """Copy per-beam ``logits_indices`` into a runner-owned reusable buffer.
+
+    The legacy path built a fresh ``torch.tensor(list, device=...)`` on every
+    beam step, paying a CUDA allocation + host->device transfer each time.
+    This keeps one int32 device buffer on the runner (sized to the first
+    request's footprint) and reuses it in place, so repeated decode steps only
+    pay the host->device ``copy_`` of the newly expanded indices.
+
+    Fully incremental beam decode fills ``indices`` as the contiguous range
+    ``[0, num_logits)``; that shape is materialized directly on the device with
+    ``torch.arange``, eliminating the host->device copy (and the Python list
+    itself) entirely.  A non-contiguous index list (chunked prefill / standard
+    recompute rows) falls back to the host copy path.
+
+    Returns a view of the buffer containing exactly the given indices.  The
+    caller must consume the value before the next call to this helper (the
+    buffer is intentionally overwritten on the next beam step), matching the
+    one-step lifetime of ``logits_indices`` inside ``execute_model``.
+    """
+    n = len(indices)
+    buffer = getattr(runner, "_gr_logits_indices_buffer", None)
+    if buffer is None or buffer.numel() < n:
+        buffer = torch.empty(n, dtype=torch.int32, device=runner.device)
+        runner._gr_logits_indices_buffer = buffer
+
+    # Contiguous incremental decode: materialize on device, no H2D.
+    if n and indices[-1] == n - 1 and _is_contiguous_range(indices):
+        torch.arange(n, dtype=torch.int32, device=runner.device, out=buffer[:n])
+        return buffer[:n]
+
+    buffer[:n].copy_(torch.as_tensor(indices, dtype=torch.int32))
+    return buffer[:n]
+
+
+def _is_contiguous_range(indices: list[int]) -> bool:
+    """Return whether ``indices`` equals ``range(0, len(indices))``.
+
+    Pure incremental beam decode produces exactly this shape; detecting it
+    lets ``_materialize_logits_indices`` emit a device-side ``arange`` and
+    skip the host->device transfer entirely.  The ``[-1]`` sentinel is cheap
+    and covers the common (single-request) case; the full loop only runs when
+    the tail matches.
+    """
+    if not indices:
+        return True
+    for i, value in enumerate(indices):
+        if value != i:
+            return False
+    return True
 
 
 def _beam_collapse_bookkeeping(
@@ -1314,13 +1388,18 @@ def make_patched_execute_model(_orig_execute_model):
             # decode_step_1based_buf / xllm_block_table_buf: device inputs for
             # the xllm fused kernels (NPU).  Same refresh-outside-the-graph
             # contract — a captured ACL graph reads fresh values at replay.
-            if hasattr(context, "decode_step_1based_buf"):
-                context.decode_step_1based_buf.fill_(decode_step + 1)
-            if hasattr(context, "xllm_block_table_buf"):
-                # max_batch-sized; request 0 maps to the active session's pool
-                # slot (the registry is max_batch=1, so one active session).
-                context.xllm_block_table_buf.fill_(0)
-                context.xllm_block_table_buf[0] = beam_session.slot
+            # Only NPU kernels consume them; on GPU (Triton cache_unshared /
+            # copy_suffix reads decode_step_buf only) skip the two redundant
+            # fill_ launches to cut per-step stream setup time.
+            if getattr(context, "_gr_uses_xllm_buffers", True):
+                if hasattr(context, "decode_step_1based_buf"):
+                    context.decode_step_1based_buf.fill_(decode_step + 1)
+                if hasattr(context, "xllm_block_table_buf"):
+                    # max_batch-sized; request 0 maps to the active session's
+                    # pool slot (the registry is max_batch=1, so one active
+                    # session).
+                    context.xllm_block_table_buf.fill_(0)
+                    context.xllm_block_table_buf[0] = beam_session.slot
 
         token = BEAM_DATA_VAR.set(beam_info)
         self._current_beam_info = beam_info
