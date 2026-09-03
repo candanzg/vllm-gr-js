@@ -500,3 +500,334 @@ def test_create_beam_tensors_geom_key_arrange_contiguity() -> None:
     # Non-contiguous layout under a geom_key must NOT be wrongly ranged.
     m = run([3, 7, 11])
     assert m[0].tolist() == [3, 7, 11]
+
+
+def test_create_beam_tensors_explicit_contiguous_flag_skips_scan() -> None:
+    """``prefix_indices_contiguous`` is the explicit verdict from
+    _build_beam_mappings: when supplied, the per-element ``all()`` scan is
+    skipped and the arange fast path is taken directly.  When absent (None),
+    the conservative scan runs."""
+    builder = _make_fixed_builder()
+    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
+    geom_key = ("beam", (1, 4, 8, 3), (0, 4), (4,), builder.block_size)
+
+    def run(prefix_indices: list[int], **kw: Any) -> Any:
+        return builder._create_beam_tensors(
+            common,
+            prefix_indices=prefix_indices,
+            prefix_seqlens_q_cpu=[len(prefix_indices)],
+            prefix_cu_seqlens_q_cpu=[len(prefix_indices)],
+            prefix_seqlens_kv_cpu=[8],
+            suffix_seqlens_q_cpu=[1] * len(prefix_indices),
+            suffix_cu_seqlens_q_cpu=list(range(1, len(prefix_indices) + 1)),
+            suffix_cu_seqlens_kv_cpu=[1] * len(prefix_indices),
+            suffix_seqlens_kv_cpu=[1] * len(prefix_indices),
+            suffix_slot_mapping_out_list=[],
+            prefix_req_idxs_cpu=[0],
+            max_prefix_blocks_count=2,
+            device=torch.device("cpu"),
+            max_num_splits=0,
+            geom_key=geom_key,
+            decode_step=0,
+            **kw,
+        )
+
+    # Explicit True: arange fast path without the scan.
+    m = run([5, 6, 7, 8], prefix_indices_contiguous=True)
+    assert m[0].tolist() == [5, 6, 7, 8]
+    # Precomputed scalars are consumed (prefix_max_q_len visible in the tuple).
+    m = run([5, 6, 7, 8], prefix_indices_contiguous=True, prefix_max_q_len=4, suffix_max_q_len=1)
+    assert m[0].tolist() == [5, 6, 7, 8]
+    # Explicit False: host copy even for a visually contiguous list.
+    m = run([0, 1, 2, 3], prefix_indices_contiguous=False)
+    assert m[0].tolist() == [0, 1, 2, 3]
+
+
+def test_build_beam_mappings_incremental_returns_analytic_scalars() -> None:
+    """The incremental path returns its scalar reductions analytically:
+    a contiguous prefix flag of True and per-geometry max q lens; the
+    recompute path returns False (scan required) and list-derived maxima."""
+    builder = _make_builder()
+    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
+    geom_key = ("beam", (1, 4, 8, 8), builder.block_size)
+
+    inc = builder._build_beam_mappings(
+        beam_req_idxs=[0],
+        beam_prefix_lens=[8],
+        beam_widths=[4],
+        beam_decode_steps=[1],
+        beam_cache_lens=[8],
+        beam_q_start_offsets=[0],
+        q_starts=[0, 4],
+        common_attn_metadata=common,
+        is_incremental=True,
+        beam_decode_step_list=[2],
+        geom_key=geom_key,
+    )
+    # Tail of the tuple: (..., max_prefix_blocks_count, contiguous, pql, sql, skl)
+    assert inc[-4] is True  # prefix_indices_contiguous
+    assert inc[-3] == 4  # prefix_max_q_len == beam_width
+    assert inc[-2] == 1  # suffix_max_q_len (one query token per beam)
+    assert inc[-1] == 3  # suffix_max_seq_len == decode_step + 1 (step=2)
+
+    rec = builder._build_beam_mappings(
+        beam_req_idxs=[0],
+        beam_prefix_lens=[8],
+        beam_widths=[4],
+        beam_decode_steps=[2],
+        beam_cache_lens=[8],
+        beam_q_start_offsets=[0],
+        q_starts=[0, 4],
+        common_attn_metadata=common,
+        is_incremental=False,
+        beam_decode_step_list=None,
+        geom_key=None,
+    )
+    # The recompute path reports the SCANNED verdict (this single-group layout
+    # happens to be contiguous); multi-group gather layouts scan False.
+    assert rec[-4] is True
+    assert rec[-3] == 4  # prefix_max_q_len derived from the group list
+    assert rec[-2] == 2  # suffix_max_q_len: recompute splits chunk budget (2/beam)
+    assert rec[-1] == 2  # suffix_max_seq_len derived from suffix_seqlens_kv list
+
+
+def test_beam_mappings_fixed_cumsum_cached_per_geom() -> None:
+    """Fixed cu_seqlens lists are cached per geom_key, not recomputed per step.
+
+    Incremental decode only varies ``suffix_seqlens_kv`` (and its cumsum) with
+    ``decode_step``; the prefix cumsums and ``suffix_cu_seqlens_q`` are fixed
+    per geometry.  A geom_key hit reuses those lists instead of paying a numpy
+    cumsum + tolist on every decode step, while the step-dependent suffix
+    cumsum is still recomputed."""
+    builder = _make_builder()
+    common = _common_metadata([0, 4], [4], [[1, 2, 3, 4]])
+    geom_key = ("beam", (1, 4, 8, 8), builder.block_size)
+
+    def run(step: int) -> Any:
+        return builder._build_beam_mappings(
+            beam_req_idxs=[0],
+            beam_prefix_lens=[8],
+            beam_widths=[4],
+            beam_decode_steps=[1],
+            beam_cache_lens=[8],
+            beam_q_start_offsets=[0],
+            q_starts=[0, 4],
+            common_attn_metadata=common,
+            is_incremental=True,
+            beam_decode_step_list=[step],
+            geom_key=geom_key,
+        )
+
+    m0 = run(0)
+    assert m0[7] == [4]  # prefix_cu_seqlens_q_cpu (cumsum([4]))
+    assert m0[8] == [8]  # prefix_cu_seqlens_kv_cpu (cumsum([8]))
+    assert m0[9] == [1, 2, 3, 4]  # suffix_cu_seqlens_q_cpu (cumsum([1]*4))
+    assert m0[10] == [1, 2, 3, 4]  # suffix_cu_seqlens_kv_cpu, step 0 -> s=1
+
+    # Same geometry, later step: fixed lists must be the SAME objects (cache
+    # hit, no recompute); the step-derived suffix_cu_seqlens_kv changes.
+    m1 = run(2)
+    assert m1[7] is m0[7] and m1[8] is m0[8] and m1[9] is m0[9]
+    assert m1[10] == [3, 6, 9, 12]  # step 2 -> s=3, recomputed
+
+    # A different geometry must not share the cached lists.
+    other_key = ("beam", (2, 8, 16, 16), builder.block_size)
+    m2 = builder._build_beam_mappings(
+        beam_req_idxs=[0],
+        beam_prefix_lens=[16],
+        beam_widths=[2],
+        beam_decode_steps=[1],
+        beam_cache_lens=[16],
+        beam_q_start_offsets=[0],
+        q_starts=[0, 2],
+        common_attn_metadata=common,
+        is_incremental=True,
+        beam_decode_step_list=[0],
+        geom_key=other_key,
+    )
+    assert m2[7] is not m0[7]
+    assert m2[8] == [16]
+    assert m2[9] == [1, 2]
+
+
+def test_build_geometry_hit_fast_path_replays_layout() -> None:
+    """A second decode step with the same geometry replays the cached layout.
+
+    Frame 1 (miss) runs segmentation + std/beam mappings and registers the
+    layout in the geometry cache.  Frame 2 (hit) skips those functions
+    entirely: the fixed lists come from the cache, the step-derived suffix
+    lists are analytic, and the decode_step is re-read from THIS frame's
+    beam_data (never from the cache).
+    """
+
+    class _Registry:
+        def get_slot(self, req_id: str) -> int:
+            return 0
+
+    session = SimpleNamespace(is_active=True, context=SimpleNamespace(registry=_Registry()))
+    builder = _make_builder()
+
+    def run_build(step: int) -> BeamAttentionMetadata:
+        beam_data = {
+            "beam": {
+                "is_beam_decode": True,
+                "prefix_len": 8,
+                "beam_width": 4,
+                "beam_decode_steps": 2,
+                "cache_len": 8,
+                "decode_step": step,
+            }
+        }
+        common = _common_metadata([0, 4], [12], [[1, 2, 3, 4, 5, 6]])
+        token = BEAM_DATA_VAR.set(
+            {"beam_data": beam_data, "req_ids": ["beam"], "beam_session": session}
+        )
+        try:
+            return builder.build(0, common)
+        finally:
+            BEAM_DATA_VAR.reset(token)
+
+    # Frame 1 (decode_step=0): full path, registers the layout.
+    m1 = run_build(0)
+    assert m1.suffix_seqlens_kv_cpu == [1, 1, 1, 1]
+    assert m1.suffix_cu_seqlens_kv_cpu == [1, 2, 3, 4]
+    assert m1.is_beam_decode is True
+    assert m1.incremental_suffix_kv_len == 1
+
+    # Frame 2 (decode_step=2): geometry hit — the cached layout is replayed
+    # with THIS frame's step; suffix lists and scalars step forward.
+    m2 = run_build(2)
+    assert m2.suffix_seqlens_kv_cpu == [3, 3, 3, 3]
+    assert m2.suffix_cu_seqlens_kv_cpu == [3, 6, 9, 12]
+    assert m2.incremental_suffix_kv_len == 3
+    # Fixed geometry did not drift.
+    assert m2.prefix_seqlens_kv_cpu == m1.prefix_seqlens_kv_cpu
+    assert m2.suffix_cu_seqlens_q_cpu == m1.suffix_cu_seqlens_q_cpu
+
+    # A different geometry (beam_width change) must not replay the cache.
+    beam_data3 = {
+        "beam": {
+            "is_beam_decode": True,
+            "prefix_len": 8,
+            "beam_width": 2,
+            "beam_decode_steps": 2,
+            "cache_len": 8,
+            "decode_step": 0,
+        }
+    }
+    common3 = _common_metadata([0, 2], [10], [[1, 2, 3, 4, 5]])
+    token = BEAM_DATA_VAR.set(
+        {"beam_data": beam_data3, "req_ids": ["beam"], "beam_session": session}
+    )
+    try:
+        m3 = builder.build(0, common3)
+    finally:
+        BEAM_DATA_VAR.reset(token)
+    assert m3.suffix_seqlens_kv_cpu == [1, 1]
+
+
+def test_geometry_cache_evicts_finished_session_entries() -> None:
+    """Entries from a finished session are swept when a new session builds.
+
+    Session A's geometry leaves entries in the cu_lists / layout sub-caches
+    (keyed by A's request id).  When session B (a different request id)
+    builds, the eviction sweep drops every key whose request ids no longer
+    overlap the current batch, so a long-running server does not accumulate
+    one entry per historical request.
+    """
+
+    class _Registry:
+        def get_slot(self, req_id: str) -> int:
+            return 0
+
+    session = SimpleNamespace(is_active=True, context=SimpleNamespace(registry=_Registry()))
+    builder = _make_builder()
+
+    def run_build(req_id: str) -> None:
+        beam_data = {
+            req_id: {
+                "is_beam_decode": True,
+                "prefix_len": 8,
+                "beam_width": 4,
+                "beam_decode_steps": 2,
+                "cache_len": 8,
+                "decode_step": 0,
+            }
+        }
+        common = _common_metadata([0, 4], [12], [[1, 2, 3, 4, 5, 6]])
+        token = BEAM_DATA_VAR.set(
+            {"beam_data": beam_data, "req_ids": [req_id], "beam_session": session}
+        )
+        try:
+            builder.build(0, common)
+        finally:
+            BEAM_DATA_VAR.reset(token)
+
+    # Session A builds: layout/cu_lists entries registered under A's key.
+    run_build("req-a")
+    cache = builder._geometry_cache()
+    assert cache["layout"], "session A registered its layout"
+    assert cache["cu_lists"], "session A registered its cu_lists"
+    assert any("req-a" in str(k) for k in cache["layout"])
+
+    # Session B (different request id) builds: A's entries are swept.
+    run_build("req-b")
+    assert not any("req-a" in str(k) for k in cache["layout"])
+    assert not any("req-a" in str(k) for k in cache["cu_lists"])
+    assert any("req-b" in str(k) for k in cache["layout"])
+    # The set-valued block_table_copied sub-cache is swept too when present
+    # (its entries live in a set — deletion must use discard, not del).  The
+    # plain builder harness skips the fixed-buffer path, so guard for it.
+    btc = cache.get("block_table_copied")
+    if btc:
+        assert not any("req-a" in str(k) for k in btc)
+
+
+def test_block_table_copied_set_eviction_survives_fixed_buffers() -> None:
+    """The eviction sweep must handle the set-valued block_table_copied.
+
+    ``block_table_copied`` stores geom keys inside a SET (membership
+    markers, not a dict).  Deleting from a set with ``del`` raises
+    TypeError and killed the engine (offline beam search E2E); this test
+    drives the fixed-buffer path twice with different request ids so the
+    set is populated and then swept.
+    """
+
+    class _Registry:
+        def get_slot(self, req_id: str) -> int:
+            return 0
+
+    session = SimpleNamespace(is_active=True, context=SimpleNamespace(registry=_Registry()))
+    builder = _make_fixed_builder()
+
+    def run_build(req_id: str) -> None:
+        beam_data = {
+            req_id: {
+                "is_beam_decode": True,
+                "prefix_len": 8,
+                "beam_width": 2,
+                "beam_decode_steps": 2,
+                "cache_len": 8,
+                "decode_step": 0,
+            }
+        }
+        common = _common_metadata([0, 2], [10], [[1, 2, 3, 4, 5]])
+        token = BEAM_DATA_VAR.set(
+            {"beam_data": beam_data, "req_ids": [req_id], "beam_session": session}
+        )
+        try:
+            builder.build(0, common)
+        finally:
+            BEAM_DATA_VAR.reset(token)
+
+    # Session A registers its geometry in the fixed-buffer sub-caches
+    # (including the set-valued block_table_copied).
+    run_build("req-a")
+    cache = builder._geometry_cache()
+    btc = cache.get("block_table_copied")
+    assert btc, "fixed-buffer build registered block_table_copied"
+    assert any("req-a" in str(k) for k in btc)
+
+    # Session B sweeps A's set entry without raising TypeError.
+    run_build("req-b")
+    assert not any("req-a" in str(k) for k in btc)

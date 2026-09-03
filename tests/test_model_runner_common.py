@@ -139,6 +139,91 @@ def test_mixed_batch_remap_installs_functional_proxy() -> None:
     assert input_batch.logprob_token_ids == {}
 
 
+def test_incremental_layout_cache_short_circuits_remap() -> None:
+    """A pure incremental-beam batch replays its cached row layout.
+
+    Frame 2 with the same req_ids / token counts skips the per-beam Python
+    loop: the four host lists and logits indices are reused from the cache,
+    and only the step-dependent position ids are refreshed (decode_step 0
+    writes prefix_len, decode_step 2 writes prefix_len + 2).
+    """
+    # Shared runner skeleton (the production runner persists across decode
+    # steps, so the layout cache must live on it).
+    shared_runner = SimpleNamespace()
+
+    def make_frame(
+        step: int, positions: SimpleNamespace
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        input_batch = SimpleNamespace(
+            req_ids=["beam"],
+            logprob_token_ids={"stale": [1]},
+            num_computed_tokens_cpu=[0],
+            num_prompt_tokens=[0],
+            sampling_metadata=SimpleNamespace(
+                temperature=torch.tensor([7.0]),
+                top_p=None,
+                top_k=None,
+                min_p=None,
+                frequency_penalties=None,
+                presence_penalties=None,
+                repetition_penalties=None,
+            ),
+        )
+        shared_runner.input_batch = input_batch
+        shared_runner.positions = positions
+        scheduler_output = SimpleNamespace(
+            beam_data={
+                "beam": {
+                    "is_beam_decode": True,
+                    "prefix_len": 10,
+                    "beam_width": 4,
+                    "beam_decode_steps": 2,
+                    "cache_len": 10,
+                    "decode_step": step,
+                }
+            }
+        )
+        return shared_runner, scheduler_output
+
+    # Frame 1 (decode_step=0): slow path populates the layout cache.
+    pos1 = SimpleNamespace(
+        gpu=torch.zeros((4,), dtype=torch.long),
+        cpu=torch.zeros((4,), dtype=torch.long),
+    )
+    r1, so1 = make_frame(0, pos1)
+    idx1 = common._beam_remap_inputs(r1, so1, [4])
+    assert idx1 == [0, 1, 2, 3]
+    assert pos1.gpu.tolist() == [10, 10, 10, 10]
+    assert so1._gr_request_row_configs == [("beam", 0, 4, [0, 1, 2, 3])]
+
+    # Frame 2 (decode_step=2): cache hit short-circuits the loop; the
+    # reused layout lists are the SAME objects and positions refresh.
+    pos2 = SimpleNamespace(
+        gpu=torch.zeros((4,), dtype=torch.long),
+        cpu=torch.zeros((4,), dtype=torch.long),
+    )
+    r2, so2 = make_frame(2, pos2)
+    idx2 = common._beam_remap_inputs(r2, so2, [4])
+    assert idx2 == [0, 1, 2, 3]
+    assert pos2.gpu.tolist() == [12, 12, 12, 12]
+    assert torch.equal(pos2.gpu, pos2.cpu)
+    assert so2._gr_request_row_configs == [("beam", 0, 4, [0, 1, 2, 3])]
+    assert so2._gr_request_row_configs[0] is so1._gr_request_row_configs[0]
+
+    # A different token count (different layout key) must NOT hit the cache:
+    # the slow path reruns and builds a fresh (equal-valued) layout.  The row
+    # count still tracks beam_width (each beam contributes one token), so the
+    # logits list keeps 4 entries; only the per-frame token offsets differ.
+    pos3 = SimpleNamespace(
+        gpu=torch.zeros((5,), dtype=torch.long),
+        cpu=torch.zeros((5,), dtype=torch.long),
+    )
+    r3, so3 = make_frame(2, pos3)
+    idx3 = common._beam_remap_inputs(r3, so3, [5])
+    assert idx3 == [0, 1, 2, 3]
+    assert so3._gr_request_row_configs[0] is not so2._gr_request_row_configs[0]
+
+
 def test_sampling_metadata_remap_is_cached_and_warmed_at_remap() -> None:
     """The remap runs once at proxy install; repeated reads hit the cache."""
     sampling_metadata = SimpleNamespace(
@@ -288,6 +373,169 @@ def test_sampling_metadata_batched_gather_mixed_presence() -> None:
     assert meta.temperature.tolist() == [0.5, 0.5]
     assert meta.top_p is None
     assert meta.top_k is None
+
+
+def test_logits_idx_tensor_shared_cache_reused_across_proxies() -> None:
+    """Consecutive proxies with the same logits_map share one idx tensor.
+
+    Per-frame InputBatchProxy instances are rebuilt every decode step, so the
+    instance-level cache would rebuild the host->device logits-row index tensor
+    each frame.  The runner-owned shared cache dedups that for the steady-state
+    (unchanged beam geometry) case.
+    """
+    shared: dict[Any, Any] = {}
+    sampling_metadata = SimpleNamespace(
+        temperature=torch.tensor([0.5], dtype=torch.float32),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+
+    def make_proxy() -> common.InputBatchProxy:
+        input_batch = SimpleNamespace(req_ids=["a"], sampling_metadata=sampling_metadata)
+        return common.InputBatchProxy(
+            input_batch, ["a", "a"], [0, 0], [0, 0], shared_idx_cache=shared
+        )
+
+    p1 = make_proxy()
+    meta = p1.sampling_metadata
+    assert meta.temperature.tolist() == [0.5, 0.5]
+    assert len(shared) == 1
+
+    # Second frame: identical logits_map -> same cached idx tensor, no rebuild.
+    p2 = make_proxy()
+    meta2 = p2.sampling_metadata
+    assert meta2.temperature.tolist() == [0.5, 0.5]
+    assert len(shared) == 1
+
+    # A different logits_map replaces the single-slot entry.
+    fresh_meta = SimpleNamespace(
+        temperature=torch.tensor([1.0, 2.0], dtype=torch.float32),
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        frequency_penalties=None,
+        presence_penalties=None,
+        repetition_penalties=None,
+    )
+    p3 = common.InputBatchProxy(
+        SimpleNamespace(req_ids=["a", "b"], sampling_metadata=fresh_meta),
+        ["a", "a", "b"],
+        [0, 0, 1],
+        [0, 0, 1],
+        shared_idx_cache=shared,
+    )
+    meta3 = p3.sampling_metadata
+    assert meta3.temperature.tolist() == [1.0, 1.0, 2.0]
+    assert len(shared) == 1
+
+
+def test_sampling_remap_shared_cache_skips_gather_on_hit() -> None:
+    """A second frame's proxy reuses the beam-row expansion of sampling attrs.
+
+    Per-frame ``refresh_metadata`` builds a NEW SamplingMetadata object with
+    fresh per-request tensors, so the instance-level identity cache always
+    misses.  The runner-owned shared cache keys on (device, orig_req_len,
+    logits_map): an unchanged beam geometry hits and attaches the previously
+    gathered beam-row tensors without re-running stack/index_select/unbind.
+    """
+    shared_idx: dict[Any, Any] = {}
+    shared_sampling: dict[Any, Any] = {}
+
+    def make_proxy(temp_value: float, req_ids: list[str]) -> common.InputBatchProxy:
+        meta = SimpleNamespace(
+            temperature=torch.tensor([temp_value], dtype=torch.float32),
+            top_p=torch.tensor([0.9], dtype=torch.float32),
+            top_k=None,
+            min_p=None,
+            frequency_penalties=None,
+            presence_penalties=None,
+            repetition_penalties=None,
+        )
+        batch = SimpleNamespace(req_ids=req_ids, sampling_metadata=meta)
+        return common.InputBatchProxy(
+            batch,
+            ["a", "a"],
+            [0, 0],
+            [0, 0],
+            shared_idx_cache=shared_idx,
+            shared_sampling_cache=shared_sampling,
+            req_ids_key=tuple(req_ids),
+        )
+
+    # First frame (geometry miss): gather runs and populates the cache.
+    p1 = make_proxy(0.5, ["a"])
+    m1 = p1.sampling_metadata
+    assert m1.temperature.tolist() == [0.5, 0.5]
+    assert m1.top_p.tolist() == pytest.approx([0.9, 0.9])
+    assert len(shared_sampling) == 1
+
+    # Second frame: NEW metadata object (refresh_metadata rebuild) with the
+    # same per-request VALUES — a hit attaches the cached beam-row tensors.
+    p2 = make_proxy(0.5, ["a"])
+    m2 = p2.sampling_metadata
+    assert m2 is not m1
+    assert m2.temperature.tolist() == [0.5, 0.5]
+    assert m2.top_p.tolist() == pytest.approx([0.9, 0.9])
+    # The attached tensors are the SAME objects (no second gather).
+    assert m2.temperature is m1.temperature
+    assert m2.top_p is m1.top_p
+    assert len(shared_sampling) == 1
+
+
+def test_sampling_remap_cache_isolated_across_requests() -> None:
+    """A later request with the same layout must NOT inherit the previous
+    request's gathered sampling tensors.
+
+    The cache key includes the request ids: request B (same beam width, same
+    logits_map, DIFFERENT temperature) misses request A's entry and gathers
+    from its own per-request params.  Without the ids in the key, B would
+    silently sample with A's temperature.
+    """
+    shared_idx: dict[Any, Any] = {}
+    shared_sampling: dict[Any, Any] = {}
+
+    def make_proxy(temp_value: float, req_id: str) -> common.InputBatchProxy:
+        meta = SimpleNamespace(
+            temperature=torch.tensor([temp_value], dtype=torch.float32),
+            top_p=torch.tensor([0.9], dtype=torch.float32),
+            top_k=None,
+            min_p=None,
+            frequency_penalties=None,
+            presence_penalties=None,
+            repetition_penalties=None,
+        )
+        batch = SimpleNamespace(req_ids=[req_id], sampling_metadata=meta)
+        return common.InputBatchProxy(
+            batch,
+            [req_id, req_id],
+            [0, 0],
+            [0, 0],
+            shared_idx_cache=shared_idx,
+            shared_sampling_cache=shared_sampling,
+            req_ids_key=(req_id,),
+        )
+
+    # Request A: temperature 0.5.
+    pa = make_proxy(0.5, "req-a")
+    ma = pa.sampling_metadata
+    assert ma.temperature.tolist() == [0.5, 0.5]
+
+    # Request B (sequential, same layout, temperature 1.5): must use ITS OWN
+    # params — a geometry-only key would return A's [0.5, 0.5] here.
+    pb = make_proxy(1.5, "req-b")
+    mb = pb.sampling_metadata
+    assert mb.temperature.tolist() == [1.5, 1.5]
+    assert mb.temperature is not ma.temperature
+    # Single-slot cache: B's entry replaced A's.
+    assert len(shared_sampling) == 1
+
+    # Request A returns (e.g. re-issued request id): re-gathers A's values.
+    pa2 = make_proxy(0.5, "req-a")
+    assert pa2.sampling_metadata.temperature.tolist() == [0.5, 0.5]
 
 
 def test_materialize_logits_indices_reuses_runner_buffer() -> None:
