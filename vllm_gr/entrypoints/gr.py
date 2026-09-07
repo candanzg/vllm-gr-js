@@ -15,7 +15,6 @@ HuggingFace checkpoint (e.g. OneRec, Pangu) is supported via the regular vLLM
 LLM path.
 """
 
-import copy
 import gc
 import time
 from typing import TYPE_CHECKING, Any, Union, cast
@@ -630,6 +629,44 @@ def _custom_beam_search_batch(
             instance_completed_sessions.add(j)
 
 
+def _install_renderer_eos_token_id_cache() -> None:
+    """Cache ``Renderer.get_eos_token_id`` on the tokenizer object.
+
+    vLLM's renderer re-reads ``tokenizer.eos_token_id`` on every request;
+    for HF fast tokenizers that property re-runs
+    ``convert_tokens_to_ids`` through the token-pool borrow (~0.07ms per
+    request).  The value is constant for a tokenizer's lifetime, so the
+    first read is cached directly on the tokenizer instance (no global
+    state, no leak, lifetime tied to the tokenizer).  Idempotent; a failed
+    attribute write (exotic tokenizer hosts) silently falls back to the
+    uncached path.
+    """
+    from vllm.renderers.base import BaseRenderer
+
+    if getattr(BaseRenderer.get_eos_token_id, "_gr_eos_cache", False):
+        return
+
+    original = BaseRenderer.get_eos_token_id
+
+    def get_eos_token_id_cached(self):
+        tok = self.tokenizer
+        if tok is None:
+            return original(self)
+        cached = getattr(tok, "_gr_eos_token_id", None)
+        if cached is not None:
+            return cached
+        value = original(self)
+        if value is not None:
+            try:
+                object.__setattr__(tok, "_gr_eos_token_id", value)
+            except (AttributeError, TypeError):
+                pass
+        return value
+
+    get_eos_token_id_cached._gr_eos_cache = True  # type: ignore[attr-defined]
+    BaseRenderer.get_eos_token_id = get_eos_token_id_cached
+
+
 class GRLLM(LLM):
     """LLM subclass with catalog-aware beam search.
 
@@ -750,6 +787,8 @@ class GRLLM(LLM):
             **kwargs,
         )
 
+        _install_renderer_eos_token_id_cache()
+
         self.catalog = None
         self.constraint_strategy = None
         self.constraint_coordinator = BeamConstraintCoordinator(None)
@@ -829,18 +868,40 @@ class GRLLM(LLM):
         catalog_strategy = getattr(params, "catalog_strategy", None)
 
         tokenizer = self.get_tokenizer()
+        # Token-id conversion cache on the GRLLM instance: convert_tokens_to_ids
+        # goes through the HF token-pool borrow (~0.06ms per call) and the
+        # begin/end special tokens are identical across every beam_search call
+        # on the same tokenizer, so convert once and reuse.
+        token_id_cache = getattr(self, "_gr_token_id_cache", None)
+        if token_id_cache is None or token_id_cache[0] is not tokenizer:
+            token_id_cache = (tokenizer, {})
+            self._gr_token_id_cache = token_id_cache
+
+        def _cached_convert_token(token: str) -> int | None:
+            cache = token_id_cache[1]
+            hit = cache.get(token, -2)  # -2 sentinel: not attempted yet
+            if hit != -2:
+                return hit
+            converted = tokenizer.convert_tokens_to_ids(token)
+            if converted is None or converted == -1:
+                # Do not cache failures for tokens that a future call may
+                # legitimately retry; only cache resolved ids.
+                return None
+            cache[token] = converted
+            return converted
+
         sid_begin_token_id: int | None = None
         if begin_token is not None:
-            sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
-            if sid_begin_token_id is None or sid_begin_token_id == -1:
+            sid_begin_token_id = _cached_convert_token(begin_token)
+            if sid_begin_token_id is None:
                 logger.warning(
                     f"begin_token must be a valid token in the tokenizer vocabulary, got token {begin_token}"
                 )
                 sid_begin_token_id = None
         sid_end_token_id: int | None = None
         if end_token is not None:
-            sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
-            if sid_end_token_id is None or sid_end_token_id == -1:
+            sid_end_token_id = _cached_convert_token(end_token)
+            if sid_end_token_id is None:
                 logger.warning(
                     f"end_token must be a valid token in the tokenizer vocabulary, got token {end_token}"
                 )
@@ -883,7 +944,16 @@ class GRLLM(LLM):
             if prompt["type"] == "embeds":
                 raise NotImplementedError("Embedding prompt not supported for beam search")
 
-            engine_prompt = copy.deepcopy(prompt)
+            # Structural shallow copy instead of copy.deepcopy: the beam
+            # pipeline only REBINDS keys on this dict (prompt_token_ids is
+            # rebuilt via list(...) before append) and never mutates the
+            # original list in place, so deep-copying the 1024-token list
+            # paid ~6ms per request on the pre-prefill critical path for
+            # no semantic benefit.  Nested enc_dec dicts are copied one
+            # level for the same reason.
+            engine_prompt = dict(prompt)
+            if engine_prompt.get("type") == "enc_dec":
+                engine_prompt["decoder_prompt"] = dict(engine_prompt["decoder_prompt"])
             decoder_prompt = (
                 engine_prompt
                 if engine_prompt["type"] != "enc_dec"
@@ -913,12 +983,15 @@ class GRLLM(LLM):
             )
             instances.append(instance)
 
-        # Cache decoded prompt text and token length for each instance to optimize final decoding
+        # Cache prompt token references and lengths per instance.  The prompt
+        # TEXT is detokenized lazily at output assembly (below, after
+        # generation completes): decoding here would spend ~2.5ms of
+        # tokenizer time on the pre-prefill critical path, and the text is
+        # only ever consumed when concatenating beam.text at the very end.
         cached_prompts = []
         for instance in instances:
             prompt_tokens = instance.beams[0].tokens
-            prompt_text = tokenizer.decode(prompt_tokens)
-            cached_prompts.append({"text": prompt_text, "len": len(prompt_tokens)})
+            cached_prompts.append({"tokens": prompt_tokens, "len": len(prompt_tokens)})
 
         pre_calc = 0 if sid_begin_token_id is None else 1
         if sid_end_token_id is not None:
@@ -1122,8 +1195,19 @@ class GRLLM(LLM):
             best_beams = sorted_completed[:beam_width]
 
             prompt_cache = cached_prompts[idx]
-            prompt_text = prompt_cache["text"]
             prompt_len = prompt_cache["len"]
+            # Deferred prompt detokenization: the decode runs here (post
+            # generation) instead of on the pre-prefill critical path; same
+            # tokenizer, same tokens, identical text.  cached_prompts holds
+            # the initial beam's token list BY REFERENCE, so decode only the
+            # saved prompt-length slice: when max_tokens - pre_calc == 0 the
+            # generation loop never runs and the surviving beam is that same
+            # object whose list then received the appended sid_end_token
+            # above — decoding the whole list would leak the end token into
+            # prompt_text before the generated-token decode adds it a second
+            # time.  The slice pins the text to exactly the tokens that were
+            # present when the prompt was cached.
+            prompt_text = tokenizer.decode(prompt_cache["tokens"][:prompt_len])
             # Reconstruct FlatLogprobs from parent pointers for the best beams.
             # Batching the detokenize below removes the per-beam Rust decode that
             # used to release the GIL and spread the reconstruct allocations;
