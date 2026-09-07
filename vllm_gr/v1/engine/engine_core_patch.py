@@ -347,42 +347,69 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
-        _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
-        _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
-        block_size = self.cache_config.block_size
+        # The two cache-manager wrappers depend only on constants resolved at
+        # patch-install time (original bound methods + block_size), so they
+        # are built ONCE and stashed on the scheduler instance; rebuilding
+        # the closures on every schedule call showed up in prefill-path
+        # profiling (~60us/request of pure closure + attribute churn).
+        cached_patches = getattr(self, "_beam_schedule_patches", None)
+        if (
+            cached_patches is None
+            # Guard against a swapped/undone cache manager (e.g. engine
+            # reset re-installs fresh managers): re-capture the originals.
+            or cached_patches[0] is not self.kv_cache_manager.get_computed_blocks
+            or cached_patches[1] is not self.kv_cache_manager.coordinator.cache_blocks
+        ):
+            _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+            _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
+            block_size = self.cache_config.block_size
 
-        patch_get_computed_blocks = make_patch_get_computed_blocks(
+            patch_get_computed_blocks = make_patch_get_computed_blocks(
+                _original_get_computed_blocks,
+                self.kv_cache_manager.create_kv_cache_blocks,
+                block_size,
+            )
+
+            def patch_cache_blocks(request, num_computed_tokens):
+                # Extend the num_computed_tokens passed to cache_blocks to the next
+                # block boundary on the FINAL prefill chunk, so the trailing partial
+                # block (whose hash exists thanks to the padding in _cache_beam_request)
+                # is actually cached. Without this, vLLM would only cache full blocks
+                # and the beam-decode request could not prefix-cache-hit the remainder.
+                if (
+                    request
+                    and not getattr(request, "is_beam_decode", False)
+                    and hasattr(request, "block_hashes")
+                    and request.block_hashes
+                ):
+                    num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
+                    if num_computed_tokens >= num_prompt_tokens:
+                        chunk_padded_target = (
+                            (num_computed_tokens + block_size - 1) // block_size * block_size
+                        )
+                        num_hashes = len(request.block_hashes)
+                        padded_target = min(chunk_padded_target, num_hashes * block_size)
+                        if (
+                            num_computed_tokens < padded_target
+                            and num_computed_tokens % block_size != 0
+                        ):
+                            num_computed_tokens = padded_target
+                return _original_cache_blocks(request, num_computed_tokens)
+
+            cached_patches = (
+                _original_get_computed_blocks,
+                _original_cache_blocks,
+                patch_get_computed_blocks,
+                patch_cache_blocks,
+            )
+            self._beam_schedule_patches = cached_patches
+
+        (
             _original_get_computed_blocks,
-            self.kv_cache_manager.create_kv_cache_blocks,
-            block_size,
-        )
-
-        def patch_cache_blocks(request, num_computed_tokens):
-            # Extend the num_computed_tokens passed to cache_blocks to the next
-            # block boundary on the FINAL prefill chunk, so the trailing partial
-            # block (whose hash exists thanks to the padding in _cache_beam_request)
-            # is actually cached. Without this, vLLM would only cache full blocks
-            # and the beam-decode request could not prefix-cache-hit the remainder.
-            if (
-                request
-                and not getattr(request, "is_beam_decode", False)
-                and hasattr(request, "block_hashes")
-                and request.block_hashes
-            ):
-                num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
-                if num_computed_tokens >= num_prompt_tokens:
-                    chunk_padded_target = (
-                        (num_computed_tokens + block_size - 1) // block_size * block_size
-                    )
-                    num_hashes = len(request.block_hashes)
-                    padded_target = min(chunk_padded_target, num_hashes * block_size)
-                    if (
-                        num_computed_tokens < padded_target
-                        and num_computed_tokens % block_size != 0
-                    ):
-                        num_computed_tokens = padded_target
-            return _original_cache_blocks(request, num_computed_tokens)
-
+            _original_cache_blocks,
+            patch_get_computed_blocks,
+            patch_cache_blocks,
+        ) = cached_patches
         self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
         try:
