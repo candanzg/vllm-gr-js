@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import gc
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -1097,6 +1100,9 @@ def test_execute_wrapper_prelaunches_before_async_sample_tokens(
             scheduler_output=received,
             logits="logits",
         )
+        # The CUDA prepare path ran inside execute_model and published this
+        # step's descriptor (the wrapper's import/launch is gated on it).
+        self._gr_prepared_cuda_prefill_constraint = object()
         events.append("execute")
         return None
 
@@ -1139,3 +1145,189 @@ def test_execute_wrapper_does_not_inline_mixed_beam_plus_structured() -> None:
     assert out is None
     assert runner._sample_tokens_calls == []
     assert runner.execute_model_state == "state"
+
+
+# ---------------------------------------------------------------------------
+# Warmup GC freeze: quiescent boundary + RPC completion barrier
+# ---------------------------------------------------------------------------
+
+
+def _reset_warmup_gc_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate the process-level freeze state per test."""
+    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_DONE", False)
+    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", False)
+    monkeypatch.setattr(common, "_WORKER_EXECUTE_DEPTH", 0)
+    # Keep the quiescent fallback wait short in tests.
+    monkeypatch.setattr(common, "_QUIESCENT_WAIT_TIMEOUT_S", 2.0)
+
+
+def _freeze_daemon_alive() -> bool:
+    return any(t.name == "vllm-gr-gc-freeze" for t in threading.enumerate())
+
+
+def _wait_freeze_daemon_done(timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _freeze_daemon_alive():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_warmup_rpc_does_not_acknowledge_scheduled_pending_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review regression: frozen=True must imply a *completed* freeze.
+
+    The automatic daemon claims the one-shot before its collection runs; an
+    RPC racing that collector must not return frozen=True while the heap is
+    still unfrozen (probe observed thresholds still [700, 10, 10]).
+    """
+    _reset_warmup_gc_state(monkeypatch)
+    calls: list[bool] = []
+
+    def fake_freeze(*, raise_thresholds: bool) -> list[int]:
+        calls.append(raise_thresholds)
+        return [700, 100_000, 100_000]
+
+    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    # The automatic daemon claimed the one-shot; collection still pending.
+    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_DONE", True)
+
+    result = common.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
+
+    assert result["frozen"] is True
+    assert "deduped" not in result
+    # The RPC performed the freeze itself, so completion is guaranteed
+    # before frozen=True was returned.
+    assert calls == [True]
+    assert common._GC_WARMUP_FREEZE_COMPLETE is True
+
+
+def test_warmup_rpc_dedupes_only_completed_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_warmup_gc_state(monkeypatch)
+    calls: list[bool] = []
+
+    def fake_freeze(*, raise_thresholds: bool) -> list[int]:
+        calls.append(raise_thresholds)
+        return [700, 100_000, 100_000]
+
+    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", True)
+
+    result = common.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
+
+    assert result["frozen"] is True
+    assert result["deduped"] is True
+    assert result["thresholds"] == list(gc.get_threshold())
+    assert calls == []
+
+
+def test_warmup_rpc_failure_rolls_back_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed acknowledged collector must not strand the one-shot."""
+    _reset_warmup_gc_state(monkeypatch)
+
+    def fake_freeze(*, raise_thresholds: bool) -> list[int]:
+        raise RuntimeError("collect failed")
+
+    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+
+    result = common.freeze_gc_after_warmup(SimpleNamespace(model_runner=None))
+
+    assert result["frozen"] is False
+    assert "error" in result
+    assert common._GC_WARMUP_FREEZE_DONE is False
+    assert common._GC_WARMUP_FREEZE_COMPLETE is False
+
+
+def test_warmup_daemon_waits_for_quiescent_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review regression: no collection while execute_model is in flight.
+
+    The teardown signal is consumed at the START of the next execute_model;
+    the freeze daemon must wait for that step to finish before collecting
+    (gc.collect holds the GIL and would stall the request).
+    """
+    _reset_warmup_gc_state(monkeypatch)
+    started = threading.Event()
+
+    def fake_freeze(*, raise_thresholds: bool) -> list[int]:
+        started.set()
+        return [700, 100_000, 100_000]
+
+    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+
+    common._enter_worker_execute()
+    try:
+        assert common.schedule_warmup_gc_freeze() is True
+        assert common.schedule_warmup_gc_freeze() is False
+        assert not started.wait(0.2), "freeze ran while execute_model was in flight"
+    finally:
+        common._exit_worker_execute()
+
+    assert started.wait(5.0), "freeze did not run at the quiescent boundary"
+    assert common._GC_WARMUP_FREEZE_COMPLETE is True
+
+
+def test_warmup_daemon_skips_when_rpc_already_froze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduled daemon must not re-collect after an RPC freeze."""
+    _reset_warmup_gc_state(monkeypatch)
+    calls: list[bool] = []
+
+    def fake_freeze(*, raise_thresholds: bool) -> list[int]:
+        calls.append(raise_thresholds)
+        return [700, 100_000, 100_000]
+
+    monkeypatch.setattr(common, "_freeze_serving_gc", fake_freeze)
+    # Park the daemon behind the quiescence wait (a step is in flight), then
+    # let the explicit RPC barrier complete a freeze while it waits.
+    common._enter_worker_execute()
+    try:
+        assert common.schedule_warmup_gc_freeze() is True
+        monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", True)
+    finally:
+        common._exit_worker_execute()
+
+    assert _wait_freeze_daemon_done()
+    assert calls == []
+
+
+def test_execute_wrapper_tracks_inflight_depth_for_gc_freeze() -> None:
+    depth_seen: dict[str, int] = {}
+
+    def execute_model(self: Any, scheduler_output: Any) -> str:
+        depth_seen["during"] = common._WORKER_EXECUTE_DEPTH
+        return "result"
+
+    wrapped = common.make_patched_execute_model(execute_model)
+    runner = _m2_runner()
+    scheduler_output = SimpleNamespace(beam_data={})
+
+    assert common._WORKER_EXECUTE_DEPTH == 0
+    assert wrapped(runner, scheduler_output) == "result"
+    assert depth_seen["during"] == 1
+    assert common._WORKER_EXECUTE_DEPTH == 0
+
+
+def test_execute_wrapper_releases_depth_on_exception() -> None:
+    class ExpectedError(Exception):
+        pass
+
+    def execute_model(self: Any, scheduler_output: Any) -> None:
+        assert common._WORKER_EXECUTE_DEPTH == 1
+        raise ExpectedError
+
+    wrapped = common.make_patched_execute_model(execute_model)
+    runner = _m2_runner()
+    scheduler_output = SimpleNamespace(beam_data={})
+
+    with pytest.raises(ExpectedError):
+        wrapped(runner, scheduler_output)
+    assert common._WORKER_EXECUTE_DEPTH == 0

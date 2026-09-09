@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 from vllm.inputs import tokens_input
 from vllm.logprobs import FlatLogprobs
 
@@ -82,9 +83,111 @@ def test_offline_output_uses_original_prompt_boundary(
     generated = ([1] if begin else []) + [next_token] + ([3] if end and not stop_at_eos else [])
     expected_tail = (begin or "") + f"[{next_token}]" + ((end or "") if not stop_at_eos else "")
     assert beam.tokens == original_tokens + generated
+    # The output assembly restores full sequences in place and must drop the
+    # shared-prefix / logprob-reconstruction bookkeeping attributes that
+    # dataclasses.replace used to shed by rebuilding instances.
+    assert not any(
+        hasattr(beam, attr) for attr in ("_prompt_token_ids", "_lp_parent", "_lp_step_data")
+    )
     assert beam.text == ("[10][11]" if include_prompt is not False else "") + expected_tail
     assert generated in tokenizer.decoded
     assert (original_tokens in tokenizer.decoded) == (include_prompt is not False)
     assert list(beam.logprobs.token_ids) == generated
     assert beam.cum_logprob == pytest.approx(-0.2)
     assert prepared["prompt_token_ids"] == [10, 11]
+
+
+def _lazy_runner(tokenizer: _Tokenizer, original_tokens: list[int]) -> Any:
+    prepared = tokens_input(original_tokens)
+
+    def generate(prompts: Any, **kwargs: Any) -> list[SimpleNamespace]:
+        flat = FlatLogprobs(
+            start_indices=[0],
+            end_indices=[2],
+            token_ids=[20, 21],
+            logprobs=[-0.1, -0.2],
+            ranks=[1, 2],
+            decoded_tokens=["[20]", "[21]"],
+        )
+        return [SimpleNamespace(outputs=[SimpleNamespace(logprobs=flat)]) for _ in prompts]
+
+    return SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        _preprocess_cmpl=lambda prompts: [prepared],
+        _lora_request_to_seq=lambda request, count: [None] * count,
+        constraint_strategy=None,
+        constraint_coordinator=BeamConstraintCoordinator(None),
+        llm_engine=SimpleNamespace(vllm_config=None),
+        generate=generate,
+    )
+
+
+def _lazy_params(beam_width: int = 2) -> Any:
+    return SimpleNamespace(
+        beam_width=beam_width,
+        max_tokens=1,
+        temperature=1.0,
+        ignore_eos=False,
+        begin_token=None,
+        end_token=None,
+    )
+
+
+def test_lazy_beams_materialize_only_when_read() -> None:
+    tokenizer = _Tokenizer()
+    original_tokens = [10, 11]
+    runner = _lazy_runner(tokenizer, original_tokens)
+
+    outputs = GRLLM.beam_search(runner, [{"prompt_token_ids": original_tokens}], _lazy_params())
+    seqs = outputs[0].sequences
+    assert len(seqs) == 2
+
+    # Returning from beam_search only decodes the prompt once; neither beam's
+    # tail has been detokenized or reconstructed yet.
+    assert tokenizer.decoded == [original_tokens]
+    assert all(getattr(seq, "_lazy_materializer", None) is not None for seq in seqs)
+
+    # Reading a non-deferred field (cum_logprob) must not materialize.
+    _ = seqs[0].cum_logprob
+    assert tokenizer.decoded == [original_tokens]
+
+    # First read of sequences[0] materializes exactly that beam: full token
+    # restore + one tail decode, then the plain dataclass fast path returns.
+    assert seqs[0].tokens == [10, 11, 20]
+    assert tokenizer.decoded == [original_tokens, [20]]
+    assert seqs[0].__class__ is BeamSearchSequence
+    # Reconstructed logprobs = empty init (no sid_begin) + the per-step
+    # candidate segment [20, 21] kept for downstream rescoring.
+    assert list(seqs[0].logprobs.token_ids) == [20, 21]
+
+    # sequences[1] is still lazy until read.
+    assert getattr(seqs[1], "_lazy_materializer", None) is not None
+    assert tokenizer.decoded == [original_tokens, [20]]
+
+    assert seqs[1].text == "[10][11][21]"
+    assert tokenizer.decoded == [original_tokens, [20], [21]]
+    assert seqs[1].__class__ is BeamSearchSequence
+    assert seqs[1].tokens == [10, 11, 21]
+
+
+def test_prompt_text_is_decoded_once_per_tokenizer() -> None:
+    tokenizer = _Tokenizer()
+    original_tokens = [10, 11]
+    runner = _lazy_runner(tokenizer, original_tokens)
+    prompt = [{"prompt_token_ids": original_tokens}]
+
+    GRLLM.beam_search(runner, prompt, _lazy_params(beam_width=1))
+    assert tokenizer.decoded.count(original_tokens) == 1
+    assert "_gr_prompt_text_cache" in tokenizer.__dict__
+
+    # Second request with the same prompt hits the per-tokenizer LRU; with
+    # lazy beams and nothing read yet, the second call decodes NOTHING.
+    GRLLM.beam_search(runner, prompt, _lazy_params(beam_width=1))
+    assert tokenizer.decoded.count(original_tokens) == 1
+    assert len(tokenizer.decoded) == 1
+
+    # Reading the beam still detokenizes its tail (outside the cache).
+    beam = GRLLM.beam_search(runner, prompt, _lazy_params(beam_width=1))[0].sequences[0]
+    assert tokenizer.decoded.count(original_tokens) == 1  # still cached
+    assert beam.tokens == [10, 11, 20]
+    assert tokenizer.decoded[-1] == [20]

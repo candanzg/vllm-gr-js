@@ -13,6 +13,8 @@ from vllm.logger import init_logger
 from vllm_gr.v1.worker.model_runner_common import (
     _WORKER_CAPTURE_PATCH_MARKER,
     _WORKER_DETERMINE_PATCH_MARKER,
+    freeze_gc_after_graph_capture,
+    freeze_gc_after_warmup,
     get_beam_graph_runtime_stats,
     is_worker_runner_patched,
     make_patched_execute_model,
@@ -185,6 +187,7 @@ def _install_active_worker_resource_hook() -> None:
         # fallback is enabled.  The profiling contract must work under spawn
         # without weakening that policy.
         Worker.get_gr_beam_graph_runtime_stats = get_beam_graph_runtime_stats  # type: ignore[attr-defined]
+        Worker.gr_freeze_gc_after_warmup = freeze_gc_after_warmup  # type: ignore[attr-defined]
         setattr(Worker, _BEAM_GRAPH_STATS_HOOK_MARKER, True)
 
 
@@ -282,6 +285,12 @@ def apply_worker_patches() -> None:
                                 "vllm-gr: prefill graph capture failed; "
                                 "prefill will fall back to eager"
                             )
+                    # All CUDA graphs (native + beam + prefill) are now captured
+                    # and the serving-time heap is fully built.  Freeze it so the
+                    # long-lived post-startup objects (KV caches, captured graph
+                    # state, beam sessions) are not rescanned by gen-1/gen-2 GC
+                    # during serving (measured 29-36ms collected=0 pauses).
+                    freeze_gc_after_graph_capture(self)
                     return res
 
                 return patched_capture_model

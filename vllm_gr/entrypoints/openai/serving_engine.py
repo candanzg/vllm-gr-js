@@ -23,6 +23,7 @@ from vllm_gr.beam_search_decision_utils import (
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
     materialize_selected_beams,
+    select_top_beams,
     select_top_indices,
 )
 from vllm_gr.config import MAX_BEAM_WIDTH
@@ -35,8 +36,10 @@ from vllm_gr.constraints.strategies import (
     validate_constraint_generation_limits,
     validate_constraint_table_protocol,
 )
-from vllm_gr.logprobs import reconstruct_beam_logprobs
+from vllm_gr.logprobs import reconstruct_beam_logprobs_batch
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.tokenizer_fast import fast_batch_decode
+from vllm_gr.utils.engine_lifecycle import frontend_request_scope
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
@@ -124,17 +127,35 @@ def _worker_decision_flatten(
     if not ids_flat:
         return None
     try:
-        ids = [int(v) for v in ids_flat]
-        lps = [float(v) for v in lps_flat]
-        parent = [int(v) for v in parent_flat]
-    except (TypeError, ValueError):
+        ids_np = np.asarray(ids_flat, dtype=np.int64)
+        lps_np = np.asarray(lps_flat, dtype=np.float64)
+        parent_np = np.asarray(parent_flat, dtype=np.int64)
+    except (TypeError, ValueError, OverflowError):
         return None
-    if len(ids) != num_beams or len(ids) != len(lps) or len(ids) != len(parent):
+    if ids_np.ndim != 1 or lps_np.ndim != 1 or parent_np.ndim != 1:
         return None
+    if ids_np.size != num_beams or ids_np.size != lps_np.size or ids_np.size != parent_np.size:
+        return None
+    ids = ids_np.tolist()
+    lps = lps_np.tolist()
     # out_token_index keeps the request offset; strip it (batch == 1).
-    parent = [p - num_beams if p >= num_beams else p for p in parent]
+    parent_np = np.where(parent_np >= num_beams, parent_np - num_beams, parent_np)
+    parent = parent_np.tolist()
+    n_parents = len(parents)
+    if n_parents and parent_np.size and int(parent_np.min()) >= -n_parents:
+        # Vectorized per-parent "local" logprob (cumulative minus the
+        # parent's cumulative): pid >= n_parents reads 0.0 and in-range
+        # pids — including Python-style negative wraparound — read
+        # parents[pid].cum_logprob, identical to the validated loop below.
+        parent_cum = np.asarray([p.cum_logprob for p in parents], dtype=np.float64)
+        high = parent_np >= n_parents
+        cum = np.where(high, 0.0, parent_cum[np.where(high, 0, parent_np)])
+        local = (lps_np - cum).tolist()
+        return ids, lps, parent, [([tid], [loc], [0], [None]) for tid, loc in zip(ids, local)]
+    # Exotic indices: reproduce the original per-beam loop (raises
+    # IndexError for pid < -n_parents exactly like list indexing).
     cache: list = []
-    for i, (pid, tid, lp) in enumerate(zip(parent, ids, lps)):
+    for pid, tid, lp in zip(parent, ids, lps):
         parent_cum = parents[pid].cum_logprob if pid < len(parents) else 0.0
         cache.append(([tid], [lp - parent_cum], [0], [None]))
     return ids, lps, parent, cache
@@ -396,6 +417,7 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
+@frontend_request_scope
 async def beam_search(
     self,
     prompt: EngineInput,
@@ -1052,23 +1074,23 @@ async def beam_search(
 
     # Measure beam sort time
     beam_search_sort_start = time.perf_counter()
-    sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
+    best_beams = select_top_beams(completed, beam_width)
     beam_search_sort_time = time.perf_counter() - beam_search_sort_start
-    best_beams = sorted_completed[:beam_width]
 
     # Reconstruct full logprobs only for the final best beams by walking
     # the parent-pointer tree.  This replaces the O(beams * steps^2)
     # per-step copying with a single O(beams * steps) pass at the end.
-    for beam in best_beams:
-        reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+    reconstruct_beam_logprobs_batch(best_beams, initial_logprobs, sid_end_token_id)
 
-    for i, beam in enumerate(best_beams):
-        tokens = (
-            beam.tokens[tokenized_length:-1]
-            if beam.tokens[-1] == eos_token_id and not ignore_eos
-            else beam.tokens[tokenized_length:]
-        )
-        beam.text = tokenizer.decode(tokens)
+    tokens_list = [
+        beam.tokens[tokenized_length:-1]
+        if beam.tokens[-1] == eos_token_id and not ignore_eos
+        else beam.tokens[tokenized_length:]
+        for beam in best_beams
+    ]
+    decoded_texts = fast_batch_decode(tokenizer, tokens_list)
+    for beam, text in zip(best_beams, decoded_texts):
+        beam.text = text
 
     beam_search_decode_time = time.perf_counter() - beam_search_start
     beam_search_prefill_time = beam_search_start - prefill_start
@@ -1113,5 +1135,14 @@ async def beam_search(
     except Exception:
         model_name = "unknown"
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+
+    # Multi-process deployments run this serving frontend in a process
+    # separate from the EngineCore/worker, whose GC freeze cannot reach here.
+    # Freeze the frontend heap once after the first beam request so the
+    # driver's own gen-1 GC (heavy per-request beam bookkeeping) cannot spike
+    # request latency on a fixed cadence.  Idempotent; spawns a daemon thread.
+    from vllm_gr.utils.engine_lifecycle import schedule_frontend_gc_freeze
+
+    schedule_frontend_gc_freeze()
 
     yield out

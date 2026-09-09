@@ -12,18 +12,22 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Sequence
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 
+from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+
+# C-level key for sorting beams by cumulative log-prob (avoids a per-beam
+# Python lambda call frame, which is also amplified by the torch profiler).
+_beam_score = attrgetter("cum_logprob")
+
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.constraints.models import (
-    BeamCandidateCache,
-)
-from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+    from vllm_gr.constraints.models import BeamCandidateCache
 
 ForkInfo = list[tuple[int, int]]
 
@@ -277,6 +281,21 @@ def select_top_indices(
     return topn_idx
 
 
+def select_top_beams(beams: Sequence, beam_width: int) -> list:
+    """Return the ``beam_width`` highest-scoring beams, best first.
+
+    Equivalent to ``sorted(beams, key=lambda b: b.cum_logprob,
+    reverse=True)[:beam_width]``.  A C-level ``attrgetter`` replaces the
+    per-beam Python lambda key: at the completed-list size (a few hundred
+    beams) Timsort is already sub-millisecond, and numpy ``argpartition``
+    measured slower (its fixed dispatch overhead exceeds the sort itself at
+    this scale), so the only worthwhile saving is extracting keys without
+    entering a Python lambda per beam (also removes the profiler's per-key
+    call frames).
+    """
+    return sorted(beams, key=_beam_score, reverse=True)[:beam_width]
+
+
 def materialize_selected_beams(
     *,
     parents: Sequence[BeamSearchSequence],
@@ -290,12 +309,19 @@ def materialize_selected_beams(
 ) -> tuple[list[BeamSearchSequence], ForkInfo]:
     """Build selected child beams and their grouped-request fork mapping."""
 
+    # Batch the per-candidate NumPy scalar reads (three fancy-index gathers
+    # replace W*3 Python-level __getitem__/int()/float() conversions); the
+    # loop below then touches only plain Python objects plus the BeamSearch
+    # constructions themselves.
+    sel = np.asarray(selected_indices)
+    parent_indices = np.asarray(beam_idx)[sel].tolist()
+    token_id_list = np.asarray(token_ids)[sel].tolist()
+    score_list = np.asarray(scores)[sel].tolist()
+
     new_beams: list[BeamSearchSequence] = []
     fork_info: ForkInfo = []
-    for candidate_index in selected_indices:
-        parent_index = int(beam_idx[candidate_index])
+    for parent_index, token_id, cum_logprob in zip(parent_indices, token_id_list, score_list):
         parent = parents[parent_index]
-        token_id = int(token_ids[candidate_index])
         cached = beam_flat_cache[parent_index]
         assert cached is not None
         new_beam = BeamSearchSequence(
@@ -303,7 +329,7 @@ def materialize_selected_beams(
             tokens=parent.tokens + [token_id],
             logprobs=initial_logprobs,
             lora_request=parent.lora_request,
-            cum_logprob=float(scores[candidate_index]),
+            cum_logprob=cum_logprob,
         )
         new_beam._lp_parent = parent
         new_beam._lp_step_data = cached
