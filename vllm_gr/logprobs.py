@@ -6,9 +6,12 @@ per-element append."""
 import itertools
 from collections.abc import Iterable
 
+from vllm.logprobs import FlatLogprobs
+
 __all__ = [
     "append_fast",
     "reconstruct_beam_logprobs",
+    "reconstruct_beam_logprobs_batch",
 ]
 
 
@@ -43,6 +46,121 @@ def append_fast(
     self.end_indices.append(len(self.logprobs))
 
 
+def _reconstruct_one(
+    beam,
+    init_token_ids,
+    init_logprobs,
+    init_ranks,
+    init_decoded,
+    init_start,
+    init_end,
+    sid_end_token_id,
+) -> None:
+    """Build the full FlatLogprobs for one beam by walking its parent chain.
+
+    Inlined equivalent of repeatedly calling ``append_fast``: the per-step
+    candidate segments (``_lp_step_data``) only ever carry ``ranks`` /
+    ``decoded_tokens`` that are either ``None`` or plain lists (produced by
+    ``extract_and_dedup_segment`` / ``extract_constrained_segment``), so the
+    lazy-iterator ``islice`` branch of ``append_fast`` is unnecessary here.
+
+    The six flat lists are pre-allocated to their final length and filled via
+    slice assignment (a single C-level memcpy per segment) instead of repeated
+    ``extend`` calls; ``ranks`` / ``decoded_tokens`` default to ``None`` slots
+    and are only overwritten for segments that actually carry metadata.
+    """
+    # Walk the parent-pointer chain, collecting steps newest-first.
+    steps = []
+    ancestor = beam
+    step_data = getattr(ancestor, "_lp_step_data", None)
+    while step_data is not None:
+        steps.append(step_data)
+        ancestor = ancestor._lp_parent
+        step_data = getattr(ancestor, "_lp_step_data", None)
+
+    add_sid_end = sid_end_token_id is not None and beam.finish_reason != "stop"
+    init_len = len(init_token_ids)
+    total = init_len + sum(len(seg[0]) for seg in steps) + (1 if add_sid_end else 0)
+
+    # Pre-allocate the flat arrays at their final size. ranks/decoded_tokens
+    # are filled with None (the common hot-path case where metadata is None);
+    # only list-carrying segments overwrite their slice below.
+    token_ids = [None] * total
+    logprobs = [0.0] * total
+    ranks = [None] * total
+    decoded_tokens = [None] * total
+    token_ids[:init_len] = init_token_ids
+    logprobs[:init_len] = init_logprobs
+    ranks[:init_len] = init_ranks
+    decoded_tokens[:init_len] = init_decoded
+    start_indices = list(init_start)
+    end_indices = list(init_end)
+
+    # Replay steps oldest-first (steps were collected newest-first).
+    pos = init_len
+    for seg_token_ids, seg_logprobs, seg_ranks, seg_decoded in reversed(steps):
+        n = len(seg_token_ids)
+        start_indices.append(pos)
+        token_ids[pos : pos + n] = seg_token_ids
+        logprobs[pos : pos + n] = seg_logprobs
+        if seg_ranks is not None:
+            ranks[pos : pos + n] = seg_ranks
+        if seg_decoded is not None:
+            decoded_tokens[pos : pos + n] = seg_decoded
+        pos += n
+        end_indices.append(pos)
+
+    if add_sid_end:
+        start_indices.append(pos)
+        token_ids[pos] = sid_end_token_id
+        logprobs[pos] = 0.0
+        pos += 1
+        end_indices.append(pos)
+
+    beam.logprobs = FlatLogprobs(
+        start_indices=start_indices,
+        end_indices=end_indices,
+        token_ids=token_ids,
+        logprobs=logprobs,
+        ranks=ranks,
+        decoded_tokens=decoded_tokens,
+    )
+
+
+def reconstruct_beam_logprobs_batch(
+    beams,
+    initial_logprobs,
+    sid_end_token_id=None,
+) -> None:
+    """Batched variant of :func:`reconstruct_beam_logprobs`.
+
+    Reconstructs full ``FlatLogprobs`` for every beam in *beams* in a single
+    pass, writing the result back to ``beam.logprobs`` in place.  Produces
+    results field-by-field identical to calling
+    :func:`reconstruct_beam_logprobs` on each beam, but reads the shared
+    read-only ``initial_logprobs`` fields once and inlines the per-segment
+    ``append_fast`` logic to avoid hundreds of Python call frames,
+    ``isinstance`` checks and ``len()`` calls on the hot tail path.
+    """
+    init_token_ids = initial_logprobs.token_ids
+    init_logprobs = initial_logprobs.logprobs
+    init_ranks = initial_logprobs.ranks
+    init_decoded = initial_logprobs.decoded_tokens
+    init_start = initial_logprobs.start_indices
+    init_end = initial_logprobs.end_indices
+    for beam in beams:
+        _reconstruct_one(
+            beam,
+            init_token_ids,
+            init_logprobs,
+            init_ranks,
+            init_decoded,
+            init_start,
+            init_end,
+            sid_end_token_id,
+        )
+
+
 def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
     """Walk parent-pointer chain to build full FlatLogprobs for a beam.
 
@@ -51,25 +169,8 @@ def reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id=None):
     collected via ``_lp_parent`` / ``_lp_step_data`` pointers.  If
     ``sid_end_token_id`` is given and the beam did not finish with EOS,
     an extra entry is appended for the session-end token.
-    """
-    from vllm.logprobs import FlatLogprobs
 
-    steps = []
-    ancestor = beam
-    while getattr(ancestor, "_lp_step_data", None) is not None:
-        steps.append(ancestor._lp_step_data)
-        ancestor = ancestor._lp_parent
-    steps.reverse()
-    lp = FlatLogprobs(
-        start_indices=list(initial_logprobs.start_indices),
-        end_indices=list(initial_logprobs.end_indices),
-        token_ids=list(initial_logprobs.token_ids),
-        logprobs=list(initial_logprobs.logprobs),
-        ranks=list(initial_logprobs.ranks),
-        decoded_tokens=list(initial_logprobs.decoded_tokens),
-    )
-    for sd in steps:
-        lp.append_fast(sd[0], sd[1], sd[2], sd[3])
-    if sid_end_token_id is not None and beam.finish_reason != "stop":
-        lp.append_fast([sid_end_token_id], [0.0], [None], [None])
-    beam.logprobs = lp
+    Thin wrapper around :func:`reconstruct_beam_logprobs_batch` kept for
+    backward compatibility with existing call sites and tests.
+    """
+    reconstruct_beam_logprobs_batch([beam], initial_logprobs, sid_end_token_id)

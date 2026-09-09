@@ -23,6 +23,7 @@ from vllm_gr.beam_search_decision_utils import (
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
     materialize_selected_beams,
+    select_top_beams,
     select_top_indices,
 )
 from vllm_gr.config import MAX_BEAM_WIDTH
@@ -35,8 +36,10 @@ from vllm_gr.constraints.strategies import (
     validate_constraint_generation_limits,
     validate_constraint_table_protocol,
 )
-from vllm_gr.logprobs import reconstruct_beam_logprobs
+from vllm_gr.logprobs import reconstruct_beam_logprobs_batch
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.tokenizer_fast import fast_batch_decode
+from vllm_gr.utils.engine_lifecycle import frontend_request_scope
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 from vllm_gr.v1.metrics.beam_search_metrics import record_beam_search_metrics
 from vllm_gr.v1.metrics.stats import RequestStateStats
@@ -396,6 +399,7 @@ async def _beam_request_cleanup(engine_client, session_id, final_ids, rank):
         logger.error("Failed to clear beam_request cache for session %s: %s", session_id, e)
 
 
+@frontend_request_scope
 async def beam_search(
     self,
     prompt: EngineInput,
@@ -1052,23 +1056,23 @@ async def beam_search(
 
     # Measure beam sort time
     beam_search_sort_start = time.perf_counter()
-    sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
+    best_beams = select_top_beams(completed, beam_width)
     beam_search_sort_time = time.perf_counter() - beam_search_sort_start
-    best_beams = sorted_completed[:beam_width]
 
     # Reconstruct full logprobs only for the final best beams by walking
     # the parent-pointer tree.  This replaces the O(beams * steps^2)
     # per-step copying with a single O(beams * steps) pass at the end.
-    for beam in best_beams:
-        reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+    reconstruct_beam_logprobs_batch(best_beams, initial_logprobs, sid_end_token_id)
 
-    for i, beam in enumerate(best_beams):
-        tokens = (
-            beam.tokens[tokenized_length:-1]
-            if beam.tokens[-1] == eos_token_id and not ignore_eos
-            else beam.tokens[tokenized_length:]
-        )
-        beam.text = tokenizer.decode(tokens)
+    tokens_list = [
+        beam.tokens[tokenized_length:-1]
+        if beam.tokens[-1] == eos_token_id and not ignore_eos
+        else beam.tokens[tokenized_length:]
+        for beam in best_beams
+    ]
+    decoded_texts = fast_batch_decode(tokenizer, tokens_list)
+    for beam, text in zip(best_beams, decoded_texts):
+        beam.text = text
 
     beam_search_decode_time = time.perf_counter() - beam_search_start
     beam_search_prefill_time = beam_search_start - prefill_start
@@ -1113,5 +1117,14 @@ async def beam_search(
     except Exception:
         model_name = "unknown"
     record_beam_search_metrics(metrics, engine="0", model_name=model_name)
+
+    # Multi-process deployments run this serving frontend in a process
+    # separate from the EngineCore/worker, whose GC freeze cannot reach here.
+    # Freeze the frontend heap once after the first beam request so the
+    # driver's own gen-1 GC (heavy per-request beam bookkeeping) cannot spike
+    # request latency on a fixed cadence.  Idempotent; spawns a daemon thread.
+    from vllm_gr.utils.engine_lifecycle import schedule_frontend_gc_freeze
+
+    schedule_frontend_gc_freeze()
 
     yield out

@@ -12,18 +12,22 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Sequence
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 
+from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+
+# C-level key for sorting beams by cumulative log-prob (avoids a per-beam
+# Python lambda call frame, which is also amplified by the torch profiler).
+_beam_score = attrgetter("cum_logprob")
+
 if TYPE_CHECKING:
     from vllm.logprobs import FlatLogprobs
 
-from vllm_gr.constraints.models import (
-    BeamCandidateCache,
-)
-from vllm_gr.ops.sliced_logits import get_vocab_slice_config, is_vocab_slice_enabled
+    from vllm_gr.constraints.models import BeamCandidateCache
 
 ForkInfo = list[tuple[int, int]]
 
@@ -275,6 +279,21 @@ def select_top_indices(
     else:
         topn_idx = np.arange(scores.size)
     return topn_idx
+
+
+def select_top_beams(beams: Sequence, beam_width: int) -> list:
+    """Return the ``beam_width`` highest-scoring beams, best first.
+
+    Equivalent to ``sorted(beams, key=lambda b: b.cum_logprob,
+    reverse=True)[:beam_width]``.  A C-level ``attrgetter`` replaces the
+    per-beam Python lambda key: at the completed-list size (a few hundred
+    beams) Timsort is already sub-millisecond, and numpy ``argpartition``
+    measured slower (its fixed dispatch overhead exceeds the sort itself at
+    this scale), so the only worthwhile saving is extracting keys without
+    entering a Python lambda per beam (also removes the profiler's per-key
+    call frames).
+    """
+    return sorted(beams, key=_beam_score, reverse=True)[:beam_width]
 
 
 def materialize_selected_beams(

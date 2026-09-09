@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any, Union, cast
 
 import numpy as np
 from tqdm.auto import tqdm
-from transformers import PreTrainedTokenizerBase
 from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchInstance,
     BeamSearchOutput,
@@ -42,6 +41,7 @@ from vllm_gr.beam_search_decision_utils import (
     extract_constrained_flat_logprobs,
     extract_constrained_segment,
     materialize_selected_beams,
+    select_top_beams,
     select_top_indices,
 )
 from vllm_gr.config import ConstraintBackend, GRConfig
@@ -63,9 +63,11 @@ from vllm_gr.constraints.strategies import (
 from vllm_gr.engine.arg_utils_gr import engine_args_accepts_gr_values
 from vllm_gr.logger import init_logger
 from vllm_gr.logprobs import (
-    reconstruct_beam_logprobs,
+    reconstruct_beam_logprobs_batch,
 )
 from vllm_gr.sampling_params import clone_beam_decode_sampling_params
+from vllm_gr.tokenizer_fast import fast_batch_decode, fast_decode
+from vllm_gr.utils.engine_lifecycle import frontend_request_scope
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 from vllm_gr.v1.engine.types import BeamRequestStepUpdate
 
@@ -899,6 +901,7 @@ class GRLLM(LLM):
             "the EngineCore request, execution, result, and cleanup pipeline"
         )
 
+    @frontend_request_scope
     def beam_search(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
@@ -1285,8 +1288,7 @@ class GRLLM(LLM):
                     beam.tokens.append(sid_end_token_id)
             # Move remaining active beams into the completed list.
             instance.completed.extend(instance.beams)
-            sorted_completed = sorted(instance.completed, key=lambda x: x.cum_logprob, reverse=True)
-            best_beams = sorted_completed[:beam_width]
+            best_beams = select_top_beams(instance.completed, beam_width)
 
             prompt_cache = cached_prompts[idx]
             prompt_len = prompt_cache["len"]
@@ -1302,7 +1304,7 @@ class GRLLM(LLM):
             # time.  The slice pins the text to exactly the tokens that were
             # present when the prompt was cached.
             prompt_text = (
-                tokenizer.decode(prompt_cache["tokens"][:prompt_len])
+                fast_decode(tokenizer, prompt_cache["tokens"][:prompt_len])
                 if decode_prompt_in_text
                 else ""
             )
@@ -1315,30 +1317,24 @@ class GRLLM(LLM):
             gc_was_enabled = gc.isenabled()
             gc.disable()
             try:
-                for beam in best_beams:
-                    reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
+                reconstruct_beam_logprobs_batch(best_beams, initial_logprobs, sid_end_token_id)
             finally:
                 if gc_was_enabled:
                     gc.enable()
-            # Batch-detokenize the generated tokens of all best beams in a
-            # single fast-tokenizer call.  batch_decode() is not part of the
-            # TokenizerLike protocol (e.g. Grok2Tokenizer only implements
-            # decode()), so fall back to per-beam decode() when it is absent.
-            # Qwen2Tokenizer.batch_decode accepts a list of token-id lists and
-            # returns list[str], equivalent to N individual decode() calls but
-            # ~5x faster (Rust batch path vs per-call Python wrapper overhead).
-            # Slice the generated tail from the full sequence: on the shared-
-            # prefix path ``beam.tokens`` holds only the generated tail, but a
-            # sid_begin token (when present) lives in ``_prompt_token_ids`` at
+            # Detokenize the generated tokens of all best beams in one pass.
+            # fast_batch_decode routes straight to the native Rust
+            # ``Tokenizer.decode_batch`` when the backend is behavior-verified,
+            # bypassing HuggingFace's recursive ``to_py_obj`` conversion and
+            # per-sequence Python wrapper (~3x faster); it falls back to
+            # batch_decode / per-beam decode() for tokenizers whose raw backend
+            # disagrees with the wrapper (or that lack one).  Slice the
+            # generated tail from the full sequence: on the shared-prefix path
+            # ``beam.tokens`` holds only the generated tail, but a sid_begin
+            # token (when present) lives in ``_prompt_token_ids`` at
             # ``prompt_len`` — it belongs to the generated output, so decode it
             # here rather than losing it between prompt_text and gen_text.
             beam_token_lists = [_beam_full_tokens(beam)[prompt_len:] for beam in best_beams]
-            if hasattr(tokenizer, "batch_decode"):
-                decoded_gen_texts = cast(PreTrainedTokenizerBase, tokenizer).batch_decode(
-                    beam_token_lists
-                )
-            else:
-                decoded_gen_texts = [tokenizer.decode(tokens) for tokens in beam_token_lists]
+            decoded_gen_texts = fast_batch_decode(tokenizer, beam_token_lists)
             for beam, gen_text in zip(best_beams, decoded_gen_texts):
                 beam.text = prompt_text + gen_text
             # Restore the full token sequence on the returned beams.  During
@@ -1351,6 +1347,14 @@ class GRLLM(LLM):
             best_beams = [replace(beam, tokens=_beam_full_tokens(beam)) for beam in best_beams]
             outputs.append(BeamSearchOutput(sequences=best_beams))
 
+        # The worker-side freeze only covers the EngineCore/worker process; in
+        # the default multi-process deployment this frontend driver is a
+        # separate process and its own gen-1 GC (heavy per-request beam
+        # bookkeeping) would spike beam_search() every few requests.  Freeze
+        # the frontend heap once after the first full beam request completes.
+        from vllm_gr.utils.engine_lifecycle import schedule_frontend_gc_freeze
+
+        schedule_frontend_gc_freeze()
         return outputs
 
     def shutdown(self) -> None:
