@@ -195,12 +195,6 @@ def extract_constrained_flat_logprobs(flat: Any, logprobs_num: int):
     )
 
 
-def find_eos_indices(token_ids: np.ndarray, eos_token_id: int) -> np.ndarray:
-    """Return EOS positions using the legacy NumPy comparison."""
-
-    return np.where(token_ids == eos_token_id)[0]
-
-
 def complete_eos_candidates(
     *,
     parents: Sequence[BeamSearchSequence],

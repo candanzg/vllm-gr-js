@@ -236,14 +236,100 @@ def _publish_beam_session_error(self, update) -> None:
     )
 
 
+def _retire_drained_gr_owner(engine_core: Any) -> None:
+    """Complete a fully drained GR retirement inline, without an EngineCore step.
+
+    The zero-token retire control frame otherwise consumes one full EngineCore
+    step before the newly submitted request can be scheduled. When the previous
+    owner has already delivered its terminal result, has no in-flight dispatch,
+    and is gone from the native request table, run the identical retire
+    protocol synchronously here: build the control frame, release the local
+    Worker owner, verify the release proof, and close the scheduler owner.
+    The next step then schedules the new request's Prefill directly.
+
+    Only the in-process EngineCore may run this: its Worker is local and the
+    frontend thread that submits also drives every step, so nothing runs
+    concurrently. Multiprocess cores keep the step-based retire frame
+    (their Worker is remote and submit runs on the input thread).
+    """
+    if hasattr(engine_core, "input_queue"):
+        return  # EngineCoreProc: Worker is remote and submit is off-thread.
+    scheduler = getattr(engine_core, "scheduler", None)
+    if scheduler is None:
+        return
+    sessions = getattr(scheduler, "_gr_v1_sessions", None)
+    owner = sessions.get(getattr(scheduler, "_gr_owner", None)) if sessions else None
+    if owner is None:
+        return
+    from vllm_gr.v1.engine.beam_search_v1 import GRResourceStatus
+
+    if (
+        owner.resource_status is not GRResourceStatus.DRAINING
+        or owner._in_flight_dispatches
+        or owner.terminal_result_pending
+        or owner.session_id in scheduler.requests
+    ):
+        return
+    executor = getattr(engine_core, "model_executor", None)
+    driver = getattr(executor, "driver_worker", None)
+    worker = getattr(driver, "worker", None)
+    runner = getattr(worker, "model_runner", None)
+    adapter = getattr(runner, "_gr_gpu_stage_runner", None)
+    if runner is None or adapter is None or adapter.closed:
+        return
+
+    from vllm.v1.core.sched.output import CachedRequestData
+    from vllm.v1.core.sched.scheduler import SchedulerOutput
+
+    from vllm_gr.v1.engine.beam_search_v1 import GRRetireMetadata, GRRetireResult
+    from vllm_gr.v1.engine.gr_async_scheduler import (
+        GR_RETIRE_OUTPUT_ATTR,
+        GR_RETIRE_RESULT_ATTR,
+        _release_owner,
+    )
+    from vllm_gr.v1.worker.gpu_beam_stage_runner import execute_gr_retirement
+
+    retire_id = getattr(scheduler, "_gr_retire_id", 0) + 1
+    scheduler._gr_retire_id = retire_id
+    retirement = GRRetireMetadata(owner.session_id, owner.owner_generation, retire_id)
+    owner.retirement = retirement
+    owner.resource_status = GRResourceStatus.RETIRING
+    # A frame structurally identical to the zero-token output the scheduler
+    # would have produced for the step-based retire.
+    frame = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids={owner.session_id},
+        free_encoder_mm_hashes=[],
+    )
+    setattr(frame, GR_RETIRE_OUTPUT_ATTR, retirement)
+    result = execute_gr_retirement(runner, frame)
+    output = result.get_output()
+    proof = getattr(output, GR_RETIRE_RESULT_ATTR, None)
+    expected = GRRetireResult(
+        retirement.session_id, retirement.owner_generation, retirement.retire_id, True
+    )
+    if proof != expected:
+        raise RuntimeError(
+            "Asynchronous scheduling Worker did not prove release of the matching execution owner"
+        )
+    _release_owner(scheduler, owner)
+
+
 def _handle_submit_gr_session(self, batch_request) -> None:
     """Preprocess once, then let Scheduler register and run the persistent session."""
     if not batch_request.items:
         logger.error("Rejecting an empty beam_search_v1 batch")
         return
+    _retire_drained_gr_owner(self)
     engine_request = batch_request.items[0].request
     try:
-        from vllm_gr.config import BeamExecutionMode
+        from vllm_gr.config import BeamExecutionMode, GRConfig
         from vllm_gr.config.execution import require_beam_execution_mode
 
         require_beam_execution_mode(self.vllm_config, BeamExecutionMode.V1)
@@ -253,7 +339,23 @@ def _handle_submit_gr_session(self, batch_request) -> None:
             raise RuntimeError("beam_search_v1 requires vLLM async_scheduling")
         if self.batch_queue is None or self.batch_queue_size < 2:
             raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
-        preprocessed = self.preprocess_add_request(engine_request)
+        skip_prefix_hash = GRConfig.from_vllm_config(
+            getattr(self, "vllm_config", None)
+        ).beam_skip_prefix_hash
+        if skip_prefix_hash:
+            # Unique-prompt GR sessions never hit the prefix cache, so the
+            # block-hash chain is pure cold-path overhead. Flag the request
+            # before preprocess so Request construction computes nothing and
+            # the scheduler's cache-hit lookup short-circuits.
+            engine_request.sampling_params.skip_reading_prefix_cache = True
+            hasher = getattr(self, "request_block_hasher", None)
+            self.request_block_hasher = None
+            try:
+                preprocessed = self.preprocess_add_request(engine_request)
+            finally:
+                self.request_block_hasher = hasher
+        else:
+            preprocessed = self.preprocess_add_request(engine_request)
     except Exception:
         handler = getattr(self, "_handle_request_preproc_error", None)
         if handler is None:

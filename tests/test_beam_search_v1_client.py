@@ -7,6 +7,7 @@ import asyncio
 import gc
 import threading
 import weakref
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -446,3 +447,70 @@ def test_terminal_failure_precedes_tokenizer_access(online: bool) -> None:
             call = OfflineBeamSearchRequest([[1, 2]], object())
         client.build_output(call, _request(), result)
     assert caught.value.failure is failure
+
+
+class _BoundaryStubTokenizer:
+    def __init__(self) -> None:
+        self.convert_calls = 0
+        self.decode_calls = 0
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        self.convert_calls += 1
+        return {"<bos>": 7, "<eos>": 9}[token]
+
+    def decode(self, ids: Iterable[int], **kwargs: object) -> str:
+        self.decode_calls += 1
+        return " ".join(str(int(i)) for i in ids)
+
+
+def _output_case(
+    token_ids: tuple[int, ...],
+    finish_reason: str,
+    stop_token_id: int | None = None,
+) -> tuple[OfflineBeamSearchRequest, BeamBatchRequest, BeamBatchResult]:
+    call = OfflineBeamSearchRequest(
+        prompts=[SimpleNamespace(prompt="ignored")],
+        params=SimpleNamespace(begin_token="<bos>", end_token="<eos>"),
+    )
+    request = cast(
+        BeamBatchRequest,
+        SimpleNamespace(
+            items=[
+                SimpleNamespace(
+                    request=SimpleNamespace(
+                        prompt_token_ids=[7, 101, 102, 103],
+                        cache_salt=None,
+                        lora_request=None,
+                    )
+                )
+            ],
+        ),
+    )
+    sequence = SimpleNamespace(
+        token_ids=token_ids,
+        cumulative_logprob=-1.25,
+        finish_reason=finish_reason,
+        stop_token_id=stop_token_id,
+    )
+    item = SimpleNamespace(item_index=0, sequences=[sequence])
+    output = SimpleNamespace(items=[item])
+    result = cast(
+        BeamBatchResult,
+        SimpleNamespace(failure=None, output=output),
+    )
+    return call, request, result
+
+
+def test_output_processor_boundary_cache_survives_processor_instances() -> None:
+    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+        BeamSearchOutputProcessor,
+    )
+
+    tokenizer = _BoundaryStubTokenizer()
+    for _ in range(3):
+        call, request, result = _output_case((201,), "length")
+        processor = BeamSearchOutputProcessor(tokenizer)
+        processor.process_outputs(call, request, result)
+    # Two boundary conversions for the whole run; every repeat hits the
+    # tokenizer-attached cache instead of re-resolving.
+    assert tokenizer.convert_calls == 2

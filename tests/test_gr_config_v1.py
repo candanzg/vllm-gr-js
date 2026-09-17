@@ -90,6 +90,55 @@ def test_canonical_beam_runtime_options_round_trip(
     assert gr_config_to_mapping(config) == raw
 
 
+@pytest.mark.parametrize("skip_prefix_hash", [True, False])  # type: ignore[misc]
+def test_canonical_beam_skip_prefix_hash_round_trip(
+    skip_prefix_hash: bool,
+    tmp_path: Path,
+) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam["skip_prefix_hash"] = skip_prefix_hash
+
+    config = gr_config_from_mapping(raw)
+
+    assert config.beam_skip_prefix_hash is skip_prefix_hash
+    # The default (False) stays omitted; explicit True survives serialization.
+    encoded = gr_config_to_mapping(config)["beam"]
+    assert encoded.get("skip_prefix_hash") is (True if skip_prefix_hash else None)
+
+
+def test_canonical_beam_skip_prefix_hash_defaults_off(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    assert gr_config_from_mapping(raw).beam_skip_prefix_hash is False
+
+
+@pytest.mark.parametrize("table_vocab_slice", [True, False])  # type: ignore[misc]
+def test_canonical_beam_table_vocab_slice_round_trip(
+    table_vocab_slice: bool,
+    tmp_path: Path,
+) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    beam = raw["beam"]
+    assert isinstance(beam, dict)
+    beam["table_vocab_slice"] = table_vocab_slice
+
+    config = gr_config_from_mapping(raw)
+
+    assert config.beam_table_vocab_slice is table_vocab_slice
+    assert gr_config_to_mapping(config) == raw
+
+
+def test_canonical_beam_table_vocab_slice_defaults_to_auto(tmp_path: Path) -> None:
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    config = gr_config_from_mapping(raw)
+    assert config.beam_table_vocab_slice is None
+    # Tri-state: the auto default stays omitted on serialization.
+    encoded = gr_config_to_mapping(config)["beam"]
+    assert isinstance(encoded, dict)
+    assert "table_vocab_slice" not in encoded
+
+
 def test_canonical_self_advance_requires_worker_decision(tmp_path: Path) -> None:
     raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
     beam = raw["beam"]

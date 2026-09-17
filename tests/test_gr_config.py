@@ -19,6 +19,7 @@ from vllm_gr.config.parser import (
     ATTENTION_BACKEND_KEY,
     BEAM_MAX_DECODE_STEPS_KEY,
     BEAM_MAX_WIDTH_KEY,
+    BEAM_SKIP_PREFIX_HASH_KEY,
     CATALOG_PATH_KEY,
     CONSTRAINT_BACKEND_KEY,
     NPU_DECODE_EXECUTION_KEY,
@@ -112,6 +113,30 @@ def test_npu_decode_execution_parses_and_normalizes() -> None:
 def test_rejects_invalid_npu_decode_execution(value: object) -> None:
     with pytest.raises(ValueError, match="npu_decode_execution"):
         GRConfig.from_vllm_config(_vllm_config({NPU_DECODE_EXECUTION_KEY: value}))
+
+
+def test_beam_skip_prefix_hash_round_trip_and_default_elision() -> None:
+    assert GRConfig().beam_skip_prefix_hash is False
+    assert GRConfig.from_vllm_config(_vllm_config()).beam_skip_prefix_hash is False
+    # The switch is a pure runtime optimization: it never marks the
+    # configuration as "enabled" by itself.
+    assert GRConfig(beam_skip_prefix_hash=True).enabled is False
+
+    vllm_config = _vllm_config({BEAM_SKIP_PREFIX_HASH_KEY: True})
+    assert GRConfig.from_vllm_config(vllm_config).beam_skip_prefix_hash is True
+
+    GRConfig(beam_skip_prefix_hash=True).write_to_vllm_config(vllm_config)
+    assert vllm_config.additional_config[BEAM_SKIP_PREFIX_HASH_KEY] is True
+
+    # Writing the default removes the key entirely.
+    GRConfig().write_to_vllm_config(vllm_config)
+    assert BEAM_SKIP_PREFIX_HASH_KEY not in vllm_config.additional_config
+
+
+@pytest.mark.parametrize("value", [1, [], {}, "unknown"])  # type: ignore[misc]
+def test_rejects_invalid_beam_skip_prefix_hash(value: object) -> None:
+    with pytest.raises(ValueError, match="beam_skip_prefix_hash"):
+        GRConfig.from_vllm_config(_vllm_config({BEAM_SKIP_PREFIX_HASH_KEY: value}))
 
 
 def test_npu_decode_execution_round_trip_and_default_elision() -> None:

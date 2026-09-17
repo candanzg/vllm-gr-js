@@ -8,6 +8,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn
 
+from vllm.entrypoints.generate.beam_search.utils import (
+    BeamSearchOutput,
+    BeamSearchSequence,
+)
 from vllm.inputs import tokens_input
 
 from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
@@ -16,6 +20,7 @@ from vllm_gr.entrypoints.beam_search_v1.protocol import (
     OnlineBeamSearchRequest,
 )
 from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
+from vllm_gr.entrypoints.gr import _LazyMaterializedBeamSequence
 from vllm_gr.tokenizer_fast import fast_batch_decode, fast_decode
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
@@ -51,12 +56,9 @@ def _prompt_text(prompt: Any) -> str | None:
 
 
 def _prompt_boundaries(
-    tokenizer: Any,
     request: BeamBatchRequest,
-    params: Any,
-) -> tuple[list[Sequence[int]], list[Sequence[int]], int | None, int | None]:
-    begin_token_id = _token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
-    end_token_id = _token_id(tokenizer, getattr(params, "end_token", None), "end_token")
+    begin_token_id: int | None,
+) -> tuple[list[Sequence[int]], list[Sequence[int]]]:
     prepared_prompts: list[Sequence[int]] = []
     original_prompts: list[Sequence[int]] = []
     for item in request.items:
@@ -68,7 +70,7 @@ def _prompt_boundaries(
             original = prepared
         prepared_prompts.append(prepared)
         original_prompts.append(original)
-    return prepared_prompts, original_prompts, begin_token_id, end_token_id
+    return prepared_prompts, original_prompts
 
 
 def _output_suffix(sequence: BeamOutputSequence, end_token_id: int | None) -> list[int]:
@@ -111,8 +113,6 @@ class _V1BeamTailMaterializer:
         self._prompt_text: str | None = None
 
     def __call__(self, beam: Any) -> None:
-        from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
-
         suffix = beam.__dict__.pop("_v1_suffix")
         full = list(self._prepared)
         full.extend(suffix)
@@ -139,6 +139,38 @@ class BeamSearchOutputProcessor:
             raise ValueError("beam_search_v1 output conversion requires a tokenizer")
         self.tokenizer = tokenizer
 
+    def _boundaries(self, params: Any) -> tuple[int | None, int | None]:
+        """Resolve (begin_token_id, end_token_id) per (tokenizer, token pair).
+
+        Boundary token ids depend only on (tokenizer, begin/end token) and
+        resolving them walks the HF tokenizer plus the vLLM tokenizer-pool
+        borrow/return (~160us). The processor is constructed per call by the
+        clients, so a per-instance cache could never hit; the cache therefore
+        hangs off the tokenizer instance (the same engine-lifetime pattern
+        as gr.py's prompt-text LRU) and dies with it.
+        """
+        key = (
+            getattr(params, "begin_token", None),
+            getattr(params, "end_token", None),
+        )
+        cache: dict[Any, tuple[int | None, int | None]] | None
+        try:
+            cache = self.tokenizer.__dict__.get("_gr_boundary_cache")
+            if cache is None:
+                cache = self.tokenizer.__dict__["_gr_boundary_cache"] = {}
+        except AttributeError:
+            cache = None  # slotted/exotic tokenizer: resolve uncached
+        cached = cache.get(key) if cache is not None else None
+        if cached is not None:
+            return cached
+        resolved = (
+            _token_id(self.tokenizer, key[0], "begin_token"),
+            _token_id(self.tokenizer, key[1], "end_token"),
+        )
+        if cache is not None:
+            cache[key] = resolved
+        return resolved
+
     @classmethod
     def ensure_available(cls) -> None:
         """A5 output conversion is installed and safe to admit work."""
@@ -151,16 +183,8 @@ class BeamSearchOutputProcessor:
     ) -> list[Any]:
         output = _result_output(result)
         try:
-            prepared, original, _, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params
-            )
-
-            from vllm.entrypoints.generate.beam_search.utils import (
-                BeamSearchOutput,
-                BeamSearchSequence,
-            )
-
-            from vllm_gr.entrypoints.gr import _LazyMaterializedBeamSequence
+            begin_token_id, end_token_id = self._boundaries(call.params)
+            prepared, original = _prompt_boundaries(request, begin_token_id)
 
             converted = []
             for item in output.items:
@@ -203,9 +227,8 @@ class BeamSearchOutputProcessor:
     ) -> list[Any]:
         output = _result_output(result)
         try:
-            _, original, begin_token_id, end_token_id = _prompt_boundaries(
-                self.tokenizer, request, call.params
-            )
+            begin_token_id, end_token_id = self._boundaries(call.params)
+            _, original = _prompt_boundaries(request, begin_token_id)
 
             from vllm.outputs import CompletionOutput, RequestOutput
 

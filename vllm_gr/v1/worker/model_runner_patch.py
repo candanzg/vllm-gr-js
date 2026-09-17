@@ -55,6 +55,56 @@ def _runner_vocab_size(runner: object) -> int:
     return vocab_size
 
 
+def _enable_constraint_vocab_slice(
+    backend: object, vocab_size: int, *, table_vocab_slice: bool | None = None
+) -> None:
+    """Enable sliced lm_head logits from the backend's emittable-token window.
+
+    Canonical Beam V1 deployments never run the legacy catalog slice
+    computation, so the worker derives the vocabulary window from the loaded
+    constraint tables themselves. Backends exposing ``vocab_window`` support
+    sliced logits (the fused kernel translates global ids to local columns);
+    backends without it keep the full-vocabulary ABI and are left untouched.
+    ``table_vocab_slice=False`` (beam.table_vocab_slice in the canonical
+    config) is the explicit rollback switch; None keeps the auto behavior.
+    """
+    if table_vocab_slice is False:
+        return
+    try:
+        from vllm_gr.ops.sliced_logits import (
+            is_vocab_slice_enabled,
+            set_vocab_slice_config,
+        )
+
+        if is_vocab_slice_enabled():
+            # An explicitly configured slice (legacy additional_config keys) wins.
+            return
+        vocab_window = getattr(backend, "vocab_window", None)
+        if not callable(vocab_window):
+            return
+        low, high = vocab_window()
+        offset, slice_size = int(low), int(high) - int(low) + 1
+        if offset < 0 or offset + slice_size > vocab_size:
+            raise ValueError(
+                f"constraint token window [{low}, {high}] exceeds vocab_size {vocab_size}"
+            )
+        set_vocab_slice_config(offset, slice_size)
+    except Exception as exc:
+        logger.warning(
+            "vllm_gr: constraint vocabulary slice not enabled (%s); "
+            "falling back to full-vocabulary logits",
+            exc,
+        )
+        return
+    logger.info(
+        "vllm_gr: constraint vocabulary slice enabled from table tokens: "
+        "offset=%d slice_size=%d vocab_size=%d",
+        offset,
+        slice_size,
+        vocab_size,
+    )
+
+
 def make_load_model_with_constraint_backend(original):
     """Load weights first, then atomically publish a ready canonical Backend."""
 
@@ -93,10 +143,11 @@ def make_load_model_with_constraint_backend(original):
 
             from vllm_gr.constraints.loader import load_constraint_backend
 
+            vocab_size = _runner_vocab_size(self)
             backend = load_constraint_backend(
                 config=table_config,
                 device=getattr(self, "device", None),
-                vocab_size=_runner_vocab_size(self),
+                vocab_size=vocab_size,
                 dtype=getattr(getattr(self, "model_config", None), "dtype", None),
                 # One Backend call is made per request. Decode requests carry
                 # exactly beam_width logits rows, so beam_max_width is the
@@ -113,6 +164,15 @@ def make_load_model_with_constraint_backend(original):
             # Backend only after readiness and returns an immediately usable CPU
             # Backend, so requests never observe a partially initialized object.
             self.constraint_backend = backend
+
+            # Sliced lm_head logits must be configured before the first forward
+            # so the weight-slice cache is built once and reused by the Beam
+            # decode/prefill paths.
+            _enable_constraint_vocab_slice(
+                backend,
+                vocab_size,
+                table_vocab_slice=gr_config.beam_table_vocab_slice,
+            )
             return result
         except BaseException:
             if backend is not None:

@@ -141,6 +141,11 @@ class GPUBeamFinalOutput:
                 state.device,
             )
         self.host_numpy = self.host.numpy()
+        # The V1 execution path never switches the ambient compute stream
+        # (all copy/side streams are entered through temporary ``with`` blocks),
+        # so resolve it once here instead of paying the ~44us
+        # ``torch.cuda.current_stream`` Python walk on every _record_done call.
+        self._compute_stream = torch.cuda.current_stream(state.device)
         self.pack_ready = torch.Event()
         self.ready = torch.Event()
         self.done = torch.Event()
@@ -180,7 +185,7 @@ class GPUBeamFinalOutput:
     def _record_done(self, owner: GPUBeamStageRunner) -> None:
         if self._done_recorded:
             return
-        stream = torch.cuda.current_stream(owner.beam.state.device)
+        stream = self._compute_stream
         stream.wait_event(owner.last_work)
         if self._enqueued:
             stream.wait_event(self.ready)
@@ -197,7 +202,7 @@ class GPUBeamFinalOutput:
         state = owner.beam.state
         row = self.binding.state_row
         result_width = self.options.num_return_sequences
-        produced = torch.cuda.current_stream(state.device)
+        produced = self._compute_stream
         produced.wait_event(owner.last_work)
         ranking_scores = state.completed_scores[row : row + 1]
         if control is not None:

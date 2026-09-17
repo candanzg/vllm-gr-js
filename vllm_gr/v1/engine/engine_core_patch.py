@@ -532,6 +532,11 @@ def apply_scheduler_patch():
 
             def patch_cache_blocks(request, num_computed_tokens):
                 if getattr(request, "gr_batch_request", None) is not None:
+                    if getattr(self, "_gr_skip_prefix_hash", False):
+                        # GR prefix-hash skipping also drops the write side:
+                        # the request has no block hashes, so there is
+                        # nothing to register in the prefix-cache table.
+                        return None
                     # Only complete prompt blocks are cacheable. Placeholder
                     # hashes must never advertise generated Beam KV.
                     return _original_cache_blocks(
@@ -752,9 +757,10 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
         if terminal_result.failure is not None
         else RequestStatus.FINISHED_STOPPED
     )
-    finish_reason = FinishReason.ERROR if terminal_result.failure is not None else FinishReason.STOP
 
     _finish_native_gr_request(scheduler, native_request, request_id, request_status)
+
+    finish_reason = FinishReason.ERROR if terminal_result.failure is not None else FinishReason.STOP
 
     if target_outputs is None:
         target_outputs = result.get(client_index)
@@ -817,6 +823,7 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         dispatched_sessions = {
             session_id: sessions[session_id] for session_id in gr_stages if session_id in sessions
         }
+
         native_update_ids = getattr(self, _GR_NATIVE_UPDATE_IDS_ATTR, None)
         if native_update_ids is None:
             native_update_ids = set()

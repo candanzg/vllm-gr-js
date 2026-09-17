@@ -77,6 +77,21 @@ class CUDAConstraintBackend:
         """Whether admission can use this backend without initialization work."""
         return self._state is _BackendState.READY
 
+    def vocab_window(self) -> tuple[int, int]:
+        """Global inclusive ``[min, max]`` token-ID window of emitted tokens.
+
+        Every token this backend can emit is drawn from the three token-ID
+        tables, so a contiguous vocabulary slice covering their combined
+        ``[min, max]`` is sufficient for sliced-logits deployments (the fused
+        kernel translates global ids to local logits columns itself).
+        """
+        token_tables = (self._first_token_ids, self._prefix1_values, self._prefix2_values)
+        if any(table is None or table.numel() == 0 for table in token_tables):
+            raise RuntimeError("cannot derive a vocabulary window from empty constraint tables")
+        low = min(int(table.min()) for table in token_tables)
+        high = max(int(table.max()) for table in token_tables)
+        return low, high
+
     def _tables(self) -> tuple[torch.Tensor, ...]:
         tables = (
             self._first_token_ids,

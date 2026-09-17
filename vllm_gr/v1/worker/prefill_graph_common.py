@@ -224,6 +224,32 @@ class PrefillBucketBuffers:
         self.static_attn_metadatas: dict[int, Any] = {}
         self.max_seq_len_bounds: dict[int, int] = {}
 
+        # Direct-staging fast-path state (GPU prefill replay; see
+        # GPUPrefillGraphRunner.try_direct_stage_prefill):
+        # - positions_template: capture-time positions snapshot (arange).
+        #   Restores the static positions buffer after a differently-shaped
+        #   generic replay overwrote them, and cheaply fills the live
+        #   positions buffer for fresh single-request prefills.
+        # - capture_invariants_fresh: True while the static positions /
+        #   query_start_loc / seq_lens buffers provably hold capture values
+        #   (identical to what a fresh exact-bucket single-request prefill
+        #   would stage), so the direct path may skip re-copying them. The
+        #   generic replay staging clears it; the direct staging (which
+        #   restores the values) and capture set it.
+        # - slot_offsets_np: lazily built within-block offset template
+        #   (tiled arange of the kernel block size) for CPU slot-mapping
+        #   assembly without the triton kernel.
+        # - prefill_logits_indices: cached [bucket-1] logit index tensor
+        #   (constant for B=1 exact-bucket prefills).
+        # The one-shot "which bucket was direct-staged for the CURRENT step"
+        # token lives on the runner (not per bucket): it is reset at every
+        # _prepare_inputs and consumed by the next execute_model_prefill,
+        # so a replay can never observe a staging from an earlier step.
+        self.positions_template: torch.Tensor | None = None
+        self.capture_invariants_fresh: bool = False
+        self.slot_offsets_np: Any = None
+        self.prefill_logits_indices: torch.Tensor | None = None
+
     def has_captured_graph(self, num_reqs: int = 1) -> bool:
         return num_reqs in self.captured_graphs
 

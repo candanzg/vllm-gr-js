@@ -18,6 +18,8 @@ from typing import Any, cast
 import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
+from vllm_gr.config import BeamExecutionMode
+from vllm_gr.config.execution import require_beam_execution_mode
 from vllm_gr.constraints.backend import ConstraintMetadata
 from vllm_gr.constraints.cuda_backend import CUDAConstraintBackend
 from vllm_gr.v1.beam.batch_contracts import (
@@ -50,6 +52,10 @@ from vllm_gr.v1.worker.gr_inputs import (
     GRInputBuffers,
     PreparedGRInputs,
     bind_device_inputs,
+)
+from vllm_gr.v1.worker.model_runner_common import (
+    _create_beam_context,
+    _get_gr_config,
 )
 
 METADATA_ABI = 1
@@ -685,23 +691,32 @@ class GPUBeamStageRunner:
                 "Asynchronous scheduling retirement identity does not match the drained execution"
             )
         self.final_output.abort(self)
-        self.cancel(self.binding)
+        # The retire protocol only reaches a fully drained owner: the terminal
+        # payload is already delivered (its Host consumer synchronized the
+        # producing stream) and no dispatch or control transfer is in flight.
+        # The device rows are dead state — the next admission's
+        # BeamSearchState.reset overwrites them wholesale — so skip the
+        # device finalization writes and event churn on this hot submit path.
+        # The abort/failure paths keep cancel's full device terminalization
+        # for consumers that may still be pending.
+        self.cancel(self.binding, device_finalize=False)
         return AsyncGRRetireOutput(self, metadata)
 
     @torch.inference_mode()
-    def cancel(self, binding: BeamRequestBinding) -> None:
+    def cancel(self, binding: BeamRequestBinding, *, device_finalize: bool = True) -> None:
         if binding != self.binding:
             raise ValueError("cancel binding mismatch")
         if self.closed or self.cancelled:
             return
         if self.pending is not None:
             raise RuntimeError("sample the dispatched work before cancellation")
-        stream = torch.cuda.current_stream(self.beam.state.device)
-        stream.wait_event(self.last_work)
-        row = binding.state_row
-        self.beam.state.is_finished[row : row + 1].fill_(True)
-        self.beam.state.active_mask[row : row + 1].zero_()
-        self.last_work.record(stream)
+        if device_finalize:
+            stream = torch.cuda.current_stream(self.beam.state.device)
+            stream.wait_event(self.last_work)
+            row = binding.state_row
+            self.beam.state.is_finished[row : row + 1].fill_(True)
+            self.beam.state.active_mask[row : row + 1].zero_()
+            self.last_work.record(stream)
         self.cancelled = True
 
     def release(self, binding: BeamRequestBinding, *, consumer_done: torch.Event) -> None:
@@ -779,29 +794,50 @@ def execute_gr_retirement(worker, scheduler_output):
     return result
 
 
-def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
-    """Admit first, then derive the adapter from existing Worker resources."""
-    from vllm_gr.config import BeamExecutionMode
-    from vllm_gr.config.execution import require_beam_execution_mode
+def _attention_layout_signature(worker: Any) -> tuple:
+    """Per-layer attention layout facts a cached admission must be valid for.
 
-    require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
-    existing = getattr(worker, "_gr_gpu_stage_runner", None)
-    if existing is not None and not existing.closed:
-        if getattr(worker, "constraint_backend", None) is not existing.backend:
-            raise ValueError("GR constraint backend binding changed before session release")
-        return cast(GPUBeamStageRunner, existing)
-    stages = validate_dispatch(scheduler_output)
-    (m,) = stages
-    from vllm_gr.v1.worker.model_runner_common import (
-        _create_beam_context,
-        _get_gr_config,
+    A tuple of (impl type, sliding window) per KV layer keeps the cached
+    static admission honest about mutations of the live forward context
+    (swapped attention implementations, edited windows) at the cost of one
+    attribute walk per admission.
+    """
+    layers = worker.compilation_config.static_forward_context
+    return tuple(
+        (
+            type(impl := getattr(layers.get(name), "impl", None)),
+            getattr(impl, "sliding_window", None),
+        )
+        for group in worker.kv_cache_config.kv_cache_groups
+        for name in group.layer_names
     )
 
-    cfg = _get_gr_config(worker)
-    capacity = GRExecutionCapacity(cfg.beam_max_width)
-    capacity.validate(m.beam_params)
-    if m.execution_capacity is not None and m.execution_capacity != capacity:
-        raise ValueError("Scheduler and Worker Asynchronous scheduling execution capacities differ")
+
+def _validate_static_admission(worker: Any, cfg: Any, m: Any, backend: Any, existing: Any) -> None:
+    """Run the once-per-(worker, backend, capacity, layout) static admission checks.
+
+    Worker/model facts cannot change after startup, so the first successful
+    admission is cached on the Worker; the per-request repeats are the Beam
+    capacity comparisons and the attention-layout signature. Dynamic
+    ownership checks stay in ``get_stage_runner``.
+    """
+    signature = (
+        backend,
+        cfg.beam_max_width,
+        cfg.beam_max_decode_steps,
+        _attention_layout_signature(worker),
+    )
+    cached = getattr(worker, "_gr_static_admission", None)
+    if cached is not None and cached[0] is backend and cached[1:] == signature[1:]:
+        if (
+            m.beam_params.beam_width != cfg.beam_max_width
+            or cfg.beam_max_decode_steps < m.beam_params.max_tokens
+        ):
+            raise ValueError(
+                "persistent GR requires GPU V1 async, TP/PP/DP=1, FP16/BF16 and matching capacity"
+            )
+        return
+    require_beam_execution_mode(worker.vllm_config, BeamExecutionMode.V1)
     parallel = worker.parallel_config
     if (
         torch.device(worker.device).type != "cuda"
@@ -819,7 +855,6 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         raise ValueError(
             "persistent GR requires GPU V1 async, TP/PP/DP=1, FP16/BF16 and matching capacity"
         )
-    backend = getattr(worker, "constraint_backend", None)
     if not isinstance(backend, CUDAConstraintBackend):
         raise ValueError("persistent GR requires a loaded canonical CUDA Constraint Table")
     if (
@@ -877,6 +912,26 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         )
     if getattr(worker, "_beam_postprocess_workspaces", None) is None:
         raise ValueError("persistent GR requires prewarmed Beam postprocess workspace")
+    worker._gr_static_admission = signature
+
+
+def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
+    """Admit first, then derive the adapter from existing Worker resources."""
+    existing = getattr(worker, "_gr_gpu_stage_runner", None)
+    if existing is not None and not existing.closed:
+        if getattr(worker, "constraint_backend", None) is not existing.backend:
+            raise ValueError("GR constraint backend binding changed before session release")
+        return cast(GPUBeamStageRunner, existing)
+    stages = validate_dispatch(scheduler_output)
+    (m,) = stages
+
+    cfg = _get_gr_config(worker)
+    capacity = GRExecutionCapacity(cfg.beam_max_width)
+    capacity.validate(m.beam_params)
+    if m.execution_capacity is not None and m.execution_capacity != capacity:
+        raise ValueError("Scheduler and Worker Asynchronous scheduling execution capacities differ")
+    backend = getattr(worker, "constraint_backend", None)
+    _validate_static_admission(worker, cfg, m, backend, existing)
     if getattr(worker, "_beam_sessions", {}):
         raise ValueError("another Beam session owns the Worker")
     workspace = worker._beam_postprocess_workspaces.require(
@@ -900,13 +955,6 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         or context.max_decode_steps < m.beam_params.max_tokens
     ):
         raise ValueError("existing Beam context and workspace capacity are incompatible")
-    BeamSearchRunner.validate_resources(
-        context,
-        workspace,
-        beam_width=m.beam_params.beam_width,
-        max_new_tokens=m.beam_params.max_tokens,
-        kv_slot=0,
-    )
     reuse = (
         existing is not None
         and existing.closed
@@ -914,7 +962,13 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace
     )
-    if reuse and existing.previous is not None and existing.previous.beam_params == m.beam_params:
+    # Identical beam params keep the state object: reset + in-place rebind of
+    # the drained runner reuse every precomputed device view. Any param
+    # change rebuilds the state and runner through the full constructor.
+    same_state = (
+        reuse and existing.previous is not None and existing.previous.beam_params == m.beam_params
+    )
+    if same_state:
         state = existing.beam.state
         state.reset(existing.binding.state_row)
     else:
@@ -929,7 +983,9 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
     session = BeamSearchSession(m.session_id, slot, context)
     session.begin_session(m.beam_params.beam_width, m.num_prompt_tokens, decision_index=0)
     binding = BeamRequestBinding(m.session_id, 0, m.session_id, 0, slot, 0)
-    beam = BeamSearchRunner(session, state, workspace)
+    beam = (
+        existing.beam.rebind(session) if same_state else BeamSearchRunner(session, state, workspace)
+    )
     if reuse:
         assert existing is not None
         adapter = existing

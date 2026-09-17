@@ -160,6 +160,17 @@ class GRConfig:
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
     beam_execution_mode: BeamExecutionMode = BeamExecutionMode.LEGACY
+    # Beam V1 async scheduling only: skip the EngineCore-side prompt block-hash
+    # chain and the schedule/update-time prefix-cache writes for GR requests.
+    # Unique-prompt workloads never hit the prefix cache, so the hash cost is
+    # pure overhead; enabling this trades away cross-request prefill prefix
+    # hits for identical prompts. Ordinary (non-GR) requests are unaffected.
+    beam_skip_prefix_hash: bool = False
+    # Beam V1 constraint-table deployments derive the lm_head vocabulary
+    # window from the loaded table's token ids (worker-side, P2-0).  None =
+    # auto-enable on backends that support sliced logits (CUDA);  False is
+    # the explicit opt-out/rollback switch.
+    beam_table_vocab_slice: bool | None = None
 
     def __post_init__(self) -> None:
         from vllm_gr.config.validation import (
@@ -169,6 +180,8 @@ class GRConfig:
             validate_beam_graph_enabled,
             validate_beam_max_decode_steps,
             validate_beam_max_width,
+            validate_beam_skip_prefix_hash,
+            validate_beam_table_vocab_slice,
             validate_beam_worker_decision,
             validate_catalog_path,
             validate_constraint_backend,
@@ -226,6 +239,16 @@ class GRConfig:
         )
         object.__setattr__(
             self, "beam_execution_mode", validate_beam_execution_mode(self.beam_execution_mode)
+        )
+        object.__setattr__(
+            self,
+            "beam_skip_prefix_hash",
+            validate_beam_skip_prefix_hash(self.beam_skip_prefix_hash),
+        )
+        object.__setattr__(
+            self,
+            "beam_table_vocab_slice",
+            validate_beam_table_vocab_slice(self.beam_table_vocab_slice),
         )
         if self.beam_engine_driven and not self.beam_worker_decision:
             raise ValueError(

@@ -822,3 +822,25 @@ def test_async_output_cache_never_hashes_generated_placeholders() -> None:
     cache(gr, 32)
     cache(SimpleNamespace(), 32)
     assert calls == [30, 31, 32]
+
+
+def test_async_output_cache_skips_gr_requests_when_prefix_hash_disabled() -> None:
+    from vllm_gr.v1.engine.gr_async_scheduler import _install_gr_prompt_cache_guard
+
+    calls: list[int] = []
+    scheduler = SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config={"vllm_gr_beam_skip_prefix_hash": True}),
+        kv_cache_manager=SimpleNamespace(cache_blocks=lambda request, count: calls.append(count)),
+    )
+    _install_gr_prompt_cache_guard(scheduler)
+    cache = scheduler.kv_cache_manager.cache_blocks
+
+    # With the flag on, a GR request carries no block hashes, so the guard
+    # skips the prefix-cache table write entirely instead of capping it.
+    gr = SimpleNamespace(gr_batch_request=object(), num_prompt_tokens=31)
+    assert cache(gr, 32) is None
+    assert calls == []
+
+    # Ordinary requests on the same engine keep the native caching path.
+    cache(SimpleNamespace(), 32)
+    assert calls == [32]

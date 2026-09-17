@@ -130,6 +130,26 @@ class BeamSearchRunner:
             DEVICE_STEPS=True,
         )
 
+    def rebind(self, session: BeamSearchSession) -> "BeamSearchRunner":
+        """Rebind a drained runner to a new session, reusing every view.
+
+        The caller (the get_stage_runner reuse path) guarantees an unchanged
+        state object, context, workspace and row indices; only the session and
+        its KV slot differ. Refresh the session binding and the single
+        slot-dependent element of the KV argument tuple in place.
+        """
+        if not self._closed:
+            raise RuntimeError("rebind requires a drained runner")
+        first = session.context.pools[0].unshared_key
+        self.session = session
+        self._closed = False
+        self._kv_args = (
+            *self._kv_args[:4],
+            session.slot * first.stride(0) * first.element_size(),
+            *self._kv_args[5:],
+        )
+        return self
+
     def initialize_from_prefill(
         self, token_ids: torch.Tensor, logprobs: torch.Tensor, valid_mask: torch.Tensor
     ) -> None:

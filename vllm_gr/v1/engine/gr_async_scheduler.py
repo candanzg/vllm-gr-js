@@ -229,8 +229,20 @@ def _install_gr_prompt_cache_guard(scheduler: Any) -> None:
     ):
         return
 
+    if getattr(scheduler, "_gr_skip_prefix_hash", None) is None:
+        from vllm_gr.config import GRConfig
+
+        config = getattr(scheduler, "vllm_config", None)
+        scheduler._gr_skip_prefix_hash = bool(
+            config is not None and GRConfig.from_vllm_config(config).beam_skip_prefix_hash
+        )
+
     def cache_prompt(request: Any, num_computed_tokens: int) -> Any:
         if getattr(request, "gr_batch_request", None) is not None:
+            if getattr(scheduler, "_gr_skip_prefix_hash", False):
+                # The request also carries no block hashes, so there is
+                # nothing to register in the prefix-cache table.
+                return None
             num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
         return original(request, num_computed_tokens)
 
@@ -254,8 +266,11 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     if session_id in sessions:
         raise GRAdmissionError(f"GR session already exists: {session_id}")
     config = getattr(scheduler, "vllm_config", None)
-    if config is not None:
+    if config is not None and not getattr(scheduler, "_gr_exec_config_validated", False):
+        # Every fact checked here is fixed at engine startup; validate the
+        # first submission only and reuse the verdict for the rest.
         validate_gr_execution_config(config)
+        scheduler._gr_exec_config_validated = True
     capacity = getattr(scheduler, "_gr_execution_capacity", None)
     if capacity is None:
         from vllm_gr.config import GRConfig
@@ -370,9 +385,11 @@ def attach_gr_stage_metadata(
     if manager is not None:
         # Scheduler owns the native block refcounts. Python references in a
         # Worker cannot prevent block reuse after abort or preemption.
-        groups = tuple(tuple(group) for group in manager.get_blocks(req_id).blocks)
-        blocks = tuple(block for group in groups for block in group)
-        manager.block_pool.touch(blocks)
+        # ``blocks`` is consumed immediately by touch(); the lease below keeps
+        # its own immutable snapshot, so the per-group sequences from
+        # get_blocks need no eager re-tupling here.
+        groups = manager.get_blocks(req_id).blocks
+        manager.block_pool.touch([block for group in groups for block in group])
         # The last reference determines eviction order. Match native free():
         # preserve group order and release each group's prompt tail first.
         session._kv_dispatch_leases[dispatch_id] = tuple(

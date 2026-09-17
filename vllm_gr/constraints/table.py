@@ -196,24 +196,6 @@ def _validate_offsets(
     return max_degree
 
 
-def derive_constraint_table_degrees(
-    prefix1_offsets: NDArray[np.int32],
-    prefix2_value_offsets: NDArray[np.int32],
-) -> tuple[int, int]:
-    return (
-        _validate_offsets(
-            prefix1_offsets,
-            "prefix1_offsets",
-            require_positive=False,
-        ),
-        _validate_offsets(
-            prefix2_value_offsets,
-            "prefix2_value_offsets",
-            require_positive=False,
-        ),
-    )
-
-
 def _is_strictly_increasing(values: IntArray) -> bool:
     for start in range(1, values.size, _VALIDATION_CHUNK_SIZE):
         stop = min(values.size, start + _VALIDATION_CHUNK_SIZE)

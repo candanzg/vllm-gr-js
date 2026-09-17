@@ -503,8 +503,3 @@ def _apply_patches(force: bool = False) -> int:
 def re_apply_patches() -> int:
     """Re-scan sys.modules and patch any newly-loaded vLLM modules."""
     return _apply_patches(force=True)
-
-
-def apply_patches_if_needed() -> int:
-    """Apply patches if not yet applied. Safe to call multiple times."""
-    return _apply_patches()

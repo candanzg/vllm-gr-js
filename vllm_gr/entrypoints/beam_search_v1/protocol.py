@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -127,40 +126,4 @@ class AsyncBeamSearchFrontend(Protocol):
         The first cleanup error may return while the retained owner retries.
         Mark the session closed only after acknowledgement.
         """
-        ...
-
-
-class GRSessionClient(Protocol):
-    """A3 methods installed on the synchronous vLLM ``LLMEngine``."""
-
-    def submit_gr_session(self, request: BeamBatchRequest) -> object: ...
-
-    def wait_gr_session(self, session_id: str, handle: object) -> BeamBatchResult: ...
-
-    def abort_gr_session(self, session_id: str) -> None:
-        """Acknowledge abort idempotently, including already released sessions."""
-        ...
-
-    def release_gr_session(self, session_id: str) -> None:
-        """Acknowledge release idempotently; failed acknowledgements are retried."""
-        ...
-
-
-class AsyncGRSessionClient(Protocol):
-    """A3 methods installed on vLLM ``AsyncLLM`` for online serving."""
-
-    def submit_gr_session(self, request: BeamBatchRequest) -> Awaitable[object]: ...
-
-    def wait_gr_session(self, session_id: str, handle: object) -> Awaitable[BeamBatchResult]: ...
-
-    def abort_gr_session(self, session_id: str) -> Awaitable[None]:
-        """Acknowledge abort idempotently, including already released sessions.
-
-        The frontend retries when an abort or its acknowledgement is lost.
-        The backend remains responsible for draining any outstanding work.
-        """
-        ...
-
-    def release_gr_session(self, session_id: str) -> Awaitable[None]:
-        """Acknowledge release idempotently; failed acknowledgements are retried."""
         ...

@@ -202,9 +202,38 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
         # interception can classify the batch and extract token counts.
         self._current_scheduler_output = scheduler_output
 
-        logits_indices, spec_decode_metadata = _orig_prepare_inputs(
-            self, scheduler_output, num_scheduled_tokens
-        )
+        # Direct-staging fast path: for a GR V1 single-request exact-bucket
+        # prefill, stage the live input buffers AND the captured prefill
+        # graph's static input buffers in one specialized pass, skipping
+        # the generic cumsum/arange/index_select machinery and its triton
+        # slot-mapping launch (the replay then also skips re-staging).
+        direct_result = None
+        p_runner = getattr(self, "_prefill_graph_runner", None)
+        if p_runner is not None and is_prefill_graph_enabled():
+            # Invalidate any staging left over from a previous step before
+            # this step's (generic or direct) preparation runs.
+            reset_direct = getattr(p_runner, "reset_direct_staging", None)
+            if callable(reset_direct):
+                reset_direct()
+            try_direct = getattr(p_runner, "try_direct_stage_prefill", None)
+            if callable(try_direct):
+                try:
+                    direct_result = try_direct(self, scheduler_output)
+                except Exception as error:  # noqa: BLE001
+                    # The fast path stages live buffers in place; the generic
+                    # _prepare_inputs below re-derives all of them, so any
+                    # failure is safely absorbed.
+                    logger.debug(
+                        "Prefill direct staging failed (%r); using generic _prepare_inputs.",
+                        error,
+                    )
+                    direct_result = None
+        if direct_result is not None:
+            logits_indices, spec_decode_metadata = direct_result
+        else:
+            logits_indices, spec_decode_metadata = _orig_prepare_inputs(
+                self, scheduler_output, num_scheduled_tokens
+            )
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:

@@ -213,6 +213,20 @@ def validate_beam_graph_enabled(value: object) -> bool:
     raise ValueError("vllm-gr beam_graph_enabled must be a boolean")
 
 
+def validate_beam_skip_prefix_hash(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    raise ValueError("vllm-gr beam_skip_prefix_hash must be a boolean")
+
+
 def _validate_positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"vllm-gr {name} must be an integer")
@@ -249,6 +263,20 @@ def validate_beam_worker_decision(value: object) -> bool | None:
         if lowered in ("false", "0", "no", "off"):
             return False
     raise ValueError("vllm-gr beam_worker_decision must be a boolean or null")
+
+
+def validate_beam_table_vocab_slice(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    raise ValueError("vllm-gr beam_table_vocab_slice must be a boolean or null")
 
 
 def validate_beam_engine_driven(value: object) -> bool | None:

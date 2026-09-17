@@ -124,20 +124,6 @@ class ConstrainedTopKExecution(Protocol):
         ...
 
 
-class ResettableConstrainedTopKExecution(ConstrainedTopKExecution, Protocol):
-    """Extends the execution contract with an explicit ``reset``.
-
-    Worker resource-injection paths that support hot-swapping constraint
-    tables (paired with
-    :meth:`ConstraintResourceManager.clear`) must depend on this protocol
-    rather than the three-method base contract, so ``reset`` is available.
-    """
-
-    def reset(self) -> None:
-        """Drop loaded tables and digest so a fresh digest can be loaded."""
-        ...
-
-
 def _tables_to_device(
     resource: "ConstraintTableResource",
     device: "_DEVICE",

@@ -117,6 +117,39 @@ class BeamSearchState:
         self.ignore_stop_tokens = torch.full(
             (batch,), ignore_stop_tokens, dtype=torch.bool, device=self.device
         )
+        # Precompute per-row reset groups once: reset() then costs one batched
+        # _foreach_zero_ launch plus one batched _foreach_copy_ launch instead
+        # of 21 serial ops. Row views stay valid because this storage is
+        # fixed-capacity and never reallocated.
+        reset_config = {
+            "max_new_tokens_tensor",
+            "stop_token_ids",
+            "num_stop_tokens",
+            "ignore_stop_tokens",
+        }
+        inf_names = ("beam_scores", "completed_scores")
+        zero_by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+        inf_specs: list[torch.Tensor] = []
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor) and name not in reset_config:
+                if name in inf_names:
+                    inf_specs.append(value)
+                else:
+                    zero_by_dtype.setdefault(value.dtype, []).append(value)
+        # One same-dtype list per row: a mixed-dtype tensor list makes
+        # _foreach_zero_ fall back to per-tensor launches, while each
+        # same-dtype list stays on the batched multi-tensor path.
+        self._reset_zero_groups = [
+            [[t[index : index + 1] for t in group] for group in zero_by_dtype.values()]
+            for index in range(batch)
+        ]
+        self._reset_inf_groups = [
+            [t[index : index + 1] for t in inf_specs] for index in range(batch)
+        ]
+        self._reset_inf_templates = [
+            torch.full(t[0:1].shape, -float("inf"), dtype=t.dtype, device=t.device)
+            for t in inf_specs
+        ]
         for index in range(batch):
             self.reset(index)
 
@@ -138,16 +171,11 @@ class BeamSearchState:
             raise TypeError("state_index must be an integer")
         if not 0 <= state_index < self.max_batch_size:
             raise ValueError("state_index exceeds state capacity")
-        configuration = {
-            "max_new_tokens_tensor",
-            "stop_token_ids",
-            "num_stop_tokens",
-            "ignore_stop_tokens",
-        }
-        for name, value in vars(self).items():
-            if isinstance(value, torch.Tensor) and name not in configuration:
-                row = value[state_index : state_index + 1]
-                if name in ("beam_scores", "completed_scores"):
-                    row.fill_(-float("inf"))
-                else:
-                    row.zero_()
+        # Same-dtype batched launches replace the serial zero_/fill_ dispatches
+        # (and the per-tensor fallback a mixed-dtype list would trigger).
+        # torch has no _foreach_fill_; -inf rows copy from persistent
+        # templates of identical shape instead.
+        for group in self._reset_zero_groups[state_index]:
+            torch._foreach_zero_(group)
+        if self._reset_inf_groups[state_index]:
+            torch._foreach_copy_(self._reset_inf_groups[state_index], self._reset_inf_templates)

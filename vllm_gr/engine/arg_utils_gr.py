@@ -612,6 +612,7 @@ def create_engine_config(self, usage_context=None, headless=False):
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
             beam_execution_mode=existing_gr_config.beam_execution_mode,
+            beam_skip_prefix_hash=existing_gr_config.beam_skip_prefix_hash,
             schema_version=existing_gr_config.schema_version,
             constraint_table=existing_gr_config.constraint_table,
         )
