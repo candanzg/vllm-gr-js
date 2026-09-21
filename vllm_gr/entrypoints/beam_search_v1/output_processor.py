@@ -155,13 +155,11 @@ class BeamSearchOutputProcessor:
                 self.tokenizer, request, call.params
             )
 
-            from vllm.entrypoints.generate.beam_search.utils import (
-                BeamSearchOutput,
-                BeamSearchSequence,
-            )
+            from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
 
             from vllm_gr.entrypoints.gr import _LazyMaterializedBeamSequence
 
+            end_suffix = () if end_token_id is None else (end_token_id,)
             converted = []
             for item in output.items:
                 source_prompt = call.prompts[item.item_index]
@@ -174,19 +172,26 @@ class BeamSearchOutputProcessor:
                 lora_request = request.items[item.item_index].request.lora_request
                 sequences = []
                 for sequence in item.sequences:
-                    beam = BeamSearchSequence(
-                        orig_prompt=prompt,
-                        tokens=[],
-                        logprobs=[],
-                        lora_request=lora_request,
-                        cum_logprob=float(sequence.cumulative_logprob),
-                        text=None,
-                        finish_reason=sequence.finish_reason,
-                        stop_reason=sequence.stop_token_id,
-                    )
-                    beam.__class__ = _LazyMaterializedBeamSequence
-                    beam._v1_suffix = tuple(_output_suffix(sequence, end_token_id))
-                    beam._lazy_materializer = materializer
+                    # Initialize the final lazy type in one pass. Its generated
+                    # __init__ would invoke three Python descriptor setters per
+                    # beam; constructing the base first also needs a class swap.
+                    # Keep every public BeamSearchSequence field initialized.
+                    beam = object.__new__(_LazyMaterializedBeamSequence)
+                    beam.__dict__ = {
+                        "orig_prompt": prompt,
+                        "tokens": [],
+                        "logprobs": [],
+                        "lora_request": lora_request,
+                        "cum_logprob": float(sequence.cumulative_logprob),
+                        "text": None,
+                        "finish_reason": sequence.finish_reason,
+                        "stop_reason": sequence.stop_token_id,
+                        # Stop completions already carry their requested boundary.
+                        "_v1_suffix": sequence.token_ids + end_suffix
+                        if sequence.finish_reason == "length"
+                        else sequence.token_ids,
+                        "_lazy_materializer": materializer,
+                    }
                     sequences.append(beam)
                 converted.append(BeamSearchOutput(sequences=sequences))
             return converted

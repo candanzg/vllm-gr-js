@@ -66,6 +66,13 @@ class BeamSessionRegistry:
     def num_active_sessions(self) -> int:
         return len(self._slot_map)
 
+    @property
+    def next_free_slot(self) -> int:
+        """Inspect admission geometry before resetting or claiming resources."""
+        if not self._free_slots:
+            raise RuntimeError("No free beam session slots")
+        return self._free_slots[0]
+
     def allocate(self, session_id: str, beam_width: int, prefix_len: int) -> int:
         """Allocate a slot for a new session.
 

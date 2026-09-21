@@ -93,6 +93,8 @@ target-version = "py311"
 strict = true
 
 [tool.typos.default.extend-identifiers]
+_get_cumsum_and_arange = "_get_cumsum_and_arange"
 CANN = "CANN"
+arange_np = "arange_np"
 cann = "cann"
 fx_arange = "fx_arange"

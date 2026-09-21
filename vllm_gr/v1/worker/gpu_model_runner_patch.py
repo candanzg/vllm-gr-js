@@ -17,6 +17,7 @@ from vllm_gr.v1.worker.constraint_hook import (
     prepare_cuda_prefill_constraint,
     try_sample_with_constraint_backend,
 )
+from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
 
 # Shared device-neutral beam-graph helpers live in model_runner_common; they
 # are re-exported here so callers/tests that historically reached them via
@@ -202,9 +203,13 @@ def make_patched_prepare_inputs_gpu(_orig_prepare_inputs):
         # interception can classify the batch and extract token counts.
         self._current_scheduler_output = scheduler_output
 
-        logits_indices, spec_decode_metadata = _orig_prepare_inputs(
-            self, scheduler_output, num_scheduled_tokens
-        )
+        logits_indices = try_prepare_gr_prefill_inputs(self, scheduler_output, num_scheduled_tokens)
+        if logits_indices is None:
+            logits_indices, spec_decode_metadata = _orig_prepare_inputs(
+                self, scheduler_output, num_scheduled_tokens
+            )
+        else:
+            spec_decode_metadata = None
 
         # GPU attention metadata is built after _prepare_inputs returns.
         if getattr(self, "_current_beam_info", None) is not None:

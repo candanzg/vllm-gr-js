@@ -370,14 +370,21 @@ def attach_gr_stage_metadata(
     if manager is not None:
         # Scheduler owns the native block refcounts. Python references in a
         # Worker cannot prevent block reuse after abort or preemption.
-        groups = tuple(tuple(group) for group in manager.get_blocks(req_id).blocks)
-        blocks = tuple(block for group in groups for block in group)
-        manager.block_pool.touch(blocks)
-        # The last reference determines eviction order. Match native free():
-        # preserve group order and release each group's prompt tail first.
-        session._kv_dispatch_leases[dispatch_id] = tuple(
-            block for group in groups for block in reversed(group)
-        )
+        # Single pass over the group lists (instead of nested genexprs that
+        # re-iterate every block 4x) building both sequences in one walk:
+        # the touch order (group order, tail first per group is not required
+        # for touch itself) and the lease order that must match native
+        # free(): preserve group order and release each group's prompt tail
+        # first (reversed within each group).
+        blocks = manager.get_blocks(req_id).blocks
+        if blocks:
+            touched: list[Any] = []
+            lease: list[Any] = []
+            for group in blocks:
+                touched.extend(group)
+                lease.extend(reversed(group))
+            manager.block_pool.touch(touched)
+            session._kv_dispatch_leases[dispatch_id] = tuple(lease)
     session._next_dispatch_id += 1
     session._in_flight_dispatches.add(dispatch_id)
     session.worker_resources_allocated = True

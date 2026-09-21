@@ -954,12 +954,13 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         or context.max_decode_steps < m.beam_params.max_tokens
     ):
         raise ValueError("existing Beam context and workspace capacity are incompatible")
-    BeamSearchRunner.validate_resources(
+    next_slot = context.registry.next_free_slot
+    resource_key = BeamSearchRunner.validate_resources(
         context,
         workspace,
         beam_width=m.beam_params.beam_width,
         max_new_tokens=m.beam_params.max_tokens,
-        kv_slot=0,
+        kv_slot=next_slot,
     )
     reuse = (
         existing is not None
@@ -968,7 +969,35 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace
     )
-    if reuse and existing.previous is not None and existing.previous.beam_params == m.beam_params:
+    reuse_state = (
+        existing is not None
+        and reuse
+        and existing.beam.state.decision is context.decision
+        and existing.beam._resource_key == resource_key
+        and existing.beam.state.max_new_tokens == m.beam_params.max_tokens
+        and existing.beam.state.stop_token_ids_config == m.beam_params.stop_token_ids
+        and existing.beam.state.ignore_stop_tokens_config == m.beam_params.ignore_stop_tokens
+        and existing.beam.state_index == 0
+        and existing.beam.workspace_index == 0
+    )
+    reuse_beam = (
+        existing is not None
+        and reuse_state
+        and existing.beam._scratch_owner is workspace.state_scratch
+    )
+    if (
+        existing is not None
+        and reuse
+        and existing.graph is not None
+        and existing.beam._resource_key != resource_key
+    ):
+        raise ValueError("GR captured resource addresses or layouts changed before reuse")
+    if reuse_beam:
+        assert existing is not None
+        existing.beam.reset_for_session()
+        state = existing.beam.state
+    elif reuse_state:
+        assert existing is not None
         state = existing.beam.state
         state.reset(existing.binding.state_row)
     else:
@@ -981,9 +1010,15 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         )
     slot = context.registry.allocate(m.session_id, m.beam_params.beam_width, m.num_prompt_tokens)
     session = BeamSearchSession(m.session_id, slot, context)
-    session.begin_session(m.beam_params.beam_width, m.num_prompt_tokens, decision_index=0)
+    if not reuse_beam:
+        session.begin_session(m.beam_params.beam_width, m.num_prompt_tokens, decision_index=0)
     binding = BeamRequestBinding(m.session_id, 0, m.session_id, 0, slot, 0)
-    beam = BeamSearchRunner(session, state, workspace)
+    if reuse_beam:
+        assert existing is not None
+        beam = existing.beam
+        beam.rebind_session(session)
+    else:
+        beam = BeamSearchRunner(session, state, workspace)
     if reuse:
         assert existing is not None
         adapter = existing
@@ -994,9 +1029,7 @@ def get_stage_runner(worker: Any, scheduler_output: Any) -> GPUBeamStageRunner:
         adapter.terminal_release_claimed = False
         adapter.execution_error = None
         adapter.prepared = None
-        adapter.constraint_steps = state.num_generated_tokens[
-            binding.state_row : binding.state_row + 1
-        ]
+        adapter.constraint_steps = beam._state["num_generated_tokens"]
         context._gr_execution_owner = adapter
         workspace.execution_owner = adapter
     else:

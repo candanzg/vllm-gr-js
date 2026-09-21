@@ -21,6 +21,26 @@ FINISH_STOP = 1
 FINISH_LENGTH = 2
 
 
+@triton.jit
+def _reset_session_state_kernel(
+    tensors,
+    SIZES: tl.constexpr,
+    STARTS: tl.constexpr,
+    NEGATIVE_INFINITY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Reset disjoint contiguous rows in one launch, without touching config."""
+    block = tl.program_id(0)
+    for i in tl.static_range(len(SIZES)):
+        if (block >= STARTS[i]) & (block < STARTS[i + 1]):
+            offset = (block - STARTS[i]) * BLOCK + tl.arange(0, BLOCK)
+            if NEGATIVE_INFINITY[i]:
+                value = -float("inf")
+            else:
+                value = 0
+            tl.store(tensors[i] + offset, value, mask=offset < SIZES[i])
+
+
 @dataclass(slots=True)
 class BeamStateScratch:
     """Optional postprocess scratch; contains no cross-step request state."""

@@ -16,10 +16,15 @@ from vllm_gr.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Gen-1/gen-2 threshold used while serving, matching the worker-side freeze
-# (model_runner_common._freeze_serving_gc).  Gen-0 keeps CPython's default so
-# per-request temporaries are still reclaimed cheaply.
-_SERVING_OLD_GEN_THRESHOLD = 100_000
+# GC threshold applied to ALL generations (0/1/2) while serving, matching the
+# worker-side freeze (model_runner_common._freeze_serving_gc).  Tracer
+# evidence: every collection during serving measured ``collected=0`` — the
+# old-gen scans were 17-36 ms pauses, and gen-0 scans (the in-flight
+# request's beam bookkeeping) 3.7-8 ms pauses landing inside the request
+# window on a fixed cadence.  Beam temporaries die by refcount and never
+# form cycles, so raising all three thresholds removes pure pauses without
+# losing reclamation.
+_SERVING_GC_THRESHOLD = 50_000
 
 # Bounded wait for a quiescent serving boundary (no beam request in flight)
 # before the one-shot frontend collection runs.  A frontend that stays busy
@@ -106,7 +111,11 @@ def schedule_frontend_gc_freeze() -> bool:
     engine bookkeeping) stay in gen-1/gen-2; with CPython's default
     thresholds ``(700, 10, 10)`` a gen-1 full scan fires every few requests,
     pauses the driver for tens of ms (``collected=0``), and lands inside the
-    ``beam_search()`` E2E wall time.
+    ``beam_search()`` E2E wall time.  A gc-callbacks tracer aligned to
+    request boundaries further showed the *gen-0* scans themselves pause the
+    driver 3.7-8 ms on a fixed cadence inside the request window (they scan
+    the in-flight request's own ~1.0-1.5k beam-bookkeeping objects yet
+    collect nothing), so the freeze raises all three generation thresholds.
 
     The worker-side freeze (``schedule_warmup_gc_freeze``) only protects the
     EngineCore/worker process.  In multi-process deployments the frontend is a
@@ -144,8 +153,11 @@ def schedule_frontend_gc_freeze() -> bool:
             gc.collect(1)
             gc.collect(2)
             gc.freeze()
-            g0, _g1, _g2 = gc.get_threshold()
-            gc.set_threshold(g0, _SERVING_OLD_GEN_THRESHOLD, _SERVING_OLD_GEN_THRESHOLD)
+            gc.set_threshold(
+                _SERVING_GC_THRESHOLD,
+                _SERVING_GC_THRESHOLD,
+                _SERVING_GC_THRESHOLD,
+            )
             logger.info(
                 "vllm-gr: auto-froze frontend GC heap at a quiescent "
                 "boundary after the first beam request (gen thresholds now %s)",

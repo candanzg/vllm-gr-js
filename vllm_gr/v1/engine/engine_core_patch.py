@@ -1017,11 +1017,10 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     (hash_function, block_size, salt, the full-block token prefix), so a
     hit can replay the whole list in one dict lookup.
 
-    A MISS hashes at stock vLLM speed: ``_CHAIN_FALLBACK_ACTIVE`` is set
-    around the fallback so the per-block memo stays transparent and a
-    never-repeating prompt pays zero memo bookkeeping (no key builds, no
-    probes, no evictions of hot entries).  The chain entry is still
-    recorded, so a repeat of this exact prompt hits next time.
+    A MISS hashes the already-materialized token tuple directly with the
+    native hash function and parent/extra-key ABI. Eligibility below proves
+    that extra keys are absent. No per-block memo bookkeeping is needed;
+    the chain entry is still recorded for a repeat of this exact prompt.
 
     Fast-path eligibility is conservative: any incremental call
     (``block_hashes`` non-empty), mm_features, lora_request, a non-``None``
@@ -1068,10 +1067,22 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
 
             _CHAIN_FALLBACK_ACTIVE = True
             try:
-                # Stock-speed fallback (see _CHAIN_FALLBACK_ACTIVE): a miss
-                # means this prompt is new to the chain memo, and the
-                # per-block memo's recency window cannot reach it either.
-                result = original_hasher(request)
+                # Eligibility above proves every block has no extra keys.
+                # Reuse the immutable full-block tuple already built for the
+                # memo key, preserving the exact native hash input and chain.
+                result = []
+                parent_hash = None
+                for start in range(0, len(tokens), block_size):
+                    parent_hash = kv_cache_utils.BlockHash(
+                        caching_hash_fn(
+                            (
+                                parent_hash or kv_cache_utils.NONE_HASH,
+                                tokens[start : start + block_size],
+                                None,
+                            )
+                        )
+                    )
+                    result.append(parent_hash)
             finally:
                 _CHAIN_FALLBACK_ACTIVE = False
             if len(chain_memo) >= _CHAIN_MEMO_LIMIT:

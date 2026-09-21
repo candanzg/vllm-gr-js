@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -70,25 +71,23 @@ def _build_result(
     steps = layout.steps
     stride = layout.row_stride
     rows = values[_CONTROL_WORDS + 1 :].reshape(layout.width, stride)
-    scores = rows.view("float32")[:, 2 * steps]
-    row_values = rows[:count].tolist()
-    score_values = scores[:count].tolist()
-    for row, score in zip(row_values, score_values, strict=True):
-        length = int(row[2 * steps + 1])
-        reason = int(row[2 * steps + 2])
-        stop_token = int(row[2 * steps + 3])
-        token_count = length - int(reason == FINISH_STOP and not options.include_stop_token)
+    include_score = options.include_cumulative_logprob
+    include_parents = options.include_parent_beam_indices
+    include_stop = options.include_stop_token
+    # The wire row uses native int32/float32 words without alignment padding.
+    # Unpack directly to Python tuples, avoiding two tolist conversions and
+    # per-field scalar casts. The small CPU copy also detaches reused storage.
+    for row in struct.iter_unpack(f"={2 * steps}ifiii", rows[:count].tobytes()):
+        length, reason, stop_token = row[-3:]
+        stopped = reason == FINISH_STOP
+        token_count = length - (stopped and not include_stop)
         sequences.append(
             BeamOutputSequence(
-                token_ids=tuple(row[:token_count]),
-                cumulative_logprob=(float(score) if options.include_cumulative_logprob else None),
-                parent_beam_indices=(
-                    tuple(row[steps : steps + length])
-                    if options.include_parent_beam_indices
-                    else ()
-                ),
-                finish_reason="stop" if reason == FINISH_STOP else "length",
-                stop_token_id=stop_token if reason == FINISH_STOP else None,
+                row[:token_count],
+                row[-4] if include_score else None,
+                row[steps : steps + length] if include_parents else (),
+                "stop" if stopped else "length",
+                stop_token if stopped else None,
             )
         )
 

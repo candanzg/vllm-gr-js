@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -21,6 +22,45 @@ from vllm_gr.ops.cuda.beam_selection import (
 from vllm_gr.v1.beam.beam_decision import BeamPostprocessWorkspace
 from vllm_gr.v1.beam.beam_search_session import BeamSearchSession
 from vllm_gr.v1.beam.beam_state import BeamSearchState
+
+try:
+    from torch._C._dynamo.guards import TensorGuards as _TensorGuards
+except ImportError:
+    _TensorGuards = None  # type: ignore[assignment,misc]
+
+
+def _bound_resource_tensors(context: Any, workspace: BeamPostprocessWorkspace) -> tuple[Any, ...]:
+    return (
+        context.decision.sequence,
+        context.decision.beam_scores,
+        context.decision.group_token_num,
+        context.aux_key_buf,
+        context.aux_value_buf,
+        context.pool_key_ptrs,
+        context.pool_value_ptrs,
+        workspace.selected_token_ids,
+        workspace.selected_parent_ids,
+        workspace.selected_scores,
+        workspace.selected_flat_indices,
+        workspace.next_sequence,
+    )
+
+
+def _live_resource_tensors(context: Any, workspace: BeamPostprocessWorkspace) -> tuple[Any, ...]:
+    return (
+        *(tensor for pool in context.pools for tensor in (pool.unshared_key, pool.unshared_value)),
+        *_bound_resource_tensors(context, workspace),
+        workspace.topk_token_ids,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _BeamResourceValidation:
+    workspace: BeamPostprocessWorkspace
+    parameters: tuple[int, ...]
+    guard: Any
+    addresses: tuple[int, ...]
+    key: tuple[Any, ...]
 
 
 class BeamSearchRunner:
@@ -62,7 +102,7 @@ class BeamSearchRunner:
             raise ValueError("state must alias this session's decision buffers")
         if not session.is_active or session.beam_width != width:
             raise ValueError("session must be active with the configured beam width")
-        self.validate_resources(
+        self._resource_key = self.validate_resources(
             context,
             workspace,
             beam_width=width,
@@ -129,6 +169,68 @@ class BeamSearchRunner:
             execute=self._scratch["reorder"],
             DEVICE_STEPS=True,
         )
+        self._session_reset: tuple[Any, ...] | None = None
+        self._scratch_owner = scratch
+
+    def rebind_session(self, session: BeamSearchSession) -> None:
+        """Bind an admitted session after release, retaining fixed tensor views.
+
+        The caller must validate resources and compare the returned key before
+        any mutation. Registry allocation initializes all host session fields.
+        """
+        if not self._closed or session.context is not self.session.context:
+            raise RuntimeError("Beam rebind requires a released runner on the same context")
+        if not session.is_active or session.beam_width != self.state.beam_width:
+            raise ValueError("Beam rebind requires an active matching session")
+        if session.slot != self.session.slot:
+            first = session.context.pools[0].unshared_key
+            args = self._kv_args
+            self._kv_args = (
+                *args[:4],
+                session.slot * first.stride(0) * first.element_size(),
+                *args[5:],
+            )
+        self.session = session
+        self._closed = False
+
+    def reset_for_session(self) -> None:
+        """Match state.reset + decision.reset(row) after all consumers drain.
+
+        Keep full initialization, including the -inf completed-score sentinel
+        needed by final selection over the entire completed capacity. Decision
+        sequence/scores are shared with state and are written only once.
+        """
+        if not self._closed:
+            raise RuntimeError("Session reset requires a released Beam runner")
+        plan = self._session_reset
+        if plan is None:
+            excluded = {
+                "sequence",
+                "beam_scores",
+                "max_new_tokens_tensor",
+                "stop_token_ids",
+                "num_stop_tokens",
+                "ignore_stop_tokens",
+            }
+            rows = [
+                (value, name == "completed_scores")
+                for name, value in self._state.items()
+                if name not in excluded
+            ]
+            decision = self.state.decision
+            for value in (decision.sequence, decision.beam_scores, decision.group_token_num):
+                rows.append((value[self.state_index], False))
+            tensors = tuple(value for value, _ in rows)
+            sizes = tuple(value.numel() for value in tensors)
+            starts = [0]
+            for size in sizes:
+                starts.append(starts[-1] + triton.cdiv(size, 256))
+            plan = (tensors, sizes, tuple(starts), tuple(fill for _, fill in rows))
+            self._session_reset = plan
+        tensors, sizes, starts, negative_infinity = plan
+        ops._reset_session_state_kernel[(starts[-1],)](
+            tensors, sizes, starts, negative_infinity, BLOCK=256, num_warps=4
+        )
 
     def initialize_from_prefill(
         self, token_ids: torch.Tensor, logprobs: torch.Tensor, valid_mask: torch.Tensor
@@ -161,8 +263,80 @@ class BeamSearchRunner:
         beam_width: int,
         max_new_tokens: int,
         kv_slot: int,
-    ) -> None:
-        """Check storage without mutating state or allocating a registry slot."""
+    ) -> tuple[Any, ...]:
+        """Check live layouts in C++ and live addresses before reusing a key.
+
+        TensorGuards does not check storage addresses. Inference tensors also
+        lack version counters, so neither identity nor versions can replace
+        the explicit data_ptr checks. A miss runs the complete validator.
+        """
+        if _TensorGuards is None:
+            return BeamSearchRunner._validate_resources_full(
+                context,
+                workspace,
+                beam_width=beam_width,
+                max_new_tokens=max_new_tokens,
+                kv_slot=kv_slot,
+            )
+        parameters = (
+            beam_width,
+            max_new_tokens,
+            kv_slot,
+            workspace.key.beam_width,
+            workspace.key.top_k,
+            workspace.max_batch,
+            workspace.max_decode_steps,
+        )
+        cached: _BeamResourceValidation | None = getattr(context, "_gr_resource_validation", None)
+        if cached is not None and cached.workspace is workspace and cached.parameters == parameters:
+            tensors = _live_resource_tensors(context, workspace)
+            if (
+                len(tensors) == len(cached.addresses)
+                and cached.guard.check(*tensors)
+                and all(t.data_ptr() == address for t, address in zip(tensors, cached.addresses))
+            ):
+                return cached.key
+
+        key = BeamSearchRunner._validate_resources_full(
+            context,
+            workspace,
+            beam_width=beam_width,
+            max_new_tokens=max_new_tokens,
+            kv_slot=kv_slot,
+        )
+        tensors = _live_resource_tensors(context, workspace)
+        if all(type(t) is torch.Tensor for t in tensors):
+            # Guard constructor signatures vary across PyTorch versions. An
+            # unsupported API leaves the full validator as the sole path.
+            try:
+                guard = _TensorGuards(
+                    *tensors,
+                    dynamic_dims_sizes=[list(t.shape) for t in tensors],
+                    dynamic_dims_strides=[list(t.stride()) for t in tensors],
+                )
+            except TypeError:
+                context._gr_resource_validation = None
+            else:
+                context._gr_resource_validation = _BeamResourceValidation(
+                    workspace, parameters, guard, tuple(t.data_ptr() for t in tensors), key
+                )
+        return key
+
+    @staticmethod
+    def _validate_resources_full(
+        context: Any,
+        workspace: BeamPostprocessWorkspace,
+        *,
+        beam_width: int,
+        max_new_tokens: int,
+        kv_slot: int,
+    ) -> tuple[Any, ...]:
+        """Validate live storage and return the binding key for cached views.
+
+        This is deliberately a live check: tensors and attention configuration
+        have no generation/freeze API. Never treat object identity alone as a
+        certificate for captured addresses or tensor layouts.
+        """
         width, device = beam_width, context.decision.sequence.device
         if (
             workspace.key.beam_width != width
@@ -175,6 +349,7 @@ class BeamSearchRunner:
         if not context.pools:
             raise ValueError("session must provide at least one KV layer")
         first = context.pools[0].unshared_key
+        shape, stride, dtype, pool_device = first.shape, first.stride(), first.dtype, first.device
         if (
             first.ndim != 5
             or first.dtype not in (torch.float16, torch.bfloat16)
@@ -185,15 +360,17 @@ class BeamSearchRunner:
             or not 0 <= kv_slot < first.shape[0]
         ):
             raise ValueError("KV pool capacity, dtype, device, or layout is incompatible")
+        addresses = []
         for pool in context.pools:
             for tensor in (pool.unshared_key, pool.unshared_value):
                 if (
-                    tensor.shape != first.shape
-                    or tensor.stride() != first.stride()
-                    or tensor.dtype != first.dtype
-                    or tensor.device != first.device
+                    tensor.shape != shape
+                    or tensor.stride() != stride
+                    or tensor.dtype != dtype
+                    or tensor.device != pool_device
                 ):
                     raise ValueError("all KV layers must have identical layouts")
+                addresses.append(tensor.data_ptr())
         layers = len(context.pools)
         aux = context.aux_key_buf
         expected_aux = (layers, first.shape[1], *first.shape[2:])
@@ -214,6 +391,19 @@ class BeamSearchRunner:
                 or not ptrs.is_contiguous()
             ):
                 raise ValueError("KV reorder requires persistent layer pointer tables")
+
+        # These tensors back cached views/launch arguments. Include layout and
+        # address so a valid replacement rebuilds views instead of using stale
+        # ones; malformed replacements above are rejected before state reset.
+        bound = _bound_resource_tensors(context, workspace)
+        return (
+            tuple(addresses),
+            shape,
+            stride,
+            dtype,
+            pool_device,
+            tuple((t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) for t in bound),
+        )
 
     def end_session(self, consumer_done: torch.Event | None = None) -> None:
         """Release the existing slot only after device work and final consumers.

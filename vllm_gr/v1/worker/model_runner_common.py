@@ -1273,6 +1273,17 @@ _QUIESCENT_WAIT_TIMEOUT_S = 30.0
 _WORKER_EXECUTE_DEPTH = 0
 _WORKER_EXECUTE_COND = threading.Condition()
 
+# GC threshold applied to ALL generations (0/1/2) while serving, after the
+# warmup freeze.  Every collection during serving measured ``collected=0``:
+# gen-1/gen-2 pauses were 17-36 ms (old-gen scans of the persistent beam
+# heap), gen-0 pauses 3.7-8 ms (scans of the in-flight request's ~1.0-1.5k
+# beam-bookkeeping objects).  None of them ever reclaimed a single object —
+# beam temporaries die by refcount, they never form cycles — so the scan is
+# a pure pause landing on a fixed request cadence inside the E2E window.
+# The finite (not 0) value keeps the door open for real cross-generation
+# garbage to still be collected eventually / at shutdown.
+_SERVING_GC_THRESHOLD = 50_000
+
 
 def _enter_worker_execute() -> None:
     global _WORKER_EXECUTE_DEPTH
@@ -1290,25 +1301,36 @@ def _exit_worker_execute() -> None:
 
 def _freeze_serving_gc(*, raise_thresholds: bool) -> list[int]:
     """Collect all generations, freeze the live heap into the permanent
-    generation, and (optionally) raise the gen-1/gen-2 thresholds.
+    generation, and (optionally) raise the gen-0/gen-1/gen-2 thresholds.
 
     Process-level operation shared by the capture-time freeze, the warmup
     RPC freeze, and the automatic post-first-request freeze.  ``gc.freeze()``
     moves every currently-tracked live object into the permanent generation
     so that gen-0/gen-1 collections no longer scan the persistent beam
     infrastructure (beam-session pools, captured graph state, scheduler beam
-    bookkeeping).  When ``raise_thresholds`` is set, gen-1/gen-2 full scans
-    are additionally disabled during serving (they measured ``collected=0``,
-    i.e. pure 17-36 ms pauses); gen-0 keeps its default threshold so
-    per-request temporaries are still reclaimed cheaply.
+    bookkeeping).  When ``raise_thresholds`` is set, all generation scans
+    are additionally disabled during serving:
+
+    - gen-1/gen-2 measured ``collected=0`` (pure 17-36 ms pauses on a fixed
+      4-request cadence);
+    - gen-0 also measured ``collected=0`` with 3.7-8 ms pauses landing inside
+      the request window on a fixed cadence (gc-callbacks tracer, aligned to
+      request boundaries: every spiked request contained exactly one gen-0
+      STOP, non-spiked requests none).  The young generation holds the
+      in-flight request's own beam bookkeeping (~1.0-1.5k live objects:
+      BeamSearchSequence x128, lists/dicts, wrapped tensors), so each scan
+      walks them all yet reclaims nothing — temporaries die by refcount the
+      moment their owner is dropped, they never form cycles.  Raising the
+      gen-0 threshold therefore trades nothing measurable for removing the
+      per-request pause.
     """
     gc.collect(0)
     gc.collect(1)
     gc.collect(2)
     gc.freeze()
     if raise_thresholds:
-        g0, _g1, _g2 = gc.get_threshold()
-        gc.set_threshold(g0, 100_000, 100_000)
+        _g0, _g1, _g2 = gc.get_threshold()
+        gc.set_threshold(_SERVING_GC_THRESHOLD, _SERVING_GC_THRESHOLD, _SERVING_GC_THRESHOLD)
     return list(gc.get_threshold())
 
 
@@ -1452,24 +1474,23 @@ def freeze_gc_after_warmup(worker: Any) -> dict[str, Any]:
             _GC_WARMUP_FREEZE_DONE = True
         # After freeze, the persistent heap (weights, KV caches, captured
         # graphs, beam-session pools) lives in the permanent generation and is
-        # never scanned.  Anything still promoted to gen-1/gen-2 during serving
-        # is measured to be collected=0 (no cyclic garbage in the beam path),
-        # so gen-1/gen-2 collections are pure 17-36ms pauses that land mid-
-        # request on a fixed cadence.  Keep gen-0 at its default (it cheaply
-        # reclaims per-request temporaries) but push the gen-1/gen-2 thresholds
-        # high enough that full-heap scans do not fire during serving; they can
-        # still run eventually / at shutdown if real cross-generation garbage
-        # ever accumulates.
+        # never scanned.  Every collection that still fires during serving
+        # is measured to be collected=0 (no cyclic garbage in the beam path):
+        # gen-1/gen-2 scans were pure 17-36ms pauses landing mid-request on a
+        # fixed cadence, and gen-0 scans (the in-flight request's beam
+        # bookkeeping, ~1.0-1.5k objects) pure 3.7-8ms pauses on their own
+        # fixed cadence.  Push all generation thresholds high enough that
+        # these scans do not fire during serving; they can still run
+        # eventually / at shutdown if real cross-generation garbage ever
+        # accumulates.
         thresholds = _freeze_serving_gc(raise_thresholds=True)
         with _GC_WARMUP_FREEZE_LOCK:
             _GC_WARMUP_FREEZE_COMPLETE = True
-        g0 = thresholds[0]
         if runner is not None:
             setattr(runner, _GC_FROZEN_AFTER_CAPTURE_MARKER, True)
         logger.info(
-            "vllm-gr: froze GC heap after warmup and raised gen-1/gen-2 "
-            "thresholds to 100000 (gen-0 stays at %d)",
-            g0,
+            "vllm-gr: froze GC heap after warmup and raised all gen thresholds to %d",
+            _SERVING_GC_THRESHOLD,
         )
         return {"frozen": True, "thresholds": thresholds}
     except Exception as e:  # never fail the request over a GC hint

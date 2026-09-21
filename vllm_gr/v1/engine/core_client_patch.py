@@ -126,12 +126,12 @@ def make_patched_inproc_get_output(original):
 
     from functools import wraps
 
+    from vllm.v1.engine import EngineCoreOutputs
+
+    from vllm_gr.v1.engine.core import _beam_self_advance
+
     @wraps(original)
     def patched_get_output(self):
-        from vllm.v1.engine import EngineCoreOutputs
-
-        from vllm_gr.v1.engine.core import _beam_self_advance
-
         outputs, model_executed = self.engine_core.step_fn()
         if outputs:
             try:
