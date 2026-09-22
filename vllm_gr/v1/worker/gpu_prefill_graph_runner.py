@@ -10,6 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.utils.npu_adapter import is_cuda_available
+from vllm_gr.v1.worker.gpu_prefill_graph_inputs import PreparedGRPrefillInputs
 from vllm_gr.v1.worker.prefill_graph_common import (
     ENV_ENABLE_PREFILL_GRAPH,
     BasePrefillGraphRunner,
@@ -338,6 +339,8 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         positions: torch.Tensor | None,
         slot_mapping: torch.Tensor | None,
         num_scheduled_tokens: list[int] | dict[Any, int],
+        *,
+        prepared_inputs: PreparedGRPrefillInputs | None = None,
     ) -> torch.Tensor | None:
         """Populates static device buffers, replays captured CUDA Graph for num_reqs, and returns output."""
         token_counts = (
@@ -365,7 +368,11 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
         # 2x the bucket; reject batches whose real per-request KV lengths
         # exceed it (the scalar cannot change at replay).
         bound = buf.max_seq_len_bounds.get(num_reqs)
-        max_kvlen = self._max_scheduled_kvlen(num_scheduled_tokens)
+        max_kvlen = (
+            prepared_inputs.kv_len
+            if prepared_inputs is not None and prepared_inputs.kv_len is not None
+            else self._max_scheduled_kvlen(num_scheduled_tokens)
+        )
         if bound is not None and max_kvlen is not None and max_kvlen > bound:
             self.last_replay_reason = "kv_length_exceeds_bound"
             logger.debug(
@@ -382,6 +389,18 @@ class GPUPrefillGraphRunner(BasePrefillGraphRunner):
                 "GPU prefill graph replay: missing live inputs; falling back to eager prefill."
             )
             return None
+
+        if prepared_inputs is not None:
+            if (
+                input_ids is not buf.input_ids_buf
+                or positions is not buf.positions_buf
+                or slot_mapping is not buf.slot_mapping_buf
+            ):
+                raise RuntimeError("Prepared GR Prefill must use its captured input buffers")
+            prepared_inputs.consume(buf, bucket, num_scheduled_tokens)
+            buf.captured_graphs[num_reqs].replay()
+            self.last_replay_reason = "replay"
+            return buf.output_bufs[num_reqs]
 
         # Refresh the static buffers with plain on-stream D2D copies from the
         # live per-batch tensors. _prepare_inputs has already computed all of

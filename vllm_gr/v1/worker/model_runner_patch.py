@@ -256,6 +256,10 @@ def apply_worker_patches() -> None:
                 shutdown if callable(shutdown) else None
             )
 
+        update_states_patch = getattr(platform_module, "make_update_states_with_gr", None)
+        if update_states_patch is not None and hasattr(runner_class, "_update_states"):
+            runner_class._update_states = update_states_patch(runner_class._update_states)
+
         runner_class.execute_model = make_patched_execute_model(runner_class.execute_model)
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs

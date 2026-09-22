@@ -581,9 +581,14 @@ class GPUBeamStageRunner:
         for entry in execution.entries:
             m = entry.metadata
             if m.kind is GRStageKind.PREFILL:
+                from vllm_gr.v1.worker.gpu_prefill_execute import try_execute_gr_prefill
+
                 self.temperatures.fill_(m.beam_params.temperature)
                 self.prefixes.fill_(-1)
-                out = original(worker, scheduler_output, *args, **kwargs)
+                if try_execute_gr_prefill(worker, scheduler_output, *args, **kwargs):
+                    out = None
+                else:
+                    out = original(worker, scheduler_output, *args, **kwargs)
                 if out is not None or worker.execute_model_state is None:
                     raise RuntimeError(
                         "native GR Prefill must return logits through execute_model_state"

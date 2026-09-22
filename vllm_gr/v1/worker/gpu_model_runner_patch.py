@@ -18,6 +18,7 @@ from vllm_gr.v1.worker.constraint_hook import (
     try_sample_with_constraint_backend,
 )
 from vllm_gr.v1.worker.gpu_prefill_inputs import try_prepare_gr_prefill_inputs
+from vllm_gr.v1.worker.gr_worker_request import make_update_states_with_gr  # noqa: F401
 
 # Shared device-neutral beam-graph helpers live in model_runner_common; they
 # are re-exported here so callers/tests that historically reached them via

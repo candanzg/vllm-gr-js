@@ -237,6 +237,10 @@ def _install_gr_prompt_cache_guard(scheduler: Any) -> None:
     manager.cache_blocks = cache_prompt
     manager._gr_prompt_cache_guard = True
 
+    from vllm_gr.v1.engine.gr_block_cache import install_gr_cache_lookup
+
+    install_gr_cache_lookup(getattr(manager, "coordinator", None))
+
 
 def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
     """Validate admission without mutating session, owner or capacity state."""
