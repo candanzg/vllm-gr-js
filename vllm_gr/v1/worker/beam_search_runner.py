@@ -170,6 +170,7 @@ class BeamSearchRunner:
             DEVICE_STEPS=True,
         )
         self._session_reset: tuple[Any, ...] | None = None
+        self._session_reset_graph: torch.cuda.CUDAGraph | None = None
         self._scratch_owner = scratch
 
     def rebind_session(self, session: BeamSearchSession) -> None:
@@ -202,6 +203,9 @@ class BeamSearchRunner:
         """
         if not self._closed:
             raise RuntimeError("Session reset requires a released Beam runner")
+        if self._session_reset_graph is not None:
+            self._session_reset_graph.replay()
+            return
         plan = self._session_reset
         if plan is None:
             excluded = {
@@ -231,6 +235,33 @@ class BeamSearchRunner:
         ops._reset_session_state_kernel[(starts[-1],)](
             tensors, sizes, starts, negative_infinity, BLOCK=256, num_warps=4
         )
+
+    def capture_session_reset(self) -> None:
+        """Prepare reuse at an explicit, drained warmup boundary.
+
+        A new state/configuration gets a new runner and uses eager reset until
+        warmed up again. Serving never captures a graph or synchronizes here;
+        get_stage_runner still validates live resource bindings before replay.
+        """
+        if not self._closed:
+            raise RuntimeError("Reset graph capture requires a released Beam runner")
+        if self._session_reset_graph is not None:
+            return
+        stream = torch.cuda.current_stream(self.state.device)
+        side = torch.cuda.Stream(device=self.state.device)
+        side.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(side):
+                # Build the plan and compile the fixed kernel before capture.
+                self.reset_for_session()
+                with torch.cuda.graph(graph, stream=side):
+                    self.reset_for_session()
+                graph.replay()
+        finally:
+            stream.wait_stream(side)
+            stream.synchronize()
+        self._session_reset_graph = graph
 
     def initialize_from_prefill(
         self, token_ids: torch.Tensor, logprobs: torch.Tensor, valid_mask: torch.Tensor

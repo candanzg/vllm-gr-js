@@ -1226,6 +1226,40 @@ def test_warmup_rpc_dedupes_only_completed_freeze(
     assert calls == []
 
 
+def test_warmup_rpc_prepares_reset_graph_even_after_gc_dedupes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_warmup_gc_state(monkeypatch)
+    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", True)
+    calls = []
+    beam = SimpleNamespace(capture_session_reset=lambda: calls.append("reset"))
+    owner = SimpleNamespace(closed=True, graph=object(), beam=beam)
+    worker = SimpleNamespace(model_runner=SimpleNamespace(_gr_gpu_stage_runner=owner))
+    result = common.freeze_gc_after_warmup(worker)
+    assert result["frozen"] and result["deduped"]
+    assert calls == ["reset"]
+    owner.closed = False
+    common.freeze_gc_after_warmup(worker)
+    assert calls == ["reset"]
+
+
+def test_warmup_reset_graph_failure_preserves_gc_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_warmup_gc_state(monkeypatch)
+    monkeypatch.setattr(common, "_GC_WARMUP_FREEZE_COMPLETE", True)
+
+    def failed_capture() -> None:
+        raise RuntimeError("capture failed")
+
+    owner = SimpleNamespace(
+        closed=True, graph=object(), beam=SimpleNamespace(capture_session_reset=failed_capture)
+    )
+    worker = SimpleNamespace(model_runner=SimpleNamespace(_gr_gpu_stage_runner=owner))
+    result = common.freeze_gc_after_warmup(worker)
+    assert result["frozen"] and result["deduped"]
+
+
 def test_warmup_rpc_failure_rolls_back_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

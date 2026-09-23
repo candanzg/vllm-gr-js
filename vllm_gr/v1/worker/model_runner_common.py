@@ -1460,8 +1460,22 @@ def freeze_gc_after_warmup(worker: Any) -> dict[str, Any]:
     serialized idempotent freezes at worst double the one-shot pause.
 
     ``gc.freeze()`` is safe to call repeatedly.
+
+    For a released V1 CUDA runner, this explicit warmup boundary also prepares
+    its session-reset graph. Configuration changes and callers without this
+    warmup continue to use eager reset; capture failures do not prevent GC.
     """
     runner = getattr(worker, "model_runner", None)
+    # This explicit RPC is a drained warmup boundary on the worker thread.
+    # The startup dummy has different Beam state; capture reuse only after
+    # the actual request configuration has warmed up. Do this before GC's
+    # dedupe check: the automatic GC daemon may have already frozen the heap.
+    owner = getattr(runner, "_gr_gpu_stage_runner", None) if runner is not None else None
+    if owner is not None and owner.closed and owner.graph is not None:
+        try:
+            owner.beam.capture_session_reset()
+        except Exception:
+            logger.warning("GR reset graph warmup failed; retaining eager reset", exc_info=True)
     global _GC_WARMUP_FREEZE_DONE, _GC_WARMUP_FREEZE_COMPLETE
     try:
         with _GC_WARMUP_FREEZE_LOCK:
