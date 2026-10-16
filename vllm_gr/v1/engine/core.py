@@ -109,8 +109,8 @@ def _cache_beam_request(self, request) -> None:
             del request._all_token_ids[len(raw_token_ids) :]
 
     with self.beam_cache_lock:
-        # Preserve an out-of-order BEAM_SESSION_TEMPLATE (stub entry created
-        # by _handle_beam_session_template before ADD_BATCH was cached).
+        # SUBMIT_SESSION binds its template before caching/enqueueing requests.
+        # Preserve that binding when replacing the temporary entry.
         preserved_template = self.beam_cache.get(request.request_id, {}).get("step_template")
         self.beam_cache[request.request_id] = {
             "all_token_ids": list(raw_token_ids),
@@ -159,9 +159,8 @@ def _add_preprocessed_request(self, preprocessed) -> None:
 def _handle_beam_session_template(self, template, *, via: str | None = None) -> None:
     """Cache a session's step-update template for EngineCore engine-driven chaining.
 
-    The frontend sends BEAM_SESSION_TEMPLATE right after the session's
-    ADD_BATCH (same socket, FIFO), so the template is cached before the
-    prefill output iteration runs.  The prefill branch of
+    SUBMIT_SESSION binds this template before admitting any prefill
+    request, so the template is cached before the prefill output iteration runs.  The prefill branch of
     ``_beam_advance_from_decision`` consumes it to construct the step-0
     BeamRequestStepUpdate in-process — it carries the fields EngineCore
     cannot derive itself (decode sampling_params, max_decode_steps,
@@ -903,9 +902,6 @@ def dispatch_gr_engine_core_input(self, request_type, payload) -> bool:
         return True
     if request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
         self._handle_beam_request_step_update(payload)
-        return True
-    if request_type == EngineCoreRequestType.BEAM_SESSION_TEMPLATE:
-        self._handle_beam_session_template(payload)
         return True
     if request_type == EngineCoreRequestType.SUBMIT_SESSION:
         submit_requests, submit_template = payload

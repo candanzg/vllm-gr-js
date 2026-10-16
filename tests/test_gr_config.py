@@ -11,6 +11,7 @@ import pytest
 
 from vllm_gr.config import (
     ConstraintBackend,
+    ConstraintTableConfig,
     GRAttentionBackend,
     GRConfig,
     NPUDecodeExecution,
@@ -874,3 +875,73 @@ def test_write_to_vllm_config_invalidates_parse_cache() -> None:
     after = GRConfig.from_vllm_config(vllm_config)
     assert after is not before
     assert after.npu_decode_execution is NPUDecodeExecution.CASCADE
+
+
+@pytest.mark.parametrize("source", ["legacy", "canonical"])  # type: ignore[misc]
+@pytest.mark.parametrize("platform", ["cpu", "cuda", "npu"])  # type: ignore[misc]
+@pytest.mark.parametrize("worker_decision", [None, False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("engine_driven", [None, False])  # type: ignore[misc]
+def test_engine_config_preserves_explicit_decision_controls(
+    source: str,
+    platform: str,
+    worker_decision: bool | None,
+    engine_driven: bool | None,
+) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    initial = GRConfig(
+        beam_max_width=32,
+        beam_worker_decision=worker_decision,
+        beam_engine_driven=engine_driven,
+    )
+    vllm_config = _vllm_config()
+    if source == "legacy":
+        initial.write_to_vllm_config(vllm_config)
+        engine_args = SimpleNamespace()
+    else:
+        from dataclasses import replace
+
+        engine_args = SimpleNamespace(
+            _vllm_gr_config_input=replace(
+                initial, constraint_table=ConstraintTableConfig(max_top_k=32)
+            )
+        )
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
+        ),
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=platform == "cuda"
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=platform == "npu"),
+    ):
+        result = GRConfig.from_vllm_config(create_engine_config(engine_args))
+    expected_worker = worker_decision
+    expected_engine = engine_driven
+    if platform != "cpu":
+        if expected_worker is None:
+            expected_worker = True
+        if expected_worker and expected_engine is None:
+            expected_engine = True
+    assert result.beam_worker_decision is expected_worker
+    assert result.beam_engine_driven is expected_engine
+
+
+@pytest.mark.parametrize("execution", list(NPUDecodeExecution))  # type: ignore[misc]
+def test_engine_config_merge_keeps_npu_execution_choice(execution: NPUDecodeExecution) -> None:
+    from vllm_gr.engine.arg_utils_gr import create_engine_config
+
+    vllm_config = _vllm_config()
+    initial = GRConfig(npu_decode_execution=execution, beam_graph_batch_size=4)
+    initial.write_to_vllm_config(vllm_config)
+    with (
+        mock.patch(
+            "vllm_gr.engine.arg_utils_gr.origin_create_engine_config", return_value=vllm_config
+        ),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_cuda_platform", return_value=False),
+        mock.patch("vllm_gr.engine.arg_utils_gr._is_npu_platform", return_value=True),
+    ):
+        result = GRConfig.from_vllm_config(create_engine_config(SimpleNamespace(beam_max_width=32)))
+    assert result.npu_decode_execution is execution
+    assert result.beam_graph_batch_size == 4
+    assert result.beam_max_width == 32

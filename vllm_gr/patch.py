@@ -207,6 +207,8 @@ def _validate_request_types_patch() -> str | None:
         getattr(getattr(EngineCoreRequestType, "ADD_BATCH", None), "value", None) == b"\x06"
         and getattr(getattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE", None), "value", None)
         == b"\x07"
+        and getattr(getattr(EngineCoreRequestType, "SUBMIT_SESSION", None), "value", None)
+        == b"\x09"
     )
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
@@ -217,12 +219,15 @@ def _validate_engine_clients_patch() -> str | None:
     from vllm_gr.v1.engine.core_client import (
         add_requests_async,
         beam_request_step_update_async,
+        submit_session_async,
     )
     from vllm_gr.v1.engine.core_client_patch import (
         inproc_add_requests,
         inproc_beam_request_step_update,
+        inproc_submit_session,
         sync_mp_add_requests,
         sync_mp_beam_request_step_update,
+        sync_mp_submit_session,
     )
 
     valid = (
@@ -232,6 +237,9 @@ def _validate_engine_clients_patch() -> str | None:
         and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
         and InprocClient.add_requests is inproc_add_requests
         and InprocClient.beam_request_step_update is inproc_beam_request_step_update
+        and getattr(AsyncMPClient, "submit_session_async", None) is submit_session_async
+        and getattr(SyncMPClient, "submit_session", None) is sync_mp_submit_session
+        and getattr(InprocClient, "submit_session", None) is inproc_submit_session
         and getattr(InprocClient.get_output, "_vllm_gr_inproc_self_advance", False)
     )
     return _verified(valid, "EngineCore client methods are not fully installed")
@@ -245,6 +253,7 @@ def _validate_async_llm_patch() -> str | None:
         beam_request_step_update_fn,
         prepare_request_fn,
         register_beam_output_fn,
+        submit_session_fn,
     )
 
     valid = (
@@ -252,6 +261,7 @@ def _validate_async_llm_patch() -> str | None:
         and AsyncLLM._add_requests_batch is _add_requests_batch_fn
         and AsyncLLM.register_beam_output is register_beam_output_fn
         and AsyncLLM.beam_request_step_update is beam_request_step_update_fn
+        and getattr(AsyncLLM, "submit_session", None) is submit_session_fn
     )
     return _verified(valid, "AsyncLLM grouped-beam methods are not fully installed")
 
@@ -566,8 +576,3 @@ def _apply_patches(force: bool = False) -> int:
 def re_apply_patches() -> int:
     """Re-scan sys.modules and patch any newly-loaded vLLM modules."""
     return _apply_patches(force=True)
-
-
-def apply_patches_if_needed() -> int:
-    """Apply patches if not yet applied. Safe to call multiple times."""
-    return _apply_patches()

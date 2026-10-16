@@ -4,17 +4,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import msgspec
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 import vllm_gr.v1.beam as beam_package
 import vllm_gr.v1.beam.batch_contracts as contracts
-from vllm_gr.v1.beam.batch_codec import BeamBatchCodec, BeamBatchCodecError
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     BeamBatchFailure,
@@ -22,22 +22,19 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchLimits,
     BeamBatchOutput,
     BeamBatchParams,
-    BeamBatchPlan,
     BeamBatchRequest,
     BeamBatchResult,
     BeamContractError,
     BeamOutputOptions,
     BeamOutputSequence,
-    BeamPrefillData,
     BeamRequestOutput,
     validate_beam_batch_limits,
-    validate_beam_batch_plan,
-    validate_beam_batch_plan_limits,
-    validate_beam_batch_plan_scheduler_output,
     validate_beam_batch_request,
     validate_beam_batch_request_limits,
     validate_beam_batch_result,
 )
+from vllm_gr.v1.engine.codec import build_engine_core_decoders
+from vllm_gr.v1.engine.gr_session_client import _terminal_result
 
 
 def _engine_request(
@@ -103,28 +100,12 @@ def _request(**overrides: object) -> BeamBatchRequest:
     return BeamBatchRequest(**values)
 
 
-def _plan(request: BeamBatchRequest | None = None, **overrides: object) -> BeamBatchPlan:
+def _success(request: BeamBatchRequest | None = None) -> BeamBatchResult:
     request = request or _request()
-    values: dict[str, object] = {
-        "protocol_version": request.protocol_version,
-        "batch_id": request.batch_id,
-        "items": (
-            BeamPrefillData(0, "request-0", 3, 1, 2),
-            BeamPrefillData(1, "request-1", 2, 0, 2),
-        ),
-        "beam_params": request.beam_params,
-        "output_options": request.output_options,
-    }
-    values.update(overrides)
-    return BeamBatchPlan(**values)
-
-
-def _success(plan: BeamBatchPlan | None = None) -> BeamBatchResult:
-    plan = plan or _plan()
     items = tuple(
         BeamRequestOutput(
             item_index=item.item_index,
-            request_id=item.request_id,
+            request_id=item.request.request_id,
             sequences=(
                 BeamOutputSequence(
                     token_ids=(10 + item.item_index, 20 + item.item_index, 30),
@@ -135,9 +116,9 @@ def _success(plan: BeamBatchPlan | None = None) -> BeamBatchResult:
                 ),
             ),
         )
-        for item in plan.items
+        for item in request.items
     )
-    return BeamBatchResult(plan.protocol_version, plan.batch_id, BeamBatchOutput(items), None)
+    return BeamBatchResult(request.protocol_version, request.batch_id, BeamBatchOutput(items), None)
 
 
 def _limits(**overrides: object) -> BeamBatchLimits:
@@ -154,32 +135,9 @@ def _limits(**overrides: object) -> BeamBatchLimits:
     return BeamBatchLimits(**values)
 
 
-def _scheduler_output(plan: BeamBatchPlan) -> SchedulerOutput:
-    output = SchedulerOutput.make_empty()
-    output.scheduled_new_reqs = [
-        NewRequestData(
-            req_id=item.request_id,
-            prompt_token_ids=[0] * item.num_prompt_tokens,
-            mm_features=[],
-            sampling_params=SamplingParams(max_tokens=1),
-            pooling_params=None,
-            block_ids=([],),
-            num_computed_tokens=item.num_computed_tokens,
-            lora_request=None,
-        )
-        for item in plan.items
-    ]
-    output.num_scheduled_tokens = {
-        item.request_id: item.num_scheduled_tokens for item in plan.items
-    }
-    output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
-    return output
-
-
-def test_public_inventory_has_three_top_level_messages_and_no_old_abi() -> None:
-    assert {BeamBatchRequest.__name__, BeamBatchPlan.__name__, BeamBatchResult.__name__} == {
+def test_public_inventory_has_request_result_and_no_old_abi() -> None:
+    assert {BeamBatchRequest.__name__, BeamBatchResult.__name__} == {
         "BeamBatchRequest",
-        "BeamBatchPlan",
         "BeamBatchResult",
     }
     forbidden = (
@@ -198,13 +156,11 @@ def test_public_inventory_has_three_top_level_messages_and_no_old_abi() -> None:
     assert "BeamItemCandidates" not in beam_package.__all__
 
 
-def test_request_plan_and_result_validate_in_context() -> None:
+def test_request_and_result_validate_at_terminal_boundary() -> None:
     request = _request()
-    plan = _plan(request)
-    result = _success(plan)
+    result = _success(request)
     validate_beam_batch_request(request)
-    validate_beam_batch_plan(plan, expected_request=request)
-    validate_beam_batch_result(result, expected_plan=plan)
+    _terminal_result(request, SimpleNamespace(kv_transfer_params={"gr_batch_result": result}))
 
 
 def test_request_uses_engine_request_identity_and_beam_params_authority() -> None:
@@ -268,66 +224,19 @@ def test_limits_are_non_wire_values_and_fail_closed() -> None:
         validate_beam_batch_limits(_limits(max_num_batched_tokens=0))
 
 
-def test_plan_requires_full_prefill_and_exact_request_items() -> None:
+def test_result_is_output_xor_failure_and_compact_shortfall_is_normal() -> None:
     request = _request()
-    incomplete = _plan(items=(BeamPrefillData(0, "request-0", 3, 1, 1),))
-    with pytest.raises(BeamContractError, match="full Prefill"):
-        validate_beam_batch_plan(incomplete)
-
-    missing = _plan(items=(BeamPrefillData(0, "request-0", 3, 1, 2),))
-    with pytest.raises(BeamContractError, match="exactly one item"):
-        validate_beam_batch_plan(missing, expected_request=request)
-
-
-def test_plan_prompt_count_is_not_derived_from_request_tokens() -> None:
-    request = _request(
-        items=(BeamBatchItem(0, _engine_request("request-0", [1])),),
-        output_options=_options(num_return_sequences=1),
-    )
-    plan = _plan(
-        request,
-        items=(BeamPrefillData(0, "request-0", 7, 3, 4),),
-        output_options=request.output_options,
-    )
-    validate_beam_batch_plan(plan, expected_request=request)
-
-
-def test_plan_cross_checks_native_scheduler_output() -> None:
-    plan = _plan()
-    scheduler_output = _scheduler_output(plan)
-    validate_beam_batch_plan_scheduler_output(plan, scheduler_output)
-
-    scheduler_output.num_scheduled_tokens["request-0"] = 1
-    with pytest.raises(BeamContractError, match="num_scheduled_tokens"):
-        validate_beam_batch_plan_scheduler_output(plan, scheduler_output)
-
-
-def test_plan_limits_use_scheduled_budget_and_authoritative_prompt_length() -> None:
-    plan = _plan(
-        items=(
-            BeamPrefillData(0, "request-0", 100, 98, 2),
-            BeamPrefillData(1, "request-1", 200, 198, 2),
+    empty_output = BeamBatchOutput(
+        tuple(
+            BeamRequestOutput(item.item_index, item.request.request_id, ())
+            for item in request.items
         )
     )
-    validate_beam_batch_plan_limits(plan, _limits(max_num_batched_tokens=4), max_num_seqs=8)
-    with pytest.raises(BeamContractError, match="max_num_batched_tokens"):
-        validate_beam_batch_plan_limits(plan, _limits(max_num_batched_tokens=3), max_num_seqs=8)
-    with pytest.raises(BeamContractError, match="max_model_len"):
-        validate_beam_batch_plan_limits(plan, _limits(max_model_len=202), max_num_seqs=8)
-
-
-def test_result_is_output_xor_failure_and_compact_shortfall_is_normal() -> None:
-    plan = _plan()
-    empty_output = BeamBatchOutput(
-        tuple(BeamRequestOutput(item.item_index, item.request_id, ()) for item in plan.items)
-    )
-    validate_beam_batch_result(
-        BeamBatchResult(1, plan.batch_id, empty_output, None), expected_plan=plan
-    )
+    validate_beam_batch_result(BeamBatchResult(1, request.batch_id, empty_output, None))
 
     both = BeamBatchResult(
         1,
-        plan.batch_id,
+        request.batch_id,
         empty_output,
         BeamBatchFailure("MODEL_FAILURE", "failed", None),
     )
@@ -335,7 +244,7 @@ def test_result_is_output_xor_failure_and_compact_shortfall_is_normal() -> None:
         validate_beam_batch_result(both)
 
 
-def test_result_options_control_score_lineage_and_stop_materialization() -> None:
+def test_terminal_result_honors_score_and_lineage_options() -> None:
     request = _request(
         beam_params=_params(max_tokens=3),
         output_options=_options(
@@ -345,73 +254,92 @@ def test_result_options_control_score_lineage_and_stop_materialization() -> None
             include_parent_beam_indices=True,
         ),
     )
-    plan = _plan(request)
-    sequence = BeamOutputSequence((), None, (0,), "stop", 2)
+    sequence = BeamOutputSequence((10, 20, 30), None, (0, 0, 0), "length", None)
     output = BeamBatchOutput(
         tuple(
-            BeamRequestOutput(item.item_index, item.request_id, (sequence,)) for item in plan.items
+            BeamRequestOutput(item.item_index, item.request.request_id, (sequence,))
+            for item in request.items
         )
     )
-    validate_beam_batch_result(BeamBatchResult(1, plan.batch_id, output, None), expected_plan=plan)
+    _terminal_result(
+        request,
+        SimpleNamespace(
+            kv_transfer_params={
+                "gr_batch_result": BeamBatchResult(1, request.batch_id, output, None)
+            }
+        ),
+    )
 
 
 def test_result_rejects_invalid_finish_reason_and_bad_length_output() -> None:
-    plan = _plan()
+    request = _request()
     invalid = BeamOutputSequence((1,), -1.0, (0,), "other", None)
     output = BeamBatchOutput(
-        (BeamRequestOutput(0, "request-0", (invalid,)),) + _success(plan).output.items[1:]
+        (BeamRequestOutput(0, "request-0", (invalid,)),) + _success(request).output.items[1:]
     )
     with pytest.raises(BeamContractError, match="finish_reason"):
-        validate_beam_batch_result(BeamBatchResult(1, plan.batch_id, output, None))
+        validate_beam_batch_result(BeamBatchResult(1, request.batch_id, output, None))
 
     short = BeamOutputSequence((1,), -1.0, (0,), "length", None)
     output = BeamBatchOutput(
-        (BeamRequestOutput(0, "request-0", (short,)),) + _success(plan).output.items[1:]
+        (BeamRequestOutput(0, "request-0", (short,)),) + _success(request).output.items[1:]
     )
-    with pytest.raises(BeamContractError, match="max_tokens"):
-        validate_beam_batch_result(
-            BeamBatchResult(1, plan.batch_id, output, None), expected_plan=plan
+    with pytest.raises(ValueError, match="effective budget"):
+        _terminal_result(
+            request,
+            SimpleNamespace(
+                kv_transfer_params={
+                    "gr_batch_result": BeamBatchResult(1, request.batch_id, output, None)
+                }
+            ),
         )
 
 
 def test_failure_item_index_is_context_checked() -> None:
-    plan = _plan()
+    request = _request()
     result = BeamBatchResult(
         1,
-        plan.batch_id,
+        request.batch_id,
         None,
         BeamBatchFailure("UNSUPPORTED_INPUT", "unsupported modality", 2),
     )
-    with pytest.raises(BeamContractError, match="outside"):
-        validate_beam_batch_result(result, expected_plan=plan)
+    with pytest.raises(ValueError, match="item identity"):
+        _terminal_result(request, SimpleNamespace(kv_transfer_params={"gr_batch_result": result}))
 
 
-def test_typed_codec_round_trips_all_top_level_messages() -> None:
-    codec = BeamBatchCodec()
+def test_production_codec_round_trips_request_and_terminal_result() -> None:
     request = _request()
-    plan = _plan(request)
-    result = _success(plan)
-    assert codec.decode_request(codec.encode_request(request)) == request
-    assert codec.decode_plan(codec.encode_plan(plan)) == plan
-    assert codec.decode_result(codec.encode_result(result)) == result
+    result = _success(request)
+    frames = MsgpackEncoder().encode(request)
+    decoded = build_engine_core_decoders(None).submit_gr_session.decode(frames)
+    assert decoded == request
+    validate_beam_batch_request(decoded)
+    wire_result = MsgpackDecoder().decode(MsgpackEncoder().encode(result))
+    assert (
+        _terminal_result(
+            request, SimpleNamespace(kv_transfer_params={"gr_batch_result": wire_result})
+        )
+        == result
+    )
 
 
-def test_typed_codec_preserves_nested_engine_request_tensor_frames() -> None:
-    codec = BeamBatchCodec()
+def test_production_codec_preserves_nested_engine_request_tensor_frames() -> None:
     engine_request = _engine_request("request-0", None)
     engine_request.prompt_embeds = torch.arange(256, dtype=torch.float32).reshape(2, 128)
     request = _request(items=(BeamBatchItem(0, engine_request),))
-    decoded = codec.decode_request(codec.encode_request(request))
+    decoded = build_engine_core_decoders(None).submit_gr_session.decode(
+        MsgpackEncoder().encode(request)
+    )
     torch.testing.assert_close(decoded.items[0].request.prompt_embeds, engine_request.prompt_embeds)
 
 
-def test_codec_error_and_contract_error_have_distinct_boundaries() -> None:
-    codec = BeamBatchCodec()
-    frames = codec.encode_request(_request())
-    with pytest.raises(BeamBatchCodecError):
-        codec.decode_request([bytes(frames[0])[:4]])
-
+def test_wire_decode_and_request_validation_have_distinct_boundaries() -> None:
+    decoder = build_engine_core_decoders(None).submit_gr_session
+    frames = MsgpackEncoder().encode(_request())
+    with pytest.raises(msgspec.DecodeError):
+        decoder.decode([bytes(frames[0])[:4]])
     raw = msgspec.msgpack.decode(frames[0])
     raw[0] = 99
+    decoded = decoder.decode([msgspec.msgpack.encode(raw)])
     with pytest.raises(BeamContractError, match="protocol_version"):
-        codec.decode_request([msgspec.msgpack.encode(raw)])
+        validate_beam_batch_request(decoded)

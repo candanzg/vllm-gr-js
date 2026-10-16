@@ -55,11 +55,6 @@ def decode_engine_core_payload(
         decoder = decoders.add_batch
     elif request_type == EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE:
         decoder = decoders.beam_step_update
-    elif request_type == EngineCoreRequestType.BEAM_SESSION_TEMPLATE:
-        # The template payload is a BeamRequestStepUpdate whose beam_tokens
-        # are left empty as placeholders (only the routing/param fields are
-        # consumed by the EngineCore engine-driven prefill chain).
-        decoder = decoders.beam_step_update
     elif request_type == EngineCoreRequestType.SUBMIT_SESSION:
         decoder = decoders.submit_session
     elif request_type == EngineCoreRequestType.SUBMIT_GR_SESSION:

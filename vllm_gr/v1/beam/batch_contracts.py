@@ -3,9 +3,9 @@
 
 """Passive contracts and fail-closed validation for Beam batch execution.
 
-The types in this module describe a future Worker-owned Beam batch run. They
-do not register an EngineCore message, reserve Scheduler resources, allocate
-KV cache, or invoke a ModelRunner.
+Request and Result describe the production SUBMIT_GR_SESSION boundary.
+SchedulerOutput carries native scheduling data; no parallel Plan message is
+serialized. This module holds data and validation, not runtime ownership.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Annotated, Literal, NoReturn, TypeGuard
 
 import msgspec
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import MAX_BEAM_WIDTH
@@ -90,34 +89,6 @@ class BeamBatchRequest(
     protocol_version: int
     batch_id: str
     items: tuple[BeamBatchItem, ...]
-    beam_params: BeamBatchParams
-    output_options: BeamOutputOptions
-
-
-class BeamPrefillData(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    forbid_unknown_fields=True,
-    frozen=True,
-    gc=False,
-):  # type: ignore[call-arg]
-    item_index: int
-    request_id: str
-    num_prompt_tokens: int
-    num_computed_tokens: int
-    num_scheduled_tokens: int
-
-
-class BeamBatchPlan(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    forbid_unknown_fields=True,
-    frozen=True,
-    gc=False,
-):  # type: ignore[call-arg]
-    protocol_version: int
-    batch_id: str
-    items: tuple[BeamPrefillData, ...]
     beam_params: BeamBatchParams
     output_options: BeamOutputOptions
 
@@ -452,138 +423,6 @@ def validate_beam_batch_request_limits(
     )
 
 
-def validate_beam_batch_plan(
-    plan: BeamBatchPlan,
-    *,
-    expected_request: BeamBatchRequest | None = None,
-) -> None:
-    """Validate Plan completeness and optional Request correspondence."""
-
-    if not isinstance(plan, BeamBatchPlan):
-        _fail("plan must be BeamBatchPlan")
-    _protocol_version(plan.protocol_version)
-    _non_empty_string("batch_id", plan.batch_id)
-    _validate_beam_params(plan.beam_params)
-    _validate_output_options(
-        plan.output_options,
-        beam_width=plan.beam_params.beam_width,
-    )
-    if not plan.items:
-        _fail("plan.items must not be empty")
-
-    request_ids: set[str] = set()
-    for expected_index, item in enumerate(plan.items):
-        if not isinstance(item, BeamPrefillData):
-            _fail("plan.items must contain BeamPrefillData values")
-        if item.item_index != expected_index:
-            _fail("plan items must be ordered with contiguous item_index values from zero")
-        request_id = _non_empty_string(
-            f"plan.items[{expected_index}].request_id",
-            item.request_id,
-        )
-        if request_id in request_ids:
-            _fail("plan request_id values must be unique")
-        request_ids.add(request_id)
-        num_prompt_tokens = _positive_int(
-            f"plan.items[{expected_index}].num_prompt_tokens",
-            item.num_prompt_tokens,
-        )
-        num_computed_tokens = _non_negative_int(
-            f"plan.items[{expected_index}].num_computed_tokens",
-            item.num_computed_tokens,
-        )
-        num_scheduled_tokens = _non_negative_int(
-            f"plan.items[{expected_index}].num_scheduled_tokens",
-            item.num_scheduled_tokens,
-        )
-        if num_computed_tokens + num_scheduled_tokens != num_prompt_tokens:
-            _fail(
-                "full Prefill requires num_computed_tokens + "
-                f"num_scheduled_tokens == num_prompt_tokens for item {expected_index}"
-            )
-
-    if expected_request is None:
-        return
-    validate_beam_batch_request(expected_request)
-    if plan.protocol_version != expected_request.protocol_version:
-        _fail("plan protocol_version must match request")
-    if plan.batch_id != expected_request.batch_id:
-        _fail("plan batch_id must match request")
-    if plan.beam_params != expected_request.beam_params:
-        _fail("plan beam_params must match request")
-    if plan.output_options != expected_request.output_options:
-        _fail("plan output_options must match request")
-    if len(plan.items) != len(expected_request.items):
-        _fail("plan must contain exactly one item for every request item")
-    for prefill, request_item in zip(plan.items, expected_request.items):
-        if (
-            prefill.item_index != request_item.item_index
-            or prefill.request_id != request_item.request.request_id
-        ):
-            _fail("plan item identity and order must match request")
-
-
-def validate_beam_batch_plan_scheduler_output(
-    plan: BeamBatchPlan,
-    scheduler_output: SchedulerOutput,
-) -> None:
-    """Cross-check the Plan snapshot against native SchedulerOutput."""
-
-    validate_beam_batch_plan(plan)
-    if not isinstance(scheduler_output, SchedulerOutput):
-        _fail("scheduler_output must be SchedulerOutput")
-    if scheduler_output.scheduled_cached_reqs.req_ids:
-        _fail("Beam full Prefill Plan cannot contain cached Scheduler request entries")
-
-    new_requests = {data.req_id: data for data in scheduler_output.scheduled_new_reqs}
-    planned_ids = {item.request_id for item in plan.items}
-    if set(new_requests) != planned_ids:
-        _fail("SchedulerOutput new request IDs must exactly match Plan items")
-    if set(scheduler_output.num_scheduled_tokens) != planned_ids:
-        _fail("SchedulerOutput scheduled-token request IDs must exactly match Plan items")
-
-    for item in plan.items:
-        native = new_requests[item.request_id]
-        if native.num_computed_tokens != item.num_computed_tokens:
-            _fail(f"SchedulerOutput num_computed_tokens must match Plan item {item.item_index}")
-        if scheduler_output.num_scheduled_tokens[item.request_id] != item.num_scheduled_tokens:
-            _fail(f"SchedulerOutput num_scheduled_tokens must match Plan item {item.item_index}")
-    planned_total = sum(item.num_scheduled_tokens for item in plan.items)
-    if scheduler_output.total_num_scheduled_tokens != planned_total:
-        _fail("SchedulerOutput total_num_scheduled_tokens must match the Plan total")
-
-
-def validate_beam_batch_plan_limits(
-    plan: BeamBatchPlan,
-    limits: BeamBatchLimits,
-    *,
-    max_num_seqs: int,
-) -> None:
-    """Validate limits that require authoritative Scheduler prompt counts."""
-
-    validate_beam_batch_plan(plan)
-    validate_beam_batch_limits(limits)
-    _validate_batch_geometry(
-        batch_size=len(plan.items),
-        params=plan.beam_params,
-        limits=limits,
-        max_num_seqs=max_num_seqs,
-    )
-    total_num_scheduled_tokens = sum(item.num_scheduled_tokens for item in plan.items)
-    if total_num_scheduled_tokens > limits.max_num_batched_tokens:
-        _fail(
-            f"scheduled tokens {total_num_scheduled_tokens} exceeds "
-            f"max_num_batched_tokens {limits.max_num_batched_tokens}"
-        )
-    for item in plan.items:
-        total_length = item.num_prompt_tokens + plan.beam_params.max_tokens
-        if total_length > limits.max_model_len:
-            _fail(
-                f"item {item.item_index} prompt plus generated length {total_length} "
-                f"exceeds max_model_len {limits.max_model_len}"
-            )
-
-
 def _validate_output_sequence(sequence: BeamOutputSequence, *, name: str) -> None:
     if not isinstance(sequence, BeamOutputSequence):
         _fail(f"{name} must be BeamOutputSequence")
@@ -610,10 +449,8 @@ def _validate_output_sequence(sequence: BeamOutputSequence, *, name: str) -> Non
 
 def validate_beam_batch_result(
     result: BeamBatchResult,
-    *,
-    expected_plan: BeamBatchPlan | None = None,
 ) -> None:
-    """Validate the Output/Failure envelope and contextual output invariants."""
+    """Validate the backend-neutral Output/Failure envelope and value shapes."""
 
     if not isinstance(result, BeamBatchResult):
         _fail("result must be BeamBatchResult")
@@ -657,56 +494,6 @@ def validate_beam_batch_result(
                     name=f"output.items[{expected_index}].sequences[{sequence_index}]",
                 )
 
-    if expected_plan is None:
-        return
-    validate_beam_batch_plan(expected_plan)
-    if result.protocol_version != expected_plan.protocol_version:
-        _fail("result protocol_version must match plan")
-    if result.batch_id != expected_plan.batch_id:
-        _fail("result batch_id must match plan")
-    if result.failure is not None and result.failure.item_index is not None:
-        if result.failure.item_index >= len(expected_plan.items):
-            _fail("failure.item_index is outside the planned batch")
-    if result.output is None:
-        return
-
-    if len(result.output.items) != len(expected_plan.items):
-        _fail("output must contain exactly one item per planned request")
-    params = expected_plan.beam_params
-    options = expected_plan.output_options
-    for item, prefill in zip(result.output.items, expected_plan.items):
-        if item.item_index != prefill.item_index or item.request_id != prefill.request_id:
-            _fail("output item identity and order must match plan")
-        if len(item.sequences) > options.num_return_sequences:
-            _fail("output item exceeds num_return_sequences")
-        for sequence in item.sequences:
-            if options.include_cumulative_logprob != (sequence.cumulative_logprob is not None):
-                _fail("cumulative_logprob presence must match include_cumulative_logprob")
-            if not options.include_parent_beam_indices and sequence.parent_beam_indices:
-                _fail("parent_beam_indices must be empty when they were not requested")
-            if options.include_parent_beam_indices:
-                if not 1 <= len(sequence.parent_beam_indices) <= params.max_tokens:
-                    _fail("parent_beam_indices must contain one entry per generation")
-                if any(index >= params.beam_width for index in sequence.parent_beam_indices):
-                    _fail("parent_beam_indices values must be less than beam_width")
-                expected_token_count = len(sequence.parent_beam_indices)
-                if sequence.finish_reason == "stop" and not options.include_stop_token:
-                    expected_token_count -= 1
-                if len(sequence.token_ids) != expected_token_count:
-                    _fail("token_ids length is inconsistent with parent indices/options")
-            elif len(sequence.token_ids) > params.max_tokens:
-                _fail("output sequence exceeds max_tokens")
-            if sequence.finish_reason == "length" and len(sequence.token_ids) != params.max_tokens:
-                _fail("length-finished sequence must contain max_tokens token IDs")
-            if sequence.finish_reason == "stop":
-                if params.ignore_stop_tokens:
-                    _fail("stop completion is invalid when ignore_stop_tokens is true")
-                if sequence.stop_token_id not in params.stop_token_ids:
-                    _fail("stop_token_id must be one of the requested stop tokens")
-                if options.include_stop_token:
-                    if not sequence.token_ids or sequence.token_ids[-1] != sequence.stop_token_id:
-                        _fail("included stop token must be the final token_id")
-
 
 __all__ = [
     "BEAM_BATCH_PROTOCOL_VERSION",
@@ -717,18 +504,13 @@ __all__ = [
     "BeamBatchLimits",
     "BeamBatchOutput",
     "BeamBatchParams",
-    "BeamBatchPlan",
     "BeamBatchRequest",
     "BeamBatchResult",
     "BeamContractError",
     "BeamOutputOptions",
     "BeamOutputSequence",
-    "BeamPrefillData",
     "BeamRequestOutput",
     "validate_beam_batch_limits",
-    "validate_beam_batch_plan",
-    "validate_beam_batch_plan_limits",
-    "validate_beam_batch_plan_scheduler_output",
     "validate_beam_batch_request",
     "validate_beam_batch_request_limits",
     "validate_beam_batch_result",

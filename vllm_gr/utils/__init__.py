@@ -13,10 +13,8 @@ from vllm_gr.utils.npu_adapter import (
     is_npu_available,
     release_accelerator_memory,
 )
-from vllm_gr.utils.reliable_ops import ReliableOps
 
 __all__ = [
-    "ReliableOps",
     "is_cuda_available",
     "is_npu_available",
     "release_accelerator_memory",

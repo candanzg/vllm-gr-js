@@ -725,3 +725,39 @@ def test_npu_spawn_patch_forces_spawn_only_when_npu_initialized(
     monkeypatch.setattr(npu_spawn_patch, "_npu_is_initialized", lambda: False)
     npu_spawn_patch._force_spawn_if_npu_initialized()
     assert "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("class_name", "method_name"),
+    [
+        ("AsyncMPClient", "submit_session_async"),
+        ("SyncMPClient", "submit_session"),
+        ("InprocClient", "submit_session"),
+    ],
+)  # type: ignore[misc]
+def test_client_validator_rejects_missing_merged_submission(
+    monkeypatch: pytest.MonkeyPatch, class_name: str, method_name: str
+) -> None:
+    from vllm.v1.engine import core_client
+
+    from vllm_gr.patch import _validate_engine_clients_patch
+    from vllm_gr.v1.engine.core_client_patch import apply_engine_client_patches
+
+    apply_engine_client_patches()
+    assert _validate_engine_clients_patch() is None
+    monkeypatch.delattr(getattr(core_client, class_name), method_name)
+    assert _validate_engine_clients_patch() == "EngineCore client methods are not fully installed"
+
+
+def test_async_llm_validator_rejects_missing_merged_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    from vllm_gr.patch import _validate_async_llm_patch
+    from vllm_gr.v1.engine.core_client_patch import apply_async_llm_patches
+
+    apply_async_llm_patches()
+    assert _validate_async_llm_patch() is None
+    monkeypatch.delattr(AsyncLLM, "submit_session")
+    assert _validate_async_llm_patch() == "AsyncLLM grouped-beam methods are not fully installed"

@@ -12,7 +12,7 @@ Covers the boundary that removes the prefill/decode step-update round-trip:
 - Both the prefill and decode branches are gated by ``beam_engine_driven``.
 - Skip paths: no template / flag off / width mismatch / single-step
   session (max_decode_steps < 2) / cross-session decision ownership.
-- Wire plumbing: BEAM_SESSION_TEMPLATE enum value + payload decode routes
+- Wire plumbing: retired template byte and merged submission decode routes
   through the BeamRequestStepUpdate decoder.
 - API-side hardening: outputs arriving between collectors are buffered by
   the patched ``OutputProcessor.process_outputs`` and replayed by
@@ -442,7 +442,9 @@ class TestDualFlagScoping:
 class TestWirePlumbing:
     def test_wire_value_registered(self) -> None:
         assert BEAM_SESSION_TEMPLATE_WIRE_VALUE == b"\x08"
-        assert EngineCoreRequestType.BEAM_SESSION_TEMPLATE.value == b"\x08"
+        assert not hasattr(EngineCoreRequestType, "BEAM_SESSION_TEMPLATE")
+        with pytest.raises(ValueError):
+            EngineCoreRequestType(BEAM_SESSION_TEMPLATE_WIRE_VALUE)
         # Existing members untouched.
         assert EngineCoreRequestType.ADD_BATCH.value == b"\x06"
         assert EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE.value == b"\x07"
@@ -452,25 +454,6 @@ class TestWirePlumbing:
 
         assert SUBMIT_SESSION_WIRE_VALUE == b"\x09"
         assert EngineCoreRequestType.SUBMIT_SESSION.value == b"\x09"
-
-    def test_template_decodes_via_step_update_decoder(self) -> None:
-        import msgspec
-
-        from vllm_gr.v1.engine.codec import (
-            build_engine_core_decoders,
-            decode_engine_core_payload,
-        )
-
-        template = _step_template(max_decode_steps=5)
-        buf = msgspec.msgpack.encode(template)
-        decoders = build_engine_core_decoders(None)
-        decoded = decode_engine_core_payload(
-            decoders, EngineCoreRequestType.BEAM_SESSION_TEMPLATE, [memoryview(buf)]
-        )
-        assert isinstance(decoded, BeamRequestStepUpdate)
-        assert decoded.prefix_len == 3
-        assert decoded.max_decode_steps == 5
-        assert decoded.constraint_step == 1
 
 
 # ===========================================================================
@@ -697,27 +680,12 @@ class TestSubmitSessionClients:
 
         assert called == [(requests, template)]
 
-    def test_async_llm_legacy_fallback_sends_two_messages(self) -> None:
+    def test_async_llm_rejects_client_without_merged_submit(self) -> None:
         from vllm_gr.v1.engine.async_llm import submit_session_fn
 
-        batch_calls: list[tuple[Any, bool]] = []
-        template_calls: list[Any] = []
-
-        async def fake_batch(requests: Any, use_batch_message: bool) -> None:
-            batch_calls.append((requests, use_batch_message))
-
-        async def fake_template(template: Any) -> None:
-            template_calls.append(template)
-
-        client = SimpleNamespace(beam_session_template=fake_template)
-        llm = SimpleNamespace(engine_core=client, _add_requests_batch=fake_batch)
-        template = _step_template()
-        requests = [_fake_prefill_request()]
-
-        asyncio.run(submit_session_fn(llm, requests, template))
-
-        assert batch_calls == [(requests, True)]
-        assert template_calls == [template]
+        llm = SimpleNamespace(engine_core=SimpleNamespace())
+        with pytest.raises(RuntimeError, match="required submit_session"):
+            asyncio.run(submit_session_fn(llm, [_fake_prefill_request()], _step_template()))
 
     def test_async_llm_tracks_session_before_merged_send(self) -> None:
         from vllm_gr.v1.engine.async_llm import submit_session_fn

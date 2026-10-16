@@ -135,7 +135,6 @@ class BeamSearchClient:
         self._boundary_tokens: tuple[str, tuple[int | None, int | None]] | None = None
 
     def prepare_request(self, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
-        BeamSearchOutputProcessor.ensure_available()
         processor = BeamSearchInputProcessor(self.engine)
         request = processor.process_offline_inputs(self.llm, call)
         self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
@@ -219,7 +218,6 @@ class AsyncBeamSearchClient:
         self._close_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def prepare_request(self, call: OnlineBeamSearchRequest) -> BeamBatchRequest:
-        BeamSearchOutputProcessor.ensure_available()
         processor = BeamSearchInputProcessor(self.engine)
         request = await processor.process_online_inputs(self.serving, call)
         self._boundary_tokens = (request.batch_id, processor.boundary_token_ids)
