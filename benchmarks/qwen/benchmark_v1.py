@@ -15,13 +15,17 @@ import argparse
 import dataclasses
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tools.benchmark_utils import benchmark_provenance, distribution_ms, percentile
 
 MAX_BEAM_STEPS = 3
 
@@ -84,11 +88,7 @@ def _numeric_median(values: list[float]) -> float:
 
 
 def _percentile(values: list[float], quantile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(float(value) for value in values)
-    index = min(len(ordered) - 1, int(quantile * (len(ordered) - 1)))
-    return ordered[index]
+    return percentile(values, quantile, method="lower")
 
 
 def _metric_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -394,7 +394,7 @@ def _run_once(
     started = time.perf_counter()
     for row in workload:
         request_started = time.perf_counter()
-        # Beam Search V1 currently accepts exactly one prompt per offline call.
+        # This workload deliberately measures sequential single-prompt calls.
         outputs = llm.beam_search_v1(
             [{"prompt_token_ids": row["input_ids"]}],
             params,
@@ -404,6 +404,9 @@ def _run_once(
         request_latencies_ms.append((time.perf_counter() - request_started) * 1000.0)
         if record_outputs:
             raw_outputs.append((row, outputs))
+        elif len(outputs) != 1 or len(outputs[0].sequences) != beam_width:
+            raise RuntimeError("unexpected output/beam count")
+        del outputs
     wall_ms = (time.perf_counter() - started) * 1000.0
     normalize_started = time.perf_counter()
     normalized = (
@@ -425,9 +428,11 @@ def _run_once(
         "generated_tokens_per_s": generated_tokens / elapsed_s if elapsed_s > 0 else None,
         "beam_candidates_per_s": beam_candidates / elapsed_s if elapsed_s > 0 else None,
         "request_latencies_ms": request_latencies_ms,
+        "request_latency_ms": distribution_ms(request_latencies_ms, method="lower"),
         "request_latency_ms_p50": _percentile(request_latencies_ms, 0.50),
         "request_latency_ms_p95": _percentile(request_latencies_ms, 0.95),
         "output_normalization_ms": output_normalization_ms,
+        "outputs_recorded": record_outputs,
         "outputs": normalized,
     }
 
@@ -475,7 +480,7 @@ def _run_timeline(
                 params,
                 beam_width=args.beam_width,
                 beam_steps=args.beam_steps,
-                record_outputs=True,
+                record_outputs=getattr(args, "record_outputs", True),
             )
             for _ in range(args.timeline_repeat)
         ]
@@ -497,16 +502,6 @@ def _run_timeline(
         "repeat": args.timeline_repeat,
         "wall_ms_samples": [run["wall_ms"] for run in runs],
     }
-
-
-def _git_commit(repo: Path) -> str | None:
-    try:
-        return subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"],
-            text=True,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
 
 
 def _environment(torch: Any) -> dict[str, Any]:
@@ -616,7 +611,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     params,
                     beam_width=args.beam_width,
                     beam_steps=args.beam_steps,
-                    record_outputs=True,
+                    record_outputs=getattr(args, "record_outputs", True),
                 )
                 for _ in range(args.repeat)
             ]
@@ -634,13 +629,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             timeline_temp.cleanup()
 
     repo_root = Path(__file__).resolve().parents[2]
+    provenance = benchmark_provenance(repo_root)
     return {
         "framework": "vllm-gr",
         "api": "GRLLM.beam_search_v1",
         "execution_mode": "offline_sequential_single_prompt",
         "model": args.model,
         "vllm_gr_repo": str(repo_root),
-        "vllm_gr_commit": _git_commit(repo_root),
+        "vllm_gr_commit": provenance["commit"],
         "workload_jsonl": args.workload_jsonl,
         "constraint_triples": str(constraint_path),
         "constraint_artifact": str(constraint_artifact.path),
@@ -657,6 +653,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "decode_iterations": args.beam_steps - 1,
         "beam_width": args.beam_width,
         "requests": len(workload),
+        "batch_size": 1,
+        **provenance,
+        "percentile_method": "lower order statistic at floor((n - 1) * quantile)",
+        "output_policy": (
+            "raw outputs retained for post-run accuracy normalization"
+            if getattr(args, "record_outputs", True)
+            else "scalar samples only; outputs released before next request"
+        ),
+        "timing_scope": "per-request beam_search_v1 call until return; normalization excluded; wall_ms also includes iteration overhead",
+        "cache_mode": (
+            "prefix cache enabled; reuse follows workload" if args.enable_prefix_caching else "off"
+        ),
         "warmup_runs": args.warmup_runs,
         "repeat": args.repeat,
         "timeline": (
@@ -732,6 +740,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--beam-width", type=int, default=256)
     parser.add_argument("--requests", type=int, default=1)
+    parser.add_argument(
+        "--record-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retain outputs for accuracy (default); --no-record-outputs selects scalar-only performance mode",
+    )
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)

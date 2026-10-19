@@ -5,19 +5,15 @@
 
 import hashlib
 import json
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 
-from tools.AB_Tests.run_offline_benchmark import distribution_ms
+from tools.benchmark_utils import benchmark_provenance, build_artifact, distribution_ms
 
 
 def run_v1_benchmark(args, tokenizer, requests):
     import vllm_gr
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
-        build_artifact,
-    )
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
@@ -107,25 +103,27 @@ def run_v1_benchmark(args, tokenizer, requests):
                 if any(len(s.tokens) != lengths[row] + steps + 1 for s in beams):
                     raise RuntimeError("unexpected input/SID output length")
                 if measured:
-                    samples.append(
-                        {
-                            "e2e_ms": elapsed_ms,
-                            "beams": [
-                                {
-                                    "tokens": list(s.tokens[-max_tokens:]),
-                                    "score": float(s.cum_logprob),
-                                }
-                                for s in beams
-                            ],
-                        }
-                    )
+                    sample = {"e2e_ms": elapsed_ms, "returned_beams": len(beams)}
+                    if getattr(args, "record_outputs", True):
+                        sample["beams"] = [
+                            {"tokens": list(s.tokens[-max_tokens:]), "score": float(s.cum_logprob)}
+                            for s in beams
+                        ]
+                    samples.append(sample)
+                # Loop variables must not retain the preceding result during the next call.
+                del outputs, beams, output, sequence
     latencies = [sample["e2e_ms"] for sample in samples]
     repo = Path(vllm_gr.__file__).resolve().parents[1]
     result = {
         "api": "GRLLM.beam_search_v1",
-        "commit": subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
-        ).strip(),
+        **benchmark_provenance(repo),
+        "batch_size": 1,
+        "cache_mode": "miss",
+        "output_policy": (
+            "candidate IDs/scores retained (accuracy mode)"
+            if getattr(args, "record_outputs", True)
+            else "scalar samples only (performance mode)"
+        ),
         "model": args.model,
         "dataset_path": args.dataset_path,
         "num_prompts": args.num_prompts,

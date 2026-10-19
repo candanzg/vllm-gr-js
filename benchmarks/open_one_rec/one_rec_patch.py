@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import os
@@ -228,9 +229,11 @@ async def patched_async_request_openai_chat_completions(
         ):
             temperature = request_func_input.extra_body.temperature
     payload = {
-        "model": request_func_input.model_name
-        if request_func_input.model_name
-        else request_func_input.model,
+        "model": (
+            request_func_input.model_name
+            if request_func_input.model_name
+            else request_func_input.model
+        ),
         "messages": [
             {"role": "user", "content": content},
         ],
@@ -437,6 +440,12 @@ def patched_add_cli_args(parser):
         "--beam-search-v1",
         action="store_true",
         help="Use canonical V1 and measure sequential text-to-text cache misses",
+    )
+    parser.add_argument(
+        "--record-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retain V1 candidate IDs/scores (default); --no-record-outputs selects scalar-only performance mode",
     )
     parser.add_argument("--constraint-triples", help="Canonical three-step constraint JSON for V1")
     parser.add_argument(

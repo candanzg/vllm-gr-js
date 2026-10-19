@@ -8,38 +8,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-def distribution_ms(values: list[float]) -> dict[str, float | str]:
-    """Summarize millisecond samples using the same percentiles as the dashboard."""
-    if not values:
-        raise ValueError("cannot summarize an empty sample")
-    ordered = sorted(float(value) for value in values)
-
-    def percentile(percent: float) -> float:
-        if len(ordered) == 1:
-            return ordered[0]
-        position = (len(ordered) - 1) * percent / 100.0
-        lower = int(position)
-        upper = min(lower + 1, len(ordered) - 1)
-        weight = position - lower
-        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-    return {
-        "mean": statistics.fmean(ordered),
-        "std": statistics.pstdev(ordered),
-        "p50": percentile(50),
-        "p90": percentile(90),
-        "p95": percentile(95),
-        "p99": percentile(99),
-        "unit": "ms",
-    }
+from tools.benchmark_utils import benchmark_provenance, distribution_ms
 
 
 def measure_e2e(llm: Any, prompt_token_ids: list[int], params: Any) -> dict[str, Any]:
@@ -276,6 +255,10 @@ def main() -> int:
         "schema_version": "vllm-gr.offline.raw.v2",
         "execution_mode": "offline",
         "measurement_mode": "canonical-with-posthoc-diagnostic",
+        "batch_size": 1,
+        "percentile_method": "linear interpolation at (n - 1) * quantile",
+        "output_policy": "scalar samples only; outputs released after each call",
+        **benchmark_provenance(Path(__file__).resolve().parents[2]),
         "instrumentation": {
             "canonical": "top-level perf_counter_ns only; no profiler or internal monkeypatch",
             "diagnostic": "post-canonical minimal 2-function perf_counter monkeypatch (prefill/decode boundary only)",

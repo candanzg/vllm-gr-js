@@ -8,11 +8,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
-from statistics import mean
 from time import perf_counter
 from typing import Any
+
+# These source-tree examples share tooling, not the installed runtime package.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from tools.benchmark_utils import benchmark_provenance, build_artifact, distribution_ms
 
 os.environ.setdefault("USE_TF", "0")
 
@@ -140,14 +146,8 @@ def benchmark_beam_search(
             raise RuntimeError(f"expected {len(prompts)} request outputs, got {len(outputs)}")
         # Count candidates outside timing; do not tokenize/decode or print here.
         returned_beams.append(sum(len(output.sequences) for output in outputs))
-
-    ordered = sorted(latencies_ms)
-
-    def percentile(fraction: float) -> float:
-        position = (len(ordered) - 1) * fraction
-        lower = int(position)
-        upper = min(lower + 1, len(ordered) - 1)
-        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+        if iteration + 1 < args.repeat:
+            outputs = []  # Release before the next timed call; keep only the final batch.
 
     total_seconds = sum(latencies_ms) / 1000.0
     report: dict[str, Any] = {
@@ -168,13 +168,10 @@ def benchmark_beam_search(
         "prefix_caching": "enabled; isolated salt per row and run (cold Prefill)",
         "timing_scope": "beam_search_v1 API call until output objects return; excludes engine startup, "
         "warmup, pre-call prompt preparation and post-call result inspection/printing",
-        "batch_latency_ms": {
-            "mean": mean(latencies_ms),
-            "p50": percentile(0.50),
-            "p95": percentile(0.95),
-            "min": ordered[0],
-            "max": ordered[-1],
-        },
+        "batch_latency_ms": distribution_ms(latencies_ms),
+        "percentile_method": "linear interpolation at (n - 1) * quantile",
+        "output_policy": "only the final batch is retained for printing; no output history",
+        **benchmark_provenance(Path(__file__).resolve().parents[3]),
         "total_timed_seconds": total_seconds,
         "requests_per_second": len(prompts) * len(latencies_ms) / total_seconds,
         "returned_beams_per_second": sum(returned_beams) / total_seconds,
@@ -209,43 +206,6 @@ def run_beam_search(
     finally:
         llm.stop_profile()
     return outputs
-
-
-def load_triples(path: Path) -> list[list[str]]:
-    document = json.loads(path.read_text(encoding="utf-8"))
-    rows = document.get("triples") if isinstance(document, dict) else None
-    if not isinstance(rows, list) or not rows:
-        raise ValueError(f"{path} is not a nonempty Constraint Table triples document")
-    triples = []
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict) or not all(key in row for key in ("a", "b", "c")):
-            raise ValueError(f"invalid triples row {index}: {row!r}")
-        triples.append([str(row["a"]), str(row["b"]), str(row["c"])])
-    return sorted(triples)
-
-
-def build_artifact(
-    model: Path,
-    catalog: Path,
-    artifact_path: Path,
-) -> tuple[str, str]:
-    from transformers import AutoConfig, AutoTokenizer
-
-    from vllm_gr.constraints.artifact import save_constraint_table_artifact
-    from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
-    from vllm_gr.constraints.json_compiler import compile_relations_json
-    from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
-
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-    tokenizer_digest = compute_tokenizer_digest(tokenizer)
-    table = ConstraintTableArtifactCompiler(
-        tokenizer,
-        int(model_config.vocab_size),
-        tokenizer_digest=tokenizer_digest,
-    ).compile(compile_relations_json(load_triples(catalog)))
-    artifact_digest = save_constraint_table_artifact(table, artifact_path)
-    return artifact_digest, tokenizer_digest
 
 
 def make_prompt(tokenizer: Any, path: Path, input_len: int) -> list[int]:
