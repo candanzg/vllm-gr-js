@@ -109,32 +109,6 @@ async def beam_request_step_update_async(self, update: BeamRequestStepUpdate) ->
 
 
 # ---------------------------------------------------------------------------
-# AsyncMPClient.beam_session_template_async  (BEAM_SESSION_TEMPLATE path)
-# ---------------------------------------------------------------------------
-
-
-async def beam_session_template_async(self, template: BeamRequestStepUpdate) -> None:
-    """Send BEAM_SESSION_TEMPLATE to EngineCore (fire-and-forget).
-
-    Caches the session's step-update template on the EngineCore so its
-    engine-driven prefill chain can construct the step-0 update in-process.
-    Sent right after the session's ADD_BATCH on the same socket (FIFO
-    guarantees it lands in beam_cache before the prefill output iteration).
-    No reqs_in_flight bookkeeping: the template carries no live child ids.
-    """
-    template.client_index = self.client_index
-    if hasattr(self, "current_wave"):
-        template.current_wave = self.current_wave
-
-    engine = None
-    if hasattr(self, "get_core_engine_for_request") and template.data_parallel_rank is not None:
-        engine = self.core_engines[template.data_parallel_rank]
-
-    await self._send_input(EngineCoreRequestType.BEAM_SESSION_TEMPLATE, template, engine)
-    self._ensure_output_queue_task()
-
-
-# ---------------------------------------------------------------------------
 # AsyncMPClient.submit_session_async  (SUBMIT_SESSION path)
 # ---------------------------------------------------------------------------
 
@@ -143,8 +117,7 @@ async def submit_session_async(self, requests, template: BeamRequestStepUpdate) 
     """Send SUBMIT_SESSION to EngineCore (ADD_BATCH + template in one message).
 
     Combines the session's prefill batch submission with its step template:
-    the EngineCore handler runs the ADD_BATCH handling per request and then
-    caches the template, so the template's arrival is atomic with the
+    the EngineCore handler caches the template before admitting requests, so the template's arrival is atomic with the
     prefill submission (no FIFO reliance across two messages).  Routing and
     reqs_in_flight bookkeeping mirror add_requests_async; the template rides
     the same engine as the requests.

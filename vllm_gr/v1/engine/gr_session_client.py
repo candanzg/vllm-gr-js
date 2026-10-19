@@ -83,7 +83,11 @@ def _terminal_result(request: BeamBatchRequest, output: Any) -> BeamBatchResult:
             raise ValueError("terminal Beam result requires exactly one output or failure")
         if result.batch_id != request.batch_id:
             raise ValueError("terminal Beam result belongs to a different session")
-        if result.failure is not None and result.failure.item_index not in (None, 0):
+        if (
+            result.failure is not None
+            and result.failure.item_index is not None
+            and not 0 <= result.failure.item_index < len(request.items)
+        ):
             raise ValueError("terminal Beam failure has an invalid item identity")
         if result.failure is not None and (
             not result.failure.code.strip() or not result.failure.message.strip()

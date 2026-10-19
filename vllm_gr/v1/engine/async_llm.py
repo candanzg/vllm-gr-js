@@ -466,16 +466,6 @@ async def beam_request_step_update_fn(self, update: BeamRequestStepUpdate) -> No
     await self.engine_core.beam_request_step_update_async(update)
 
 
-async def beam_session_template_fn(self, template: BeamRequestStepUpdate) -> None:
-    """Send BEAM_SESSION_TEMPLATE to EngineCore (fire-and-forget).
-
-    Must be sent after the session's ADD_BATCH and before awaiting the
-    prefill output — the EngineCore consumes it when the prefill output
-    iteration runs its engine-driven hook.
-    """
-    await self.engine_core.beam_session_template_async(template)
-
-
 async def submit_session_fn(
     self,
     requests,
@@ -488,8 +478,7 @@ async def submit_session_fn(
     wire message.  Must be called before awaiting the prefill outputs (the
     EngineCore consumes the template in the same busy-loop iteration that
     processes the prefill output).  InprocClient keeps its direct-call
-    path; clients without the merged send fall back to the legacy
-    two-message sequence.
+    path; all supported clients must expose a merged submission method.
 
     Tracks the session id before dispatch so a chained step-0 output that
     arrives during prefill collection is buffered instead of dropped.
@@ -508,6 +497,4 @@ async def submit_session_fn(
     if inproc_submit is not None:
         inproc_submit(requests, template)
         return
-    # Legacy client path: two messages, same FIFO guarantees.
-    await self._add_requests_batch(requests, use_batch_message=True)
-    await self.engine_core.beam_session_template(template)
+    raise RuntimeError("EngineCore client is missing the required submit_session interface")

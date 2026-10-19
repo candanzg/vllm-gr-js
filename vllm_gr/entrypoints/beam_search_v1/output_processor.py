@@ -148,10 +148,6 @@ class BeamSearchOutputProcessor:
         # change while it runs. Direct output-converter callers still resolve.
         self._boundary_token_ids = boundary_token_ids
 
-    @classmethod
-    def ensure_available(cls) -> None:
-        """A5 output conversion is installed and safe to admit work."""
-
     def process_outputs(
         self,
         call: OfflineBeamSearchRequest,

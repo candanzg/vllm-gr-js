@@ -427,14 +427,6 @@ def test_submission_rollback_fences_delayed_acceptance() -> None:
     asyncio.run(run())
 
 
-def test_a5_output_conversion_is_available_before_submission() -> None:
-    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
-        BeamSearchOutputProcessor,
-    )
-
-    assert BeamSearchOutputProcessor.ensure_available() is None
-
-
 @pytest.mark.parametrize("online", [False, True])  # type: ignore[misc]
 def test_terminal_failure_precedes_tokenizer_access(online: bool) -> None:
     failure = BeamBatchFailure("beam_device_error", "original device failure", 0)

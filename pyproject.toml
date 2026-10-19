@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 # Platform runtimes are selected automatically via setup.py + requirements/.
-# See docs/install_simplification_plan.md for the installation model.
+# See README.md for platform installation instructions.
 
 [project.optional-dependencies]
 dev = [

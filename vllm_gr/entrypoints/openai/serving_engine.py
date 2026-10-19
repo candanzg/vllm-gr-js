@@ -281,16 +281,17 @@ async def _add_batch_step(
     data_parallel_rank: int | None = None,
     session_template=None,
 ):
-    """ADD_BATCH path: prepare and batch-send requests (step 0).
+    """Prepare and submit the step-0 requests before awaiting Prefill outputs.
 
-    ``session_template`` (engine-driven prefill chain) is sent fire-and-forget
-    right after the ADD_BATCH and BEFORE awaiting the prefill outputs: the
-    EngineCore consumes it in the same busy-loop iteration that processes
-    the prefill output, so any later send would always be too late.
-    When the client supports SUBMIT_SESSION, the ADD_BATCH and the template
-    travel as ONE wire message instead (same ordering guarantees, one fewer
-    message per session); the two-message path stays available for clients
-    without the merged send.
+    For a nonempty Beam-request batch with ``session_template``, the client
+    must implement ``submit_session(requests, template)``. The requests and
+    template are submitted atomically through SUBMIT_SESSION (a direct
+    handler call for in-process clients), so EngineCore binds the template
+    before admitting any Prefill request. The session is tracked before
+    submission to receive engine-driven Decode outputs.
+
+    Other calls use ``_add_requests_batch``; ``use_beam_req`` selects ADD_BATCH
+    instead of individual ADD messages.
     """
     queues = []
     engine_core_requests = []
@@ -316,31 +317,14 @@ async def _add_batch_step(
         if track is not None:
             track(engine_core_requests[0].request_id)
 
-    # The template must land before the prefill output iteration runs its
-    # engine-driven hook — either merged into the SUBMIT_SESSION send below
-    # or as the fire-and-forget message right after ADD_BATCH; both precede
-    # the _gather_beam_results await, and anything later would be too late.
-    submit_session = getattr(engine_client, "submit_session", None)
-    if (
-        session_template is not None
-        and use_beam_req
-        and engine_core_requests
-        and submit_session is not None
-    ):
+    # Submit the template atomically with prefill, before any output can arrive.
+    if session_template is not None and use_beam_req and engine_core_requests:
         session_template.session_id = engine_core_requests[0].request_id
-        await submit_session(engine_core_requests, session_template)
+        await engine_client.submit_session(engine_core_requests, session_template)
     else:
         await engine_client._add_requests_batch(
             engine_core_requests, use_batch_message=use_beam_req
         )
-
-        # Cache the session's step template now (same socket as ADD_BATCH,
-        # FIFO) so it is in beam_cache before the prefill output iteration
-        # runs its engine-driven hook.  The session id is stamped from the
-        # actual request ids instead of assuming the batch layout.
-        if session_template is not None and use_beam_req and engine_core_requests:
-            session_template.session_id = engine_core_requests[0].request_id
-            await engine_client.beam_session_template(session_template)
 
     internal_ids = [r.request_id for r in engine_core_requests] if use_beam_req else []
     output = await _gather_beam_results(queues)

@@ -36,7 +36,6 @@ UPSTREAM_REQUEST_WIRE_VALUES = {
 GR_REQUEST_WIRE_VALUES = {
     "ADD_BATCH": b"\x06",
     "BEAM_REQUEST_STEP_UPDATE": b"\x07",
-    "BEAM_SESSION_TEMPLATE": b"\x08",
     "SUBMIT_SESSION": b"\x09",
     "SUBMIT_GR_SESSION": b"\x0a",
 }
@@ -250,14 +249,10 @@ def test_gr_input_dispatch_consumes_registered_types() -> None:
         _cache_beam_request=lambda req: handled.append(("cache", req)),
         input_queue=SimpleNamespace(put_nowait=lambda item: handled.append(("put", item))),
         _handle_beam_request_step_update=lambda payload: handled.append(("step", payload)),
-        _handle_beam_session_template=lambda payload: handled.append(("tpl", payload)),
         _handle_submit_session=lambda reqs, tpl: handled.append(("submit", reqs, tpl)),
     )
 
     assert dispatch_gr_engine_core_input(eng, EngineCoreRequestType.ADD, object()) is False
-    assert dispatch_gr_engine_core_input(
-        eng, EngineCoreRequestType.BEAM_SESSION_TEMPLATE, "template"
-    )
     assert dispatch_gr_engine_core_input(
         eng, EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE, "update"
     )
@@ -265,7 +260,6 @@ def test_gr_input_dispatch_consumes_registered_types() -> None:
     req = SimpleNamespace(request_id="s0")
     assert dispatch_gr_engine_core_input(eng, EngineCoreRequestType.ADD_BATCH, [req])
     assert handled == [
-        ("tpl", "template"),
         ("step", "update"),
         ("submit", ["r"], "t"),
         ("pre", req),

@@ -400,6 +400,27 @@ def _constraint_explicitly_configured(
     return explicit_backend
 
 
+def _beam_decision_defaults(
+    *,
+    beam_width_configured: bool,
+    worker_decision: bool | None,
+    engine_driven: bool | None,
+) -> tuple[bool | None, bool | None]:
+    """Resolve omitted accelerator controls while preserving explicit False."""
+    if beam_width_configured and (_is_cuda_platform() or _is_npu_platform()):
+        if worker_decision is None:
+            worker_decision = True
+        if worker_decision and engine_driven is None:
+            engine_driven = True
+    if engine_driven and not worker_decision:
+        raise ValueError(
+            "beam_engine_driven=True requires beam_worker_decision=True "
+            "(CLI --beam-worker-decision or additional_config "
+            "'vllm_gr_beam_worker_decision')"
+        )
+    return worker_decision, engine_driven
+
+
 def create_engine_config(self, usage_context=None, headless=False):
     config = origin_create_engine_config(self, usage_context, headless)
     _apply_npu_default_block_size(config)
@@ -493,14 +514,6 @@ def create_engine_config(self, usage_context=None, headless=False):
             getattr(self, "beam_max_width", None) is not None
             or existing_gr_config.beam_max_width is not None
         )
-        worker_decision_explicit = (
-            getattr(self, "beam_worker_decision", None) is not None
-            or existing_gr_config.beam_worker_decision is not None
-        )
-        engine_driven_explicit = (
-            getattr(self, "beam_engine_driven", None) is not None
-            or existing_gr_config.beam_engine_driven is not None
-        )
         if (
             _is_npu_platform()
             and beam_width_configured
@@ -520,40 +533,11 @@ def create_engine_config(self, usage_context=None, headless=False):
             # unconstrained (legacy) instead of force-building tables.  A
             # catalog document is therefore required for the promotion.
             effective_constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
-        # Worker-side beam decision is enabled on accelerator backends by default for any beam
-        # deployment unless the user explicitly disabled it.  Independent of
-        # the Constraint Table promotion above (which may already be explicit
-        # via GRLLM passing the auto-build sentinel).
-        if (
-            (_is_npu_platform() or _is_cuda_platform())
-            and beam_width_configured
-            and not worker_decision_explicit
-        ):
-            if effective_beam_worker_decision is None:
-                effective_beam_worker_decision = True
-        # Unified engine-driven sessions: accelerator beam default with
-        # worker decisions, NO async-scheduling and NO constraint-backend
-        # condition.  The advance runs in the busy-loop iteration that
-        # processes the step's outputs (no two-phase pipeline conflict), and
-        # the constraint-table requirement is enforced by the data (worker
-        # beam decisions only exist for constrained beam sessions).
-        if (
-            (_is_npu_platform() or _is_cuda_platform())
-            and beam_width_configured
-            and effective_beam_worker_decision
-            and not engine_driven_explicit
-            and effective_beam_engine_driven is None
-        ):
-            effective_beam_engine_driven = True
-        # Engine-driven chaining consumes the worker's beam_search_result.
-        # Validate after platform defaults so an explicit engine-driven
-        # choice can use the accelerator's default worker decision.
-        if effective_beam_engine_driven and not effective_beam_worker_decision:
-            raise ValueError(
-                "beam_engine_driven=True requires beam_worker_decision=True "
-                "(CLI --beam-worker-decision or additional_config "
-                "'vllm_gr_beam_worker_decision')"
-            )
+        effective_beam_worker_decision, effective_beam_engine_driven = _beam_decision_defaults(
+            beam_width_configured=beam_width_configured,
+            worker_decision=effective_beam_worker_decision,
+            engine_driven=effective_beam_engine_driven,
+        )
         offset, slice_size = None, None
         # CUDA Constraint Tables support sliced logits while keeping global
         # table token ids (CUDAConstrainedTopKExecution._vocab_window).  The
@@ -586,7 +570,8 @@ def create_engine_config(self, usage_context=None, headless=False):
 
                     set_vocab_slice_config(offset, slice_size)
 
-        effective_gr_config = GRConfig(
+        effective_gr_config = replace(
+            existing_gr_config,
             catalog_path=effective_catalog_path,
             constraint_backend=effective_constraint_backend,
             attention_backend=(
@@ -599,7 +584,6 @@ def create_engine_config(self, usage_context=None, headless=False):
             beam_graph_enabled=(
                 existing_gr_config.beam_graph_enabled and not getattr(self, "no_beam_graph", False)
             ),
-            beam_graph_batch_size=existing_gr_config.beam_graph_batch_size,
             beam_max_width=(
                 getattr(self, "beam_max_width", None)
                 if getattr(self, "beam_max_width", None) is not None
@@ -612,33 +596,19 @@ def create_engine_config(self, usage_context=None, headless=False):
             ),
             beam_worker_decision=effective_beam_worker_decision,
             beam_engine_driven=effective_beam_engine_driven,
-            beam_execution_mode=existing_gr_config.beam_execution_mode,
-            schema_version=existing_gr_config.schema_version,
-            constraint_table=existing_gr_config.constraint_table,
         )
 
-    # Canonical configs bypass the legacy merge above. Apply accelerator
-    # runtime defaults here as well so omitted decision controls use the same
-    # Worker + EngineCore path as legacy arguments.
-    if (
-        canonical_source
-        and (_is_cuda_platform() or _is_npu_platform())
-        and effective_gr_config.beam_max_width is not None
-        and effective_gr_config.beam_worker_decision is None
-    ):
-        effective_gr_config = replace(effective_gr_config, beam_worker_decision=True)
-    # Canonical configs: engine-driven default mirrors the legacy rule above
-    # (accelerator beam + worker decisions; async scheduling and constraint
-    # backend are deliberately not conditions).  Unset stays unset until this
-    # promotion writes True.
-    if (
-        canonical_source
-        and (_is_cuda_platform() or _is_npu_platform())
-        and effective_gr_config.beam_max_width is not None
-        and effective_gr_config.beam_worker_decision
-        and effective_gr_config.beam_engine_driven is None
-    ):
-        effective_gr_config = replace(effective_gr_config, beam_engine_driven=True)
+    if canonical_source:
+        worker_decision, engine_driven = _beam_decision_defaults(
+            beam_width_configured=effective_gr_config.beam_max_width is not None,
+            worker_decision=effective_gr_config.beam_worker_decision,
+            engine_driven=effective_gr_config.beam_engine_driven,
+        )
+        effective_gr_config = replace(
+            effective_gr_config,
+            beam_worker_decision=worker_decision,
+            beam_engine_driven=engine_driven,
+        )
 
     execution_mode = getattr(self, "beam_execution_mode", None)
     if execution_mode is not None:
