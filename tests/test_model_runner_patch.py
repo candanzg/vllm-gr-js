@@ -54,7 +54,7 @@ def test_dispatcher_selects_one_platform_module(
     assert imported == [model_runner_patch._NPU_PATCH_MODULE]
 
 
-def test_dispatcher_installs_three_wrappers_once(
+def test_cuda_dispatcher_installs_stage_wrappers_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # V1-platform install test: pin the V2 flag off (see
@@ -83,8 +83,6 @@ def test_dispatcher_installs_three_wrappers_once(
     platform_module = SimpleNamespace(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
-        make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
-        make_patched_sample=gpu_model_runner_patch.make_patched_sample,
     )
     monkeypatch.setattr(
         model_runner_patch,
@@ -105,7 +103,7 @@ def test_dispatcher_installs_three_wrappers_once(
     assert (Runner.execute_model, Runner._prepare_inputs, Runner._bookkeeping_sync) == first
 
 
-def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
+def test_cuda_dispatcher_preserves_native_sampler_and_bookkeeping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # V1-platform install test: pin the V2 flag off (see
@@ -151,8 +149,6 @@ def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
     platform_module = SimpleNamespace(
         discover_worker_runners=lambda: (("GPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
-        make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
-        make_patched_sample=gpu_model_runner_patch.make_patched_sample,
     )
     monkeypatch.setattr(
         model_runner_patch,
@@ -161,9 +157,13 @@ def test_dispatcher_installs_sample_hook_when_runner_exposes_sample(
     )
 
     reload_weights = Runner.reload_weights
+    sample = Runner._sample
+    bookkeeping = Runner._bookkeeping_sync
     model_runner_patch.apply_worker_patches()
 
-    assert getattr(Runner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
+    assert Runner._sample is sample
+    assert Runner._bookkeeping_sync is bookkeeping
+    assert not getattr(Runner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
     assert getattr(Runner.load_model, _CONSTRAINT_LOAD_PATCH_MARKER, False)
     assert getattr(Runner.shutdown, _CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
     # In-place weight reloads do not rebuild the tokenizer/vocab-bound Backend.
@@ -227,8 +227,6 @@ def test_dispatcher_installs_sample_tokens_hook_when_exposed(
     platform_module = SimpleNamespace(
         discover_worker_runners=lambda: (("NPUModelRunner", Runner),),
         make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
-        make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
-        make_patched_sample=gpu_model_runner_patch.make_patched_sample,
         make_patched_sample_tokens=fake_sample_tokens_patch,
     )
     monkeypatch.setattr(
@@ -351,7 +349,6 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
         return SimpleNamespace(
             discover_worker_runners=lambda: (("NPUModelRunner", Runner),),
             make_patched_prepare_inputs=gpu_model_runner_patch.make_patched_prepare_inputs,
-            make_patched_bookkeeping_sync=gpu_model_runner_patch.make_patched_bookkeeping_sync,
             capture_beam_decode_graph=lambda _: events.append("legacy"),
         )
 
