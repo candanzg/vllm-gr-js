@@ -340,12 +340,15 @@ def main() -> int:
             if diagnostic_latency
             else None
         )
+        offline_api = raw.get("api", "GRLLM.beam_search")
         notes = [
-            "Offline GRLLM.beam_search; max_concurrency=1 and one prompt per call.",
+            f"Offline {offline_api}; max_concurrency=1 and one prompt per call.",
             "Canonical E2E is measured before diagnostic sampling with one outer perf_counter_ns and no internal monkeypatch or profiler.",
             "Each canonical sample is a cold-cache call followed by an identical warm-cache call.",
             "Offline E2E excludes HTTP, SSE, serialization, and network round-trip overhead.",
-            "Internal stage values come from a smaller post-canonical diagnostic sample and never contribute to the official E2E trend.",
+            "Internal stages are not measured by the V1 E2E frontend benchmark."
+            if not diagnostic_latency
+            else "Internal stages come from separate post-canonical diagnostics and do not contribute to E2E.",
         ]
     else:
         latency_metrics = {name: latency(raw, name) for name in ("ttft", "tpot", "itl", "e2el")}
@@ -437,7 +440,7 @@ def main() -> int:
             if offline
             else f"RecIF video / beam-{args.beam_width} / input-{args.input_length} / concurrency-{raw['max_concurrency']}",
             "execution_mode": "offline" if offline else "online",
-            "endpoint": "GRLLM.beam_search" if offline else "/v1/chat/completions",
+            "endpoint": offline_api if offline else "/v1/chat/completions",
             "backend": "vllm-gr-offline" if offline else raw["backend"],
             "num_prompts": num_prompts,
             "max_concurrency": raw["max_concurrency"],

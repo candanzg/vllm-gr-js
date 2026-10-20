@@ -86,7 +86,7 @@ p99_tpot_th="$P99_TPOT_THRESHOLD"
 # pre-generates it in the "Build catalog" step (tools/build_constraint_triples.py)
 # and passes TRIPLES_PATH, mirroring CATALOG_PATH.  When it is absent (local
 # runs) it is derived from the catalog location and built on demand.
-constraint_backend_args=(--catalog-path "$CATALOG_PATH")
+constraint_device=cuda
 if [[ "$device" == "npu" || "$device" == "gpu" || "$device" == "cuda" ]] \
     || command -v npu-smi > /dev/null 2>&1 \
     || nvidia-smi -L > /dev/null 2>&1; then
@@ -104,10 +104,9 @@ if [[ "$device" == "npu" || "$device" == "gpu" || "$device" == "cuda" ]] \
   else
     echo "Using pre-built Constraint Tables triples: $triples_path"
   fi
-  constraint_backend_args=(
-    --constraint-backend constraint_table
-    --catalog-path "$triples_path"
-  )
+  if [[ "$device" == "npu" ]]; then
+    constraint_device=npu
+  fi
 fi
 
 echo "Using model: $MODEL_PATH"
@@ -155,19 +154,44 @@ echo "Running OneRec offline benchmark"
 # derived from the same variable instead of an external environment override
 # (a missing override silently disabled the pool and corrupted beam decode).
 beam_width=128
-beam_graph_args=(--beam-max-width "$beam_width")
+config_dir="${VLLM_GR_BENCHMARK_CONFIG_DIR:-$SCRIPT_DIR/../../generated_data/benchmark_v1}"
+mkdir -p "$config_dir" || exit 1
+config_dir="$(cd "$config_dir" && pwd)"
+config_path="$config_dir/vllm_gr_config.json"
+python - "$MODEL_PATH" "${triples_path:?Beam V1 requires CUDA or NPU constraint triples}" \
+    "$config_path" "$constraint_device" "$beam_width" <<'PY_CONFIG' || exit 1
+import json
+import sys
+from pathlib import Path
+from examples.offline_inference.beam_search.offline_beam_search_v1 import build_artifact
+
+model, triples, config_path, backend, width = sys.argv[1:]
+path = Path(config_path)
+artifact = path.with_suffix(".safetensors")
+digest, tokenizer_digest = build_artifact(Path(model), Path(triples), artifact)
+config = {
+    "schema_version": 1,
+    "attention_backend": "CUSTOM",
+    "beam": {"execution_mode": "v1", "max_width": int(width), "max_decode_steps": 3,
+             "graph_enabled": backend == "cuda", "worker_decision": True},
+    "constraint_table": {
+        "enabled": True, "backend": backend, "max_top_k": int(width),
+        "path": str(artifact), "format": "constraint_table_v1",
+        "artifact_digest": digest, "tokenizer_digest": tokenizer_digest,
+    },
+}
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY_CONFIG
 output=$(python -m benchmarks.open_one_rec.one_rec_acc_test \
   --gr \
   --model "$MODEL_PATH" \
   --dataset-path "$DATASET_PATH" \
   --dataset-name onerec \
   --num-prompts 100 \
-  --max-concurrency 1 \
+  --batch-size 1 \
   --use-beam-search \
   --task-type video \
-  "${constraint_backend_args[@]}" \
-  --backend CUSTOM \
-  "${beam_graph_args[@]}" \
+  --vllm-gr-config "$config_path" \
   --n "$beam_width")
 offline_status=$?
 printf '%s\n' "$output"
@@ -222,7 +246,9 @@ wait_for_server() {
 
 echo "Starting OneRec online server"
 vllm-gr serve \
-  "${beam_graph_args[@]}" \
+  --vllm-gr-config "$config_path" \
+  --async-scheduling \
+  --no-enable-chunked-prefill \
   --port "$run_port" \
   --seed 123 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
@@ -230,7 +256,6 @@ vllm-gr serve \
   --max_num_seqs 2048 \
   --max_num_batched_tokens 16384 \
   --scheduling-policy priority \
-  "${constraint_backend_args[@]}" \
   --attention-backend CUSTOM \
   "$MODEL_PATH" &
 SERVER_PID=$!

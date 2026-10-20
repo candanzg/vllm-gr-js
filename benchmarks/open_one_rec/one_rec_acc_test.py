@@ -79,15 +79,51 @@ def get_sampling_params(gen_config: dict[str, Any]) -> SamplingParams:
 
 
 class MockCompletionOutput:
-    def __init__(self, text, logprobs=None):
+    def __init__(self, text: str, logprobs: Any = None) -> None:
         self.text = text
         self.logprobs = logprobs
 
 
 class MockRequestOutput:
-    def __init__(self, prompt, outputs: list[MockCompletionOutput]):
+    def __init__(self, prompt: str, outputs: list[MockCompletionOutput]) -> None:
         self.prompt = prompt
         self.outputs = outputs
+
+
+def run_offline_v1_inference(
+    llm: Any, prompts: list[str], params: Any, batch_size: int
+) -> list[MockRequestOutput]:
+    """Preserve sample order and decode only the generated SID token suffix."""
+    if batch_size not in (1, 2, 4):
+        raise ValueError("V1 batch_size must be 1, 2 or 4")
+    outputs = []
+    tokenizer = llm.get_tokenizer()
+    offset = 0
+    while offset < len(prompts):
+        remaining = min(batch_size, len(prompts) - offset)
+        size = 4 if remaining >= 4 else 2 if remaining >= 2 else 1
+        batch = prompts[offset : offset + size]
+        raw_outputs = llm.beam_search_v1([{"prompt": prompt} for prompt in batch], params)
+        if len(raw_outputs) != size:
+            raise RuntimeError("V1 returned an unexpected number of items")
+        for prompt, output in zip(batch, raw_outputs, strict=True):
+            if len(output.sequences) != params.beam_width:
+                raise RuntimeError("V1 returned an unexpected number of beams")
+            # V1 tokens contain the original prompt plus the public SID budget.
+            # Decoding token suffixes avoids character slicing after a tokenizer
+            # round-trip (which can normalize the original prompt).
+            completions = [
+                MockCompletionOutput(
+                    tokenizer.decode(
+                        sequence.tokens[-params.max_tokens :], skip_special_tokens=False
+                    ),
+                    sequence.cum_logprob,
+                )
+                for sequence in output.sequences
+            ]
+            outputs.append(MockRequestOutput(prompt, completions))
+        offset += size
+    return outputs
 
 
 # OneRec dataset prompts are stored as fully rendered chat transcripts
@@ -208,6 +244,14 @@ def main():
         "--use-beam-search", action="store_true", help="Whether to use beam search for generation."
     )
     parser.add_argument("--n", type=int, help="Beam width to use if beam search is enabled.")
+    parser.add_argument("--vllm-gr-config", help="Canonical V1 config JSON; required offline")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        choices=(1, 2, 4),
+        default=1,
+        help="Offline V1 logical batch size; partial tails split into 4/2/1",
+    )
     parser.add_argument("--gr", action="store_true", help="Whether to use vllm-gr.")
 
     parser.add_argument(
@@ -235,13 +279,13 @@ def main():
         "--beam-max-width",
         type=int,
         default=None,
-        help="Upper bound on beam width: sizes the beam KV pool and the "
-        "startup-captured FULL CUDA graph shape (num_tokens=width, runtime "
-        "is replay-only); must be >= the request beam width (--n). Unset "
-        "derives it from the effective beam width (--n / task config).",
+        help="Optional compatibility check; must equal both --n and the V1 config max_width.",
     )
     parser.add_argument(
-        "--max-concurrency", type=int, default=None, help="maximum prompts to run concurrently"
+        "--max-concurrency",
+        type=int,
+        default=None,
+        help="Online request concurrency; offline V1 uses --batch-size",
     )
     args = parser.parse_args()
 
@@ -274,36 +318,47 @@ def main():
         )
 
     # 2. Initialize Engine
-    llm = None
+    engine_kwargs = {}
     if args.endpoint:
         logger.info(f"\nUsing OpenAI-compatible API at: {args.endpoint}")
         logger.info(f"Model: {args.model}")
     else:
-        # The beam KV pool must cover every request's beam width.  This
-        # benchmark drives exactly gen_config["num_beams"], so derive the
-        # pool/graph upper bound from it unless the operator pinned an
-        # explicit --beam-max-width override.
-        beam_max_width = args.beam_max_width
-        if beam_max_width is None:
-            beam_max_width = gen_config.get("num_beams", 1)
-        logger.info(f"Beam KV pool upper bound (beam_max_width): {beam_max_width}")
-        logger.info(f"\nInitializing vLLM with model: {args.model}")
-        try:
-            llm = GRLLM(
-                model=args.model,
-                trust_remote_code=True,
-                max_logprobs=gen_config.get("num_beams", 1) * 2,
-                catalog_path=args.catalog_path if args.catalog_path is not None else None,
-                constraint_backend=args.constraint_backend,
-                beam_max_width=beam_max_width,
-                attention_config={
-                    "backend": args.backend if args.backend is not None else "CUSTOM"
-                },
-                gpu_memory_utilization=0.7,
+        from vllm_gr.config import BeamExecutionMode
+        from vllm_gr.config.parser import load_gr_config
+
+        if not args.vllm_gr_config:
+            parser.error("Offline accuracy testing requires --vllm-gr-config with a V1 artifact")
+        config = load_gr_config(args.vllm_gr_config)
+        width = gen_config.get("num_beams", 1)
+        steps = gen_config.get("max_new_tokens", 5) - 2
+        if config.beam_execution_mode is not BeamExecutionMode.V1:
+            parser.error("Offline accuracy testing requires beam.execution_mode='v1'")
+        if steps not in (1, 2, 3):
+            parser.error(
+                "V1 supports only 1/2/3 generated SID tokens; long reasoning is unsupported"
             )
-        except Exception as e:
-            logger.error(f"Failed to initialize vLLM: {e}")
-            sys.exit(1)
+        if width != config.beam_max_width or args.beam_max_width not in (None, width):
+            parser.error("Request beam width must equal the canonical V1 max_width")
+        if args.catalog_path or args.constraint_backend:
+            parser.error(
+                "Use the canonical artifact in --vllm-gr-config instead of legacy catalog options"
+            )
+        if args.backend not in (None, "CUSTOM"):
+            parser.error("Offline attention backend is selected by --vllm-gr-config")
+        if args.max_concurrency is not None:
+            parser.error("Use --batch-size 1/2/4 for offline V1 batching")
+        engine_kwargs = {
+            "model": args.model,
+            "trust_remote_code": True,
+            "vllm_gr_config": args.vllm_gr_config,
+            "async_scheduling": True,
+            "enable_chunked_prefill": False,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192 * args.batch_size,
+            "max_num_seqs": max(width, args.batch_size),
+            "max_logprobs": width,
+            "gpu_memory_utilization": 0.7,
+        }
 
     # 3. Prepare Data
     # prompts = mock_data_loader(task_config, args.num_prompts)  # Replace with real data loading
@@ -350,38 +405,15 @@ def main():
             beam_width=gen_config["num_beams"],
             max_tokens=gen_config["max_new_tokens"],
             temperature=gen_config["temperature"],
+            ignore_eos=True,
+            begin_token="<|sid_begin|>",
+            end_token="<|sid_end|>",
+            include_stop_str_in_output=True,
         )
-        # Add vLLM-GR specific parameters if available
-        if hasattr(BeamSearchParams, "begin_token"):
-            params.begin_token = "<|sid_begin|>"
-            params.end_token = "<|sid_end|>"
-        prompts_dict = [{"prompt": prompt} for prompt in prompts]
-        gen_start = time.perf_counter()
-        raw_offline_outputs = llm.beam_search(
-            prompts_dict, params, concurrency_limit=args.max_concurrency
-        )
-        assert len(raw_offline_outputs) == len(prompts)
-        gen_end = time.perf_counter()
-
-        # Normalize beam_search outputs to match MockRequestOutput format
-        outputs = []
-        for i, raw_output in enumerate(raw_offline_outputs):
-            # beam_search returns BeamSearchOutput with .outputs containing BeamSearchSequence objects
-            # Each BeamSearchSequence has .text attribute
-            mock_completions = []
-            prompt_len = len(prompts[i])
-            if hasattr(raw_output, "sequences"):
-                for beam_seq in raw_output.sequences:
-                    text = (
-                        beam_seq.text[prompt_len:] if hasattr(beam_seq, "text") else str(beam_seq)
-                    )
-                    logprobs = getattr(beam_seq, "cum_logprob", None)
-                    mock_completions.append(MockCompletionOutput(text, logprobs))
-            else:
-                # Fallback if format is different
-                mock_completions.append(MockCompletionOutput(str(raw_output)))
-
-            outputs.append(MockRequestOutput(prompts[i], mock_completions))
+        with GRLLM(**engine_kwargs) as llm:
+            gen_start = time.perf_counter()
+            outputs = run_offline_v1_inference(llm, prompts, params, args.batch_size)
+            gen_end = time.perf_counter()
 
     # Print a sample output
     if outputs:

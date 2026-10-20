@@ -25,24 +25,35 @@ async def beam_search_dispatch(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
-    """Forward a beam request to the interface this engine was built for.
+    """Adapt upstream OpenAI Beam calls to GR V1 or native non-GR inference.
 
-    The OpenAI servers only ever call ``self.beam_search``, so that attribute
-    has to select the implementation itself: vLLM has no call site for the V1
-    interface. The engine, not the request, owns the choice. Both interfaces
-    share this signature and each one rejects a mismatched engine, so a
-    disagreement between this dispatch and the engine is reported by the
-    implementation instead of being silently served. A missing config parses
-    as LEGACY -- the interface this attribute installed before the dispatch
-    existed -- so non-GR engines are unaffected.
+    Upstream Chat/Completion still call ``self.beam_search``. Only that name
+    remains: the GR frontend token loop has been retired. Calling the native
+    mixin directly keeps repeated patch installation from capturing this
+    dispatcher as its own fallback.
     """
-    from vllm_gr.config import BeamExecutionMode, GRConfig
-    from vllm_gr.entrypoints.openai.serving_engine import beam_search, beam_search_v1
+    from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 
-    mode = GRConfig.from_vllm_config(
-        getattr(self.engine_client, "vllm_config", None)
-    ).beam_execution_mode
-    impl = beam_search_v1 if mode is BeamExecutionMode.V1 else beam_search
+    from vllm_gr.config import BeamExecutionMode, GRConfig
+    from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
+
+    config = getattr(self.engine_client, "vllm_config", None)
+    gr_config = GRConfig.from_vllm_config(config)
+    if gr_config.beam_execution_mode is BeamExecutionMode.V1:
+        impl = beam_search_v1
+    else:
+        additional = getattr(config, "additional_config", None) or {}
+        if (
+            gr_config.enabled
+            or gr_config.beam_max_width is not None
+            or "vllm_gr_beam_execution_mode" in additional
+            or "vllm_gr" in additional
+        ):
+            raise ValueError(
+                "Legacy GR beam_search() has been removed. Configure "
+                "beam.execution_mode='v1' and a canonical constraint artifact."
+            )
+        impl = BeamSearchOnlineMixin.beam_search
     async for output in impl(
         self,
         prompt=prompt,

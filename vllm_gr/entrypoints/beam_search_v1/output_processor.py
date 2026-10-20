@@ -162,7 +162,7 @@ class BeamSearchOutputProcessor:
 
             from vllm.entrypoints.generate.beam_search.utils import BeamSearchOutput
 
-            from vllm_gr.entrypoints.gr import _LazyMaterializedBeamSequence
+            from vllm_gr.entrypoints.beam_output import _LazyMaterializedBeamSequence
 
             end_suffix = () if end_token_id is None else (end_token_id,)
             converted = []

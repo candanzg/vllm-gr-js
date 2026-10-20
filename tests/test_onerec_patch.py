@@ -379,58 +379,38 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
 
         register.assert_not_called()
 
-    def test_offline_beam_search_scopes_engine_cleanup(self) -> None:
-        """The offline path still closes the GRLLM instance that it owns."""
+    def test_offline_beam_search_always_delegates_to_v1(self) -> None:
+        """The former default path uses the same V1 owner as the explicit flag."""
         import benchmarks.open_one_rec.one_rec_patch as patch_mod
-        from benchmarks.open_one_rec import open_one_rec_dataset
+        from benchmarks.open_one_rec import one_rec_v1_benchmark, open_one_rec_dataset
 
-        class _StubBeamSearchParams:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-        sampling_params = types.ModuleType("vllm_gr.sampling_params")
-        sampling_params.BeamSearchParams = _StubBeamSearchParams  # type: ignore[attr-defined]
-        sys.modules[sampling_params.__name__] = sampling_params
-        self._stub_modules[sampling_params.__name__] = sampling_params
-
-        entrypoints = types.ModuleType("vllm_gr.entrypoints")
-        entrypoints.__path__ = []
-        gr_module = types.ModuleType("vllm_gr.entrypoints.gr")
-        engine = mock.MagicMock()
-        engine.__enter__.return_value = engine
-        engine.beam_search.return_value = []
-        gr_module.GRLLM = mock.Mock(return_value=engine)  # type: ignore[attr-defined]
-        entrypoints.gr = gr_module  # type: ignore[attr-defined]
-        sys.modules[entrypoints.__name__] = entrypoints
-        sys.modules[gr_module.__name__] = gr_module
-        self._stub_modules[entrypoints.__name__] = entrypoints
-        self._stub_modules[gr_module.__name__] = gr_module
-
-        request = types.SimpleNamespace(prompt="prompt", expected_output_len=2)
+        request = types.SimpleNamespace(prompt="prompt", expected_output_len=5)
         dataset = mock.MagicMock()
         dataset.sample.return_value = [request]
-        dataset_class = mock.Mock(return_value=dataset)
-
-        transformers = sys.modules["transformers"]
         args = types.SimpleNamespace(
             model="fake-model",
             dataset_path="./data",
             task_types="ad",
             num_prompts=1,
-            n=2,
-            output_len=None,
-            output_json=None,
+            warmup_requests=2,
+            constraint_triples="triples.json",
+            output_json="result.json",
+            beam_search_v1=False,
         )
-
+        transformers = sys.modules["transformers"]
         with (
-            mock.patch.object(open_one_rec_dataset, "OneRecDataset", dataset_class),
+            mock.patch.object(open_one_rec_dataset, "OneRecDataset", return_value=dataset),
             mock.patch.object(transformers, "AutoTokenizer") as auto_tokenizer,
+            mock.patch.object(one_rec_v1_benchmark, "run_v1_benchmark") as run_v1,
         ):
-            auto_tokenizer.from_pretrained.return_value = object()
+            tokenizer = auto_tokenizer.from_pretrained.return_value
             patch_mod._run_offline_beam_search_benchmark(args)
-
-        engine.__enter__.assert_called_once_with()
-        engine.__exit__.assert_called_once()
+            dataset.sample.assert_called_once_with(
+                num_requests=2,
+                no_oversample=True,
+                tokenizer=tokenizer,
+            )
+            run_v1.assert_called_once_with(args, tokenizer, [request])
 
     def test_idempotent_reimport_keeps_patches(self) -> None:
         """Re-importing the patch module (sys.modules cache hit) MUST NOT undo patches."""
@@ -522,11 +502,11 @@ class TestOneRecDatasetInitContract(unittest.TestCase):
         test_self = self
 
         class _RecordingLoader:
-            def __init__(inner_self, **kwargs):  # noqa: N805
+            def __init__(inner_self, **kwargs):
                 test_self._loader_calls.append(kwargs)
                 inner_self.kwargs = kwargs
 
-            def load_data(inner_self, **kwargs):  # noqa: N805
+            def load_data(inner_self, **kwargs):
                 return {}
 
         self._orig_loader = ds_mod.DataLoaderWrapper
@@ -637,10 +617,10 @@ class TestOneRecDatasetSampleContract(unittest.TestCase):
 
         # Replace DataLoaderWrapper with a stub that injects controlled data.
         class _StubLoader:
-            def __init__(inner_self, **kwargs):  # noqa: N805
+            def __init__(inner_self, **kwargs):
                 inner_self.kwargs = kwargs
 
-            def load_data(inner_self, **kwargs):  # noqa: N805
+            def load_data(inner_self, **kwargs):
                 # Return a controlled payload: 3 samples for a single task.
                 return {
                     "0": {"prompt": "aaa", "ground_truth": "gt0"},
@@ -766,10 +746,10 @@ class TestOneRecDatasetExpectedOutputLen(unittest.TestCase):
         self._ds_mod = ds_mod
 
         class _StubLoader:
-            def __init__(inner_self, **kwargs):  # noqa: N805
+            def __init__(inner_self, **kwargs):
                 pass
 
-            def load_data(inner_self, **kwargs):  # noqa: N805
+            def load_data(inner_self, **kwargs):
                 # Single sample, keyed by row index.
                 return {"0": {"prompt": "p", "ground_truth": "gt"}}
 
@@ -1044,7 +1024,7 @@ class TestPatchedValidateArgs(unittest.TestCase):
         We stub original_validate_args with a sentinel to detect delegation.
         """
         calls: list = []
-        sentinel = lambda a: calls.append(a)  # noqa: E731
+        sentinel = lambda a: calls.append(a)
         original = self._patch_mod.original_validate_args
         self._patch_mod.original_validate_args = sentinel
         try:

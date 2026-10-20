@@ -7,14 +7,11 @@ try:
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
 
-try:
-    from vllm_gr.v1.metrics.stats import RequestStateStats
-except ImportError:
-    from vllm.v1.metrics.stats import RequestStateStats
-
 import multiprocessing
 import os
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import psutil
@@ -30,8 +27,8 @@ from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingM
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
-if not torch.cuda.is_available() and not (hasattr(torch, "npu") and torch.npu.is_available()):
-    pytest.skip("GPU/NPU is not available", allow_module_level=True)
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is not available", allow_module_level=True)
 
 
 async def beam_search_test(loops: int) -> None:
@@ -45,17 +42,32 @@ async def beam_search_test(loops: int) -> None:
         ) from exc
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError("VLLM_GR_TEST_GPU_MEMORY_UTILIZATION must be in (0, 1]")
-    beam_width = 256
+    from tests.st.test_onerec_v1_scheduler_st import _inputs
+
+    with TemporaryDirectory(prefix="gr-online-v1-") as directory:
+        model_name, _, config, _, _, _ = _inputs(Path(directory))
+        await _run_serving_v1(loops, model_name, config, gpu_memory_utilization)
+
+
+async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
+    from vllm_gr.plugin import initialize_runtime
+
+    initialize_runtime()
+    beam_width = config["beam"]["max_width"]
     max_tokens = 5
 
     engine_args = AsyncEngineArgs(
         model=model_name,
         trust_remote_code=True,
-        enforce_eager=True,
+        async_scheduling=True,
+        enable_chunked_prefill=False,
+        max_model_len=2048,
+        max_num_batched_tokens=8192,
+        max_num_seqs=beam_width,
         enable_log_requests=False,
         max_logprobs=2 * beam_width,
         gpu_memory_utilization=gpu_memory_utilization,
-        additional_config={"vllm_gr_beam_max_width": beam_width},
+        vllm_gr_config=config,
     )
 
     async with build_async_engine_client_from_engine_args(engine_args) as engine_client:
@@ -75,7 +87,7 @@ async def beam_search_test(loops: int) -> None:
         prompt_file = os.path.join(os.path.dirname(__file__), "resources/single_one_rec_prompt.txt")
         with open(prompt_file, "r") as f:
             prompt_text = f.read()
-        prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)[-1023:]
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
         beam_search_params: dict[str, Any] = {
@@ -93,27 +105,18 @@ async def beam_search_test(loops: int) -> None:
         if loops <= 0:
             loops = 1
         print(f"Starting beam search with {model_name}, beam_width={beam_width} iterations={loops}")
-        metrics: RequestStateStats = RequestStateStats()
         final_output: RequestOutput | None = None
         start: float = time.perf_counter()
         for i in range(loops):
             generator = serving.beam_search(prompt, "req_id", params)
             async for output in generator:
                 final_output = output
-                if final_output and final_output.metrics:
-                    metrics.num_generation_tokens += final_output.metrics.num_generation_tokens
-                    if hasattr(final_output.metrics, "beam_search_overhead"):
-                        metrics.beam_search_overhead += getattr(
-                            output.metrics, "beam_search_overhead", 0
-                        )
-                    if hasattr(final_output.metrics, "beam_search_decode_time"):
-                        metrics.beam_search_decode_time += getattr(
-                            output.metrics, "beam_search_decode_time", 0
-                        )
 
         end = time.perf_counter()
-        print(f"metrics={metrics} elapsed mean:{(end - start) / loops}")
+        print(f"V1 online elapsed mean:{(end - start) / loops}")
         assert final_output is not None
+        assert final_output.finished
+        assert final_output.request_id == "req_id"
         assert len(final_output.outputs) == beam_width
 
 

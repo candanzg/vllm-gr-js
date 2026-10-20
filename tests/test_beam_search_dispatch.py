@@ -1,100 +1,98 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pin the beam interface selection installed on ``OpenAIServing``.
-
-vLLM's OpenAI servers only ever call ``self.beam_search``; there is no call
-site for ``beam_search_v1``. That single attribute therefore has to select the
-implementation from the engine's own configuration, and a wrong selection is
-otherwise visible only when a request is refused by the implementation's mode
-guard -- two minutes of engine startup away. These tests decide it without a
-device.
-"""
+"""The upstream Beam name must never reach the retired GR frontend loop."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 
-import vllm_gr.config as gr_config
-import vllm_gr.entrypoints.openai.serving_engine as serving_engine
-from vllm_gr.config import BeamExecutionMode, GRConfig
-from vllm_gr.entrypoints.openai.beam_search_patch import (
-    beam_search_dispatch,
-    patch_beam_search,
-)
+from vllm_gr.entrypoints.gr import GRLLM
+from vllm_gr.entrypoints.openai import serving_engine
+from vllm_gr.entrypoints.openai.beam_search_patch import beam_search_dispatch, patch_beam_search
 from vllm_gr.patch import _validate_openai_beam_search_patch
 
 
-class _ModeStub:
-    """Stand-in for ``GRConfig`` that reports whatever mode a test sets."""
-
-    beam_execution_mode = BeamExecutionMode.LEGACY
-
-    @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> _ModeStub:
-        del vllm_config
-        return cls()
-
-
-def _recorder(name: str, picked: list[str]) -> Callable[..., AsyncGenerator[str, None]]:
-    """Return an async-generator stub that records the name it was reached by."""
-
-    async def impl(
-        self: object,
-        prompt: object,
-        request_id: str,
-        params: object,
-        lora_request: object = None,
-        trace_headers: object = None,
-    ) -> AsyncGenerator[str, None]:
-        del self, prompt, request_id, params, lora_request, trace_headers
-        picked.append(name)
+def _recorder(name: str, calls: list[tuple[str, dict[str, Any]]]) -> Callable[..., Any]:
+    async def impl(self: object, **kwargs: Any) -> AsyncGenerator[str, None]:
+        calls.append((name, kwargs))
         yield name
 
     return impl
 
 
-async def _drain(serving: object) -> list[str]:
-    return [
-        output async for output in beam_search_dispatch(serving, "prompt", "request-id", "params")
+def _dispatch(
+    additional: dict[str, Any] | None, monkeypatch: Any
+) -> list[tuple[str, dict[str, Any]]]:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
+    monkeypatch.setattr(BeamSearchOnlineMixin, "beam_search", _recorder("native", calls))
+    config = None if additional is None else SimpleNamespace(additional_config=additional)
+    serving = SimpleNamespace(engine_client=SimpleNamespace(vllm_config=config))
+
+    async def drain() -> None:
+        outputs = [
+            output
+            async for output in beam_search_dispatch(
+                serving, "prompt", "request-id", "params", "lora", {"trace": "id"}
+            )
+        ]
+        assert len(outputs) == 1
+
+    asyncio.run(drain())
+    return calls
+
+
+def test_v1_dispatch_preserves_upstream_arguments(monkeypatch: Any) -> None:
+    assert _dispatch({"vllm_gr_beam_execution_mode": "v1"}, monkeypatch) == [
+        (
+            "v1",
+            {
+                "prompt": "prompt",
+                "request_id": "request-id",
+                "params": "params",
+                "lora_request": "lora",
+                "trace_headers": {"trace": "id"},
+            },
+        )
     ]
 
 
-def _picked(mode: BeamExecutionMode) -> list[str]:
-    """Record which implementation a dispatch against ``mode`` reaches."""
-    picked: list[str] = []
-    serving = SimpleNamespace(engine_client=SimpleNamespace(vllm_config=object()))
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(gr_config, "GRConfig", _ModeStub)
-        monkeypatch.setattr(_ModeStub, "beam_execution_mode", mode)
-        monkeypatch.setattr(serving_engine, "beam_search", _recorder("legacy", picked))
-        monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", picked))
-        asyncio.run(_drain(serving))
-    return picked
+def test_non_gr_engine_uses_upstream_beam(monkeypatch: Any) -> None:
+    for additional in (None, {}, {"unrelated": True}):
+        assert _dispatch(additional, monkeypatch)[0][0] == "native"
 
 
-def test_patch_installs_the_dispatcher() -> None:
+def test_legacy_gr_configuration_is_rejected(monkeypatch: Any) -> None:
+    for additional in (
+        {"vllm_gr_beam_execution_mode": "legacy"},
+        {"vllm_gr_beam_max_width": 128},
+        {"vllm_gr_catalog_path": "/unused/catalog.json"},
+    ):
+        with pytest.raises(ValueError, match="removed.*execution_mode='v1'"):
+            _dispatch(additional, monkeypatch)
+
+
+def test_patch_is_idempotent_and_keeps_native_mixin(monkeypatch: Any) -> None:
+    native = BeamSearchOnlineMixin.beam_search
     patch_beam_search()
-
+    patch_beam_search()
     assert OpenAIServing.beam_search is beam_search_dispatch
+    assert OpenAIServing.beam_search_v1 is serving_engine.beam_search_v1
+    assert BeamSearchOnlineMixin.beam_search is native
     assert _validate_openai_beam_search_patch() is None
+    assert _dispatch(None, monkeypatch)[0][0] == "native"
 
 
-def test_engine_without_gr_config_stays_on_legacy() -> None:
-    # Read through the real parser: the interface this attribute installed
-    # before the dispatch existed.
-    config = GRConfig.from_vllm_config(None)
-
-    assert config.beam_execution_mode is BeamExecutionMode.LEGACY
-
-
-def test_dispatch_reaches_legacy_for_a_legacy_engine() -> None:
-    assert _picked(BeamExecutionMode.LEGACY) == ["legacy"]
-
-
-def test_dispatch_reaches_v1_for_a_v1_engine() -> None:
-    assert _picked(BeamExecutionMode.V1) == ["v1"]
+def test_offline_old_name_cannot_fall_back_to_upstream() -> None:
+    # No engine/tokenizer is needed to reject an old caller, including legacy
+    # kwargs which must not be silently translated into a V1 request.
+    llm = object.__new__(GRLLM)
+    with pytest.raises(NotImplementedError, match=r"removed.*beam_search_v1"):
+        llm.beam_search([], object(), output_mode="compact")
