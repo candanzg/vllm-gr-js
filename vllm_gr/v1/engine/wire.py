@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from vllm.v1.engine import EngineCoreRequestType
 
-
 # Retired legacy protocol values. Reserve these bytes; never register or reuse.
 ADD_BATCH_WIRE_VALUE = b"\x06"
 BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE = b"\x07"

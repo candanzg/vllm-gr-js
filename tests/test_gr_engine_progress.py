@@ -11,6 +11,10 @@ import pytest
 from vllm_gr.v1.engine.engine_core_patch import make_patched_process_engine_step
 
 
+def _native_step(engine: Any) -> bool:
+    raise AssertionError("the V1 step adapter should execute step_fn directly")
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     ("model_executed", "progress", "in_flight", "has_requests", "should_sleep"),
     [
@@ -48,7 +52,7 @@ def test_progress_backoff_preserves_native_outputs(
         output_queue=SimpleNamespace(put_nowait=lambda item: events.append(("output", item))),
         post_step=lambda executed: events.append(("post", executed)),
     )
-    wrapper = make_patched_process_engine_step(Mock())
+    wrapper = make_patched_process_engine_step(_native_step)
     assert make_patched_process_engine_step(wrapper) is wrapper
     assert wrapper(engine) is model_executed
     assert events == [("output", (2, output)), ("post", model_executed)]
@@ -66,6 +70,6 @@ def test_step_failure_propagates_without_fabricating_output() -> None:
         post_step=Mock(),
     )
     with pytest.raises(RuntimeError, match="worker failed"):
-        make_patched_process_engine_step(Mock())(engine)
+        make_patched_process_engine_step(_native_step)(engine)
     engine.output_queue.put_nowait.assert_not_called()
     engine.post_step.assert_not_called()
