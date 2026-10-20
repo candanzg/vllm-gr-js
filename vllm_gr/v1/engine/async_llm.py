@@ -3,15 +3,11 @@
 
 from contextvars import ContextVar
 from functools import wraps
-from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    pass
 
 _PROCESS_OUTPUTS_PATCH_MARKER = "_vllm_gr_admission_rejection_outputs_patch"
 
