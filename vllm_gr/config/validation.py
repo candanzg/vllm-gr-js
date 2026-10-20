@@ -23,13 +23,20 @@ from vllm_gr.config.models import (
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
-def validate_beam_execution_mode(value: object) -> BeamExecutionMode:
+def validate_beam_execution_mode(value: object) -> BeamExecutionMode | None:
+    if value is None:
+        return None
+    if value == "legacy":
+        raise ValueError(
+            "Legacy GR beam_search() has been removed. Configure "
+            "beam.execution_mode='v1' and a canonical constraint artifact."
+        )
     if isinstance(value, str):
         try:
             return BeamExecutionMode(value)
         except ValueError:
             pass
-    raise ValueError("vllm-gr beam.execution_mode must be 'legacy' or 'v1'")
+    raise ValueError("vllm-gr beam.execution_mode must be 'v1' or unset")
 
 
 def validate_schema_version(value: object) -> int:

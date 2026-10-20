@@ -191,8 +191,8 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "--beam-execution-mode",
         choices=[mode.value for mode in BeamExecutionMode],
         default=None,
-        help="Beam interface used for this engine's lifetime: legacy (default) or v1. "
-        "The v1 interface requires async scheduling; legacy also supports native async scheduling.",
+        help="Enable GR Beam Search V1 for this engine (requires async scheduling). "
+        "Unset leaves GR Beam disabled; the legacy interface has been removed.",
     )
     model_group.add_argument(
         "--beam-max-width",

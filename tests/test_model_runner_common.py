@@ -730,7 +730,7 @@ def test_execute_wrapper_is_idempotent_and_restores_outer_context() -> None:
     class ExpectedError(RuntimeError):
         pass
 
-    scheduler_output = SimpleNamespace(beam_data={"beam": {"is_beam_decode": True}})
+    scheduler_output = SimpleNamespace(beam_data={})
     runner = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))
     should_raise = False
 
@@ -1040,45 +1040,12 @@ def _orig_execute_model_none(self: Any, scheduler_output: Any) -> None:
     return None
 
 
-def test_execute_wrapper_inlines_when_gated() -> None:
-    """M2 on: execute_model returns the ModelRunnerOutput (None short-circuit
-    upstream skips the second collective_rpc); beam context stays published
-    for the in-frame sampling."""
-    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
-    runner = _m2_runner()
-    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
-
-    out = wrapped(runner, scheduler_output)
-
-    assert out == "mro"
-    assert runner._sample_tokens_calls == [None]
-    assert runner.execute_model_state is None
-    assert runner._current_beam_info is not None
-    # The in-frame sampling consumed the context (decision attach etc.); it is
-    # NOT reset early — the next execute_model overwrites it at entry.
-    assert runner._current_scheduler_output is scheduler_output
-
-
-def test_execute_wrapper_falls_back_when_inline_fails() -> None:
-    """Inline failure returns None: the engine's fallback second RPC runs and
-    the two-RPC path is preserved verbatim."""
-    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
-    runner = _m2_runner(sample_tokens_side_effect=RuntimeError("boom"))
-    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
-
-    out = wrapped(runner, scheduler_output)
-
-    assert out is None
-    assert runner._sample_tokens_calls == [None]
-    assert runner.execute_model_state is None
-
-
 def test_execute_wrapper_does_not_inline_when_gate_closed() -> None:
     """Gate closed (async scheduling): execute_model returns None and never
     calls sample_tokens — the engine issues the second RPC itself."""
     wrapped = common.make_patched_execute_model(_orig_execute_model_none)
     runner = _m2_runner(use_async_scheduling=True)
-    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
+    scheduler_output = SimpleNamespace(beam_data={})
 
     out = wrapped(runner, scheduler_output)
 
@@ -1129,27 +1096,10 @@ def test_execute_wrapper_does_not_inline_non_none_output() -> None:
     """A runner that already returned a value (e.g. pooling) is untouched."""
     wrapped = common.make_patched_execute_model(lambda self, output: "direct")
     runner = _m2_runner()
-    scheduler_output = SimpleNamespace(beam_data={"b": {"is_beam_decode": True}})
+    scheduler_output = SimpleNamespace(beam_data={})
 
     assert wrapped(runner, scheduler_output) == "direct"
     assert runner._sample_tokens_calls == []
-
-
-def test_execute_wrapper_does_not_inline_mixed_beam_plus_structured() -> None:
-    wrapped = common.make_patched_execute_model(_orig_execute_model_none)
-    runner = _m2_runner()
-    scheduler_output = SimpleNamespace(
-        beam_data={"b": {"is_beam_decode": True}},
-        num_scheduled_tokens={"b": 1, "guided": 2},
-        pending_structured_output_tokens=True,
-        scheduled_new_reqs=[],
-    )
-
-    out = wrapped(runner, scheduler_output)
-
-    assert out is None
-    assert runner._sample_tokens_calls == []
-    assert runner.execute_model_state == "state"
 
 
 # ---------------------------------------------------------------------------
