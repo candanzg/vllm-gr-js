@@ -1,154 +1,77 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-"""Unit tests for EngineCore payload decoder selection."""
+"""Typed V1 payloads and native EngineCore messages share the socket decoder."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import msgspec
-from vllm.sampling_params import SamplingParams
+import pytest
 from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 
-from vllm_gr.v1.engine.codec import (
-    EngineCoreDecoders,
-    build_engine_core_decoders,
-    decode_engine_core_payload,
-)
-from vllm_gr.v1.engine.types import BeamRequestStepUpdate
+from tests.test_gr_async_scheduler import _batch_request
+from vllm_gr.v1.beam.batch_contracts import BeamBatchItem, BeamBatchRequest
+from vllm_gr.v1.engine.codec import build_engine_core_decoders, decode_engine_core_payload
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 register_engine_core_request_types()
-
-
-def _sampling_params() -> SamplingParams:
-    return SamplingParams(max_tokens=4, temperature=1.0)
-
-
-def _engine_core_request(request_id: str) -> EngineCoreRequest:
-    return EngineCoreRequest(
-        request_id=request_id,
-        prompt_token_ids=[1, 2],
-        mm_features=None,
-        sampling_params=_sampling_params(),
-        pooling_params=None,
-        arrival_time=1.0,
-        lora_request=None,
-        cache_salt=None,
-        data_parallel_rank=None,
-    )
-
-
-def _beam_step_update() -> BeamRequestStepUpdate:
-    return BeamRequestStepUpdate(
-        session_id="session-0",
-        parent_beam_ids=["parent-0", "parent-1"],
-        child_beam_ids=["child-0", "child-1"],
-        beam_tokens=[[11], [12]],
-        pruned_ids=[],
-        prefix_len=8,
-        beam_width=2,
-        sampling_params=_sampling_params(),
-    )
 
 
 def _frames(payload: Any) -> list[bytes]:
     return [msgspec.msgpack.encode(payload)]
 
 
-def test_build_engine_core_decoders_shares_oob_tensor_provider() -> None:
+def test_decoders_share_oob_tensor_provider() -> None:
     provider = object()
-
     decoders = build_engine_core_decoders(provider)
-
-    assert isinstance(decoders, EngineCoreDecoders)
     assert decoders.add_request.oob_tensor_provider is provider
-    assert decoders.add_batch.oob_tensor_provider is provider
-    assert decoders.beam_step_update.oob_tensor_provider is provider
-    assert decoders.submit_session.oob_tensor_provider is provider
+    assert decoders.submit_gr_session.oob_tensor_provider is provider
     assert decoders.generic.oob_tensor_provider is provider
 
 
-def test_decode_add_batch_payload() -> None:
-    decoders = build_engine_core_decoders(None)
-    requests = [
-        _engine_core_request("request-0"),
-        _engine_core_request("request-1"),
-    ]
-
+@pytest.mark.parametrize("batch_size", [1, 2, 4])  # type: ignore[misc]
+def test_decode_whole_gr_batch(batch_size: int) -> None:
+    source = _batch_request()
+    items = tuple(
+        BeamBatchItem(
+            item_index=index,
+            request=msgspec.structs.replace(source.items[0].request, request_id=f"session-{index}"),
+        )
+        for index in range(batch_size)
+    )
+    source = msgspec.structs.replace(source, items=items)
     decoded = decode_engine_core_payload(
-        decoders,
-        EngineCoreRequestType.ADD_BATCH,
-        _frames(requests),
+        build_engine_core_decoders(None), EngineCoreRequestType.SUBMIT_GR_SESSION, _frames(source)
+    )
+    assert isinstance(decoded, BeamBatchRequest)
+    assert decoded == source
+    assert all(isinstance(item.request, EngineCoreRequest) for item in decoded.items)
+
+
+def test_native_add_payload() -> None:
+    request = _batch_request().items[0].request
+    decoded = decode_engine_core_payload(
+        build_engine_core_decoders(None), EngineCoreRequestType.ADD, _frames(request)
+    )
+    assert isinstance(decoded, EngineCoreRequest)
+    assert decoded == request
+
+
+def test_native_abort_payload() -> None:
+    request_ids = ["request-0", "request-1"]
+    assert (
+        decode_engine_core_payload(
+            build_engine_core_decoders(None), EngineCoreRequestType.ABORT, _frames(request_ids)
+        )
+        == request_ids
     )
 
-    assert [request.request_id for request in decoded] == [
-        "request-0",
-        "request-1",
-    ]
-    assert all(isinstance(request, EngineCoreRequest) for request in decoded)
 
-
-def test_decode_beam_step_update_payload() -> None:
-    decoders = build_engine_core_decoders(None)
-
-    decoded = decode_engine_core_payload(
-        decoders,
-        EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE,
-        _frames(_beam_step_update()),
-    )
-
-    assert isinstance(decoded, BeamRequestStepUpdate)
-    assert decoded.session_id == "session-0"
-    assert decoded.beam_width == 2
-    assert decoded.constraint_step == 0  # default round-trips
-
-
-def test_decode_beam_step_update_preserves_constraint_step() -> None:
-    decoders = build_engine_core_decoders(None)
-    update = _beam_step_update()
-    update.constraint_step = 2
-
-    decoded = decode_engine_core_payload(
-        decoders,
-        EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE,
-        _frames(update),
-    )
-
-    assert decoded.constraint_step == 2
-
-
-def test_decode_submit_session_payload() -> None:
-    """SUBMIT_SESSION carries (prefill batch, session template) as one
-    tuple payload; the EngineCoreRequest entries need the same decoder
-    treatment as the ADD_BATCH list."""
-    from vllm_gr.v1.engine.wire import register_engine_core_request_types
-
-    register_engine_core_request_types()
-    decoders = build_engine_core_decoders(None)
-    requests = [
-        _engine_core_request("request-0"),
-        _engine_core_request("request-1"),
-    ]
-    template = _beam_step_update()
-    template.session_id = "request-0"
-    template.constraint_step = 1
-
-    decoded = decode_engine_core_payload(
-        decoders,
-        EngineCoreRequestType.SUBMIT_SESSION,
-        _frames((requests, template)),
-    )
-
-    assert isinstance(decoded, tuple)
-    assert len(decoded) == 2
-    decoded_requests, decoded_template = decoded
-    assert all(isinstance(request, EngineCoreRequest) for request in decoded_requests)
-    assert [request.request_id for request in decoded_requests] == [
-        "request-0",
-        "request-1",
-    ]
-    assert isinstance(decoded_template, BeamRequestStepUpdate)
-    assert decoded_template.session_id == "request-0"
-    assert decoded_template.constraint_step == 1
+def test_invalid_v1_payload_rejected_at_decode() -> None:
+    with pytest.raises(msgspec.ValidationError):
+        decode_engine_core_payload(
+            build_engine_core_decoders(None),
+            EngineCoreRequestType.SUBMIT_GR_SESSION,
+            _frames({"not": "a batch"}),
+        )

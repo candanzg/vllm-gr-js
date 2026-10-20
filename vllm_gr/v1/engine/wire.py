@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from vllm.v1.engine import EngineCoreRequestType
 
+
+# Retired legacy protocol values. Reserve these bytes; never register or reuse.
 ADD_BATCH_WIRE_VALUE = b"\x06"
 BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE = b"\x07"
 # Retired standalone template message: reserve its byte; never renumber/reuse.
@@ -29,7 +31,7 @@ def _add_enum_member(name: str, value: bytes) -> None:
     - Is tested to ensure correctness
 
     Args:
-        name: The name of the new enum member (e.g., "ADD_BATCH")
+        name: The name of the new enum member (e.g., "SUBMIT_GR_SESSION")
         value: The byte value for the enum member.
 
     Raises:
@@ -86,13 +88,4 @@ def _add_enum_member(name: str, value: bytes) -> None:
 
 def register_engine_core_request_types() -> None:
     """Register the vLLM-GR EngineCore request types in the current process."""
-    _add_enum_member("ADD_BATCH", ADD_BATCH_WIRE_VALUE)
-    _add_enum_member(
-        "BEAM_REQUEST_STEP_UPDATE",
-        BEAM_REQUEST_STEP_UPDATE_WIRE_VALUE,
-    )
-    _add_enum_member(
-        "SUBMIT_SESSION",
-        SUBMIT_SESSION_WIRE_VALUE,
-    )
     _add_enum_member("SUBMIT_GR_SESSION", SUBMIT_GR_SESSION_WIRE_VALUE)

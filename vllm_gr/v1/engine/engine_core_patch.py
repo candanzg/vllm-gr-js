@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Monkey-patches for EngineCore / EngineCoreProc to support
-ADD_BATCH and BEAM_REQUEST_STEP_UPDATE."""
+"""V1 GR admission, scheduling, retirement and EngineCore integration."""
 
 from __future__ import annotations
 
@@ -11,14 +10,12 @@ from functools import wraps
 
 from vllm.logger import init_logger
 
-from vllm_gr.v1.engine.scheduler_metadata import build_beam_request_metadata
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 logger = init_logger(__name__)
 
-_BEAM_STATE_INIT_MARKER = "_vllm_gr_initializes_beam_state"
 _SCHEDULER_PATCH_MARKER = "_vllm_gr_beam_scheduler_patch"
-_ENGINE_STEP_PATCH_MARKER = "_vllm_gr_beam_self_advance_step"
+_ENGINE_STEP_PATCH_MARKER = "_vllm_gr_progress_step"
 _CLIENT_REQUEST_PATCH_MARKER = "_vllm_gr_gr_input_dispatch"
 _PIS_PATCH_MARKER = "_vllm_gr_process_input_sockets"
 _GR_FINALIZING_IDS_ATTR = "_gr_v1_finalizing_request_ids"
@@ -30,69 +27,17 @@ _GR_SCHEDULE_PATCH_DEPTH_ATTR = "_vllm_gr_schedule_patch_depth"
 # is installed.  Parity tests inspect this object against the pinned vLLM.
 UPSTREAM_PROCESS_INPUT_SOCKETS = None
 
-# ---------------------------------------------------------------------------
-# EngineCore.__init__ wrapper
-# ---------------------------------------------------------------------------
-
-
-def make_patched_engine_core_init(original_init):
-    """Wrap EngineCore.__init__ to add beam state."""
-
-    if getattr(original_init, _BEAM_STATE_INIT_MARKER, False):
-        return original_init
-
-    @wraps(original_init)
-    def patched_init(self, *args, **kwargs):
-        # Initialize before calling upstream. EngineCoreProc starts its input
-        # thread from __init__, so beam state must exist throughout startup.
-        from vllm_gr.v1.engine.core import _ensure_beam_state
-
-        _ensure_beam_state(self)
-        original_init(self, *args, **kwargs)
-
-    setattr(patched_init, _BEAM_STATE_INIT_MARKER, True)
-
-    return patched_init
-
-
-# ---------------------------------------------------------------------------
-# EngineCoreProc._process_engine_step wrapper (engine-driven chain hook)
-# ---------------------------------------------------------------------------
-
 
 def make_patched_process_engine_step(original_step):
-    """Wrap ``_process_engine_step`` to drive EngineCore engine-driven chaining.
-
-    The wrapper runs between ``step_fn()`` producing the step's
-    ``EngineCoreOutputs`` and those outputs being forwarded to the output
-    queue: the scheduler patch has already injected the worker's beam
-    decision into ``kv_transfer_params['beam_search_result']``, and
-    ``_beam_self_advance`` turns a non-terminal decision into the next
-    ``BeamRequestStepUpdate`` applied in-process (no frontend RPC).  The
-    chained step's ADD lands in ``input_queue`` before this iteration ends,
-    so the busy loop continues straight into the next decode step.
-
-    ``_beam_self_advance`` itself is a no-op when ``beam_engine_driven``
-    is off, so the wrapper is safe for every engine.
-    """
+    """Preserve V1 progress-aware backoff while forwarding native outputs."""
 
     if getattr(original_step, _ENGINE_STEP_PATCH_MARKER, False):
         return original_step
 
     @wraps(original_step)
     def patched_process_engine_step(self):
-        from vllm_gr.v1.engine.core import _beam_self_advance
-
         progress_before = getattr(self.scheduler, "_gr_progress", 0)
         outputs, model_executed = self.step_fn()
-        if outputs:
-            try:
-                _beam_self_advance(self, outputs)
-            except Exception:
-                logger.exception(
-                    "vllm-gr: beam self-advance failed; falling back to the "
-                    "frontend step-update loop for this step"
-                )
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         self.post_step(model_executed)
@@ -114,10 +59,10 @@ def make_patched_process_engine_step(original_step):
 def make_patched_handle_client_request(original):
     """Dispatch GR wire types and isolate expected ADD admission rejections.
 
-    Upstream logs unrecognized types.  The socket adapter normally consumes
-    GR messages on the input thread; this wrap also handles their fallback
-    dispatch. Native ADD is consumed here on the core thread, where Scheduler
-    admission failures can be returned to the requesting client.
+    The socket adapter queues each complete GR batch without admitting it.
+    This wrapper admits the batch on the core thread, where Scheduler
+    failures can be returned to the requesting client. Native ADD keeps
+    upstream shutdown and DP handling.
     """
     if getattr(original, _CLIENT_REQUEST_PATCH_MARKER, False):
         return original
@@ -183,17 +128,11 @@ def make_patched_handle_client_request(original):
 
 
 def apply_engine_core_request_patches() -> None:
-    """Install EngineCore request dispatch and beam-state support."""
+    """Install V1 session admission and native request dispatch."""
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
-        _apply_beam_step,
-        _beam_self_advance,
-        _cache_beam_request,
-        _handle_beam_request_step_update,
-        _handle_beam_session_template,
         _handle_submit_gr_session,
-        _handle_submit_session,
         is_gr_session_retired,
         process_input_sockets,
     )
@@ -202,27 +141,9 @@ def apply_engine_core_request_patches() -> None:
 
     register_engine_core_request_types()
 
-    # Wrap both constructors. Patching EngineCoreProc explicitly protects
-    # against changes in upstream inheritance and plugin loading order.
-    EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
-    EngineCoreProc.__init__ = make_patched_engine_core_init(EngineCoreProc.__init__)
-
-    # Bind request handlers explicitly on both classes.
-    EngineCore._cache_beam_request = _cache_beam_request
-    EngineCore._handle_beam_request_step_update = _handle_beam_request_step_update
-    EngineCore._handle_beam_session_template = _handle_beam_session_template
-    EngineCore._handle_submit_session = _handle_submit_session
     EngineCore.is_gr_session_retired = is_gr_session_retired
     EngineCore._handle_submit_gr_session = _handle_submit_gr_session
-    EngineCore._apply_beam_step = _apply_beam_step
-    EngineCore._beam_self_advance = _beam_self_advance
-    EngineCoreProc._cache_beam_request = _cache_beam_request
-    EngineCoreProc._handle_beam_request_step_update = _handle_beam_request_step_update
-    EngineCoreProc._handle_beam_session_template = _handle_beam_session_template
-    EngineCoreProc._handle_submit_session = _handle_submit_session
     EngineCoreProc._handle_submit_gr_session = _handle_submit_gr_session
-    EngineCoreProc._apply_beam_step = _apply_beam_step
-    EngineCoreProc._beam_self_advance = _beam_self_advance
 
     # Narrow GR dispatch on the busy-loop request handler so in-process
     # EngineCore and any GR type that misses the socket adapter still land.
@@ -241,10 +162,7 @@ def apply_engine_core_request_patches() -> None:
     EngineCoreProc.process_input_sockets = process_input_sockets
     setattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, True)
 
-    # Self-advance hook: _process_engine_step feeds each step's outputs to
-    # _beam_self_advance BEFORE they reach the output queue, so the chained
-    # BeamRequestStepUpdate (built from the worker decision) can enqueue the
-    # next beam-decode ADD in the same busy-loop iteration.
+    # Preserve V1 progress-aware backoff without legacy step chaining.
     EngineCoreProc._process_engine_step = make_patched_process_engine_step(
         EngineCoreProc._process_engine_step
     )
@@ -366,35 +284,6 @@ def run_engine_core(
         )
     finally:
         _run_engine_core_active = False
-
-
-def make_patch_get_computed_blocks(
-    original_get_computed_blocks, create_kv_cache_blocks, block_size
-):
-    """Helper to create patched get_computed_blocks function for beam decode requests."""
-
-    def patch_get_computed_blocks(req):
-        bn, tn = original_get_computed_blocks(req)
-        if req and getattr(req, "is_beam_decode", False):
-            pl = getattr(req, "prefix_len", 0)
-            if tn > pl:
-                # In incremental decode, the FULL prefix (including the trailing
-                # partial block) is treated as computed: the paged cache holds
-                # all prefix KV written during prefill, and prefix attention
-                # reads it with seqused_k = prefix_len (exact), so FA ignores
-                # the remainder-block padding. When the remainder block was
-                # padded at prefill time (see patch_cache_blocks), the cache
-                # hit reaches the next block boundary (tn = ceil(pl/16)*16);
-                # we truncate the computed blocks to only the prefix blocks
-                # and return pl (exact) so the scheduler schedules only the
-                # new beam tokens instead of re-scheduling the trailing
-                # partial-block tokens every step.
-                num_blocks = (pl + block_size - 1) // block_size
-                sliced_blocks = tuple(group[:num_blocks] for group in bn.blocks)
-                return create_kv_cache_blocks(sliced_blocks), pl
-        return bn, tn
-
-    return patch_get_computed_blocks
 
 
 def _expand_gr_abort_request_ids(scheduler, request_ids, finished_status):
@@ -594,77 +483,20 @@ def apply_scheduler_patch():
         if schedule_patch_depth:
             return _original_schedule(self)
 
-        # The two cache-manager wrappers depend only on constants resolved at
-        # patch-install time (original bound methods + block_size), so they
-        # are built ONCE and stashed on the scheduler instance; rebuilding
-        # the closures on every schedule call showed up in prefill-path
-        # profiling (~60us/request of pure closure + attribute churn).
-        cached_patches = getattr(self, "_beam_schedule_patches", None)
-        if (
-            cached_patches is None
-            # Guard against a swapped/undone cache manager (e.g. engine
-            # reset re-installs fresh managers): re-capture the originals.
-            or cached_patches[0] is not self.kv_cache_manager.get_computed_blocks
-            or cached_patches[1] is not self.kv_cache_manager.coordinator.cache_blocks
-        ):
-            _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
-            _original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
-            block_size = self.cache_config.block_size
+        # Cache only real prompt KV for V1: generated tokens are device-owned
+        # placeholders. Ordinary requests retain native cache semantics.
+        original_cache_blocks = self.kv_cache_manager.coordinator.cache_blocks
+        cached_patch = getattr(self, "_gr_cache_blocks_patch", None)
+        if cached_patch is None or cached_patch[0] is not original_cache_blocks:
 
-            patch_get_computed_blocks = make_patch_get_computed_blocks(
-                _original_get_computed_blocks,
-                self.kv_cache_manager.create_kv_cache_blocks,
-                block_size,
-            )
-
-            def patch_cache_blocks(request, num_computed_tokens):
+            def cache_prompt_blocks(request, num_computed_tokens):
                 if getattr(request, "gr_batch_request", None) is not None:
-                    # Only complete prompt blocks are cacheable. Placeholder
-                    # hashes must never advertise generated Beam KV.
-                    return _original_cache_blocks(
-                        request, min(num_computed_tokens, request.num_prompt_tokens)
-                    )
-                # Extend the num_computed_tokens passed to cache_blocks to the next
-                # block boundary on the FINAL prefill chunk, so the trailing partial
-                # block (whose hash exists thanks to the padding in _cache_beam_request)
-                # is actually cached. Without this, vLLM would only cache full blocks
-                # and the beam-decode request could not prefix-cache-hit the remainder.
-                if (
-                    request
-                    and not getattr(request, "is_beam_decode", False)
-                    and hasattr(request, "block_hashes")
-                    and request.block_hashes
-                ):
-                    num_prompt_tokens = getattr(request, "num_prompt_tokens", request.num_tokens)
-                    if num_computed_tokens >= num_prompt_tokens:
-                        chunk_padded_target = (
-                            (num_computed_tokens + block_size - 1) // block_size * block_size
-                        )
-                        num_hashes = len(request.block_hashes)
-                        padded_target = min(chunk_padded_target, num_hashes * block_size)
-                        if (
-                            num_computed_tokens < padded_target
-                            and num_computed_tokens % block_size != 0
-                        ):
-                            num_computed_tokens = padded_target
-                return _original_cache_blocks(request, num_computed_tokens)
+                    num_computed_tokens = min(num_computed_tokens, request.num_prompt_tokens)
+                return original_cache_blocks(request, num_computed_tokens)
 
-            cached_patches = (
-                _original_get_computed_blocks,
-                _original_cache_blocks,
-                patch_get_computed_blocks,
-                patch_cache_blocks,
-            )
-            self._beam_schedule_patches = cached_patches
-
-        (
-            _original_get_computed_blocks,
-            _original_cache_blocks,
-            patch_get_computed_blocks,
-            patch_cache_blocks,
-        ) = cached_patches
-        self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
-        self.kv_cache_manager.coordinator.cache_blocks = patch_cache_blocks
+            cached_patch = (original_cache_blocks, cache_prompt_blocks)
+            self._gr_cache_blocks_patch = cached_patch
+        self.kv_cache_manager.coordinator.cache_blocks = cached_patch[1]
         from vllm_gr.v1.engine.gr_async_scheduler import (
             attach_gr_retirement,
             gr_admission,
@@ -675,32 +507,6 @@ def apply_scheduler_patch():
             with gr_admission(self):
                 output = _original_schedule(self)
 
-            # Propagate beam request attributes from Request objects to SchedulerOutput
-            beam_data = {}
-            if hasattr(output, "num_scheduled_tokens"):
-                for req_id, num_scheduled_tokens in output.num_scheduled_tokens.items():
-                    req = self.requests.get(req_id)
-                    if req:
-                        metadata = build_beam_request_metadata(req, num_scheduled_tokens)
-                        if metadata is not None:
-                            beam_data[req_id] = metadata
-
-            # Propagate the authoritative beam-session teardown signal.
-            #
-            # _handle_beam_request_step_update writes session_ids to
-            # self._beam_finished_session_ids when it receives a
-            # BeamRequestStepUpdate with beam_width=0 — the beam search
-            # loop's explicit "generation finished" message.  This is
-            # distinct from finished_req_ids, which fires on every decode
-            # step (each step's Request reaches num_computed_tokens >=
-            # num_tokens and is freed).  Using finished_req_ids would
-            # destroy and recreate the session every step, losing the
-            # incremental KV pool.
-            beam_finished_session_ids = list(getattr(self, "_beam_finished_session_ids", []))
-            self._beam_finished_session_ids = []  # consume after reading
-
-            output.beam_data = beam_data
-            output.beam_finished_session_ids = beam_finished_session_ids
             gr_stages = {}
             sessions = getattr(self, "_gr_v1_sessions", {})
             request_sessions = getattr(self, "_gr_v1_request_sessions", {})
@@ -721,8 +527,7 @@ def apply_scheduler_patch():
             return output
         finally:
             try:
-                self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
-                self.kv_cache_manager.coordinator.cache_blocks = _original_cache_blocks
+                self.kv_cache_manager.coordinator.cache_blocks = original_cache_blocks
             finally:
                 if schedule_patch_depth:
                     setattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, schedule_patch_depth)
@@ -734,9 +539,7 @@ def apply_scheduler_patch():
     Scheduler._patched_for_beam_requests = True
     logger.debug("Scheduler.schedule patched for beam-requests propagation.")
 
-    # Also wrap update_from_output so the worker's beam decision
-    # (ModelRunnerOutput.beam_search_result) reaches the frontend via
-    # EngineCoreOutput.kv_transfer_params (asynchronous result flow).
+    # Publish the V1 terminal result after every physical dispatch drains.
     _patch_scheduler_update_from_output(Scheduler)
 
 
@@ -939,15 +742,7 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
 
 
 def _patch_scheduler_update_from_output(scheduler_cls) -> None:
-    """Carry ``ModelRunnerOutput.beam_search_result`` through kv_transfer_params.
-
-    The NPU worker attaches the beam decision dict to the ModelRunnerOutput
-    it returns (see ``_attach_beam_search_result`` in model_runner_common).
-    This wrapper reads it and injects it into the first EngineCoreOutput's
-    ``kv_transfer_params`` so the frontend can consume it from the streamed
-    RequestOutput without an extra round trip. A caller-formed batch has one
-    external session owner, so attaching to that owner remains unambiguous.
-    """
+    """Consume V1 stage/retirement receipts and publish the terminal batch result."""
     marker = "_vllm_gr_update_from_output_patch"
     if getattr(scheduler_cls.update_from_output, marker, False):
         return
@@ -1025,55 +820,6 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
         for session in updated_sessions:
             _finalize_ready_gr_session(self, result, session)
 
-        beam_search_result = getattr(model_runner_output, "beam_search_result", None)
-        if beam_search_result is None:
-            return result
-
-        # Attach to exactly one EngineCoreOutput.  Prefer the output whose
-        # request_id owns the decision (worker decisions carry session_id —
-        # review P5: a mixed batch of session A's decode and session B's
-        # constrained prefill must never cross-attach); fall back to the first
-        # beam-session output for legacy payloads without the marker.  The
-        # dict payload carries host tensors; the IPC envelope only serialises
-        # the kv_transfer_params mapping, so host tensors are safe here (they
-        # were D2H'd by the worker).
-        beam_data = getattr(scheduler_output, "beam_data", {})
-        beam_ids = {
-            req_id
-            for req_id, mdata in beam_data.items()
-            if mdata.get("is_beam_decode", False) or mdata.get("is_constraint_prefill", False)
-        }
-        decision_owner = (
-            beam_search_result.get("session_id") if isinstance(beam_search_result, dict) else None
-        )
-
-        def _attach(target_out) -> bool:
-            kv_params = dict(target_out.kv_transfer_params or {})
-            kv_params["beam_search_result"] = beam_search_result
-            target_out.kv_transfer_params = kv_params
-            return True
-
-        attached = False
-        fallback = None
-        for ec_outputs in result.values():
-            for out in getattr(ec_outputs, "outputs", []):
-                if out.request_id not in beam_ids:
-                    continue
-                if decision_owner is not None and out.request_id == decision_owner:
-                    attached = _attach(out)
-                    break
-                if fallback is None:
-                    fallback = out
-            if attached:
-                break
-        if not attached and fallback is not None:
-            _attach(fallback)
-        if not attached:
-            logger.debug(
-                "vllm-gr: beam_search_result present but no matching EngineCoreOutput "
-                "in this step; the decision was dropped (num_beam_ids=%d)",
-                len(beam_ids),
-            )
         return result
 
     setattr(patched_update_from_output, marker, True)
