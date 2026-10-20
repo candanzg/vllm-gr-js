@@ -67,7 +67,7 @@ async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
         enable_log_requests=False,
         max_logprobs=2 * beam_width,
         gpu_memory_utilization=gpu_memory_utilization,
-        vllm_gr_config=config,
+        additional_config={"vllm_gr": config},
     )
 
     async with build_async_engine_client_from_engine_args(engine_args) as engine_client:

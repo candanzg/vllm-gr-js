@@ -247,9 +247,8 @@ def make_patched_determine_batch_execution_and_padding_gpu(_orig_determine):
             if beam_keys:
                 # Beam decode FULL mode requires an active BeamSearchSession
                 # — the metadata builder and Triton kernels read slot/pool/
-                # suffix-buf pointers from it.  If _get_or_create_beam_session
-                # failed (e.g. config unavailable), beam_info has no session
-                # and the FULL path would crash on None access.
+                # suffix-buf pointers from it. Missing session state must not
+                # allow the FULL path to dereference absent pool bindings.
                 if beam_info.get("beam_session") is None:
                     if result[0] == CUDAGraphMode.FULL:
                         result = (

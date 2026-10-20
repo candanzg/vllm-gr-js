@@ -37,10 +37,9 @@ class SessionSlotState:
     # It is derived in ``_maybe_run_worker_beam_decision`` from the return
     # channel's host copy of ``out_token_index`` (its request-0 row IS the
     # request-local mapping), so no extra device→host sync is spent on it.
-    # The next step's ``_get_or_create_beam_session`` consumes it: an exact
-    # match against the frontend-returned ``parent_beam_ids`` skips the
-    # duplicate reorder; a mismatch triggers the composite reorder instead.
-    # ``None`` means no same-step reorder happened (frontend-driven path).
+    # Retained for the NPU compatibility sampler's host result bookkeeping.
+    # V1 stage execution owns KV progression and does not round-trip this
+    # mapping through the frontend.
     kv_reorder: list[int] | None = None
 
 
