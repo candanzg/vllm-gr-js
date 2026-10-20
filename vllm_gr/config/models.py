@@ -111,7 +111,6 @@ class NPUDecodeExecution(str, Enum):
 class BeamExecutionMode(str, Enum):
     """Engine-lifetime Beam interface, independent of native async scheduling."""
 
-    LEGACY = "legacy"
     V1 = "v1"
 
 
@@ -159,7 +158,8 @@ class GRConfig:
     # the step's outputs.  Only valid with beam_worker_decision=True (the
     # chain consumes worker beam decisions).
     beam_engine_driven: bool | None = None
-    beam_execution_mode: BeamExecutionMode = BeamExecutionMode.LEGACY
+    # Unset keeps native inference enabled without selecting GR Beam.
+    beam_execution_mode: BeamExecutionMode | None = None
     # Exact logical B captured by the NPU Beam graph adapter. This is a graph
     # signature dimension, not a scheduler capacity: other B values do not use
     # the Beam FULL graph (native PIECEWISE/NONE dispatch remains available).
@@ -271,7 +271,7 @@ class GRConfig:
             or (self.constraint_table is not None and self.constraint_table.enabled)
             or self.beam_worker_decision is not None
             or self.beam_engine_driven is not None
-            or self.beam_execution_mode is not BeamExecutionMode.LEGACY
+            or self.beam_execution_mode is not None
         )
 
     @classmethod

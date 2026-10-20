@@ -2027,8 +2027,7 @@ def make_patched_execute_model(_orig_execute_model):
             GR_STAGE_OUTPUT_ATTR,
         )
 
-        # Only the V1 entry supports both Beam protocols. Shared stage and
-        # retirement code receives an already admitted persistent frame.
+        # Shared stage and retirement code receives an admitted V1 frame.
         if getattr(scheduler_output, GR_RETIRE_OUTPUT_ATTR, None) is not None or getattr(
             scheduler_output, GR_STAGE_OUTPUT_ATTR, None
         ):
@@ -2042,7 +2041,9 @@ def make_patched_execute_model(_orig_execute_model):
         if stage is not _NOT_A_STAGE_FRAME:
             return stage
         if getattr(scheduler_output, "beam_data", {}):
-            require_beam_execution_mode(self.vllm_config, BeamExecutionMode.LEGACY)
+            raise ValueError(
+                "Legacy Beam frames have been removed; use beam.execution_mode='v1'."
+            )
         gr_stage = getattr(self, "_gr_gpu_stage_runner", None)
         if gr_stage is not None and not gr_stage.closed:
             if getattr(scheduler_output, "beam_data", {}):

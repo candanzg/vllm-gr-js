@@ -11,7 +11,6 @@ from vllm_gr.config.models import (
     _BEAM_MAX_DECODE_STEPS_DEFAULT,
     CONSTRAINT_TABLE_FORMAT,
     GR_CONFIG_SCHEMA_VERSION,
-    BeamExecutionMode,
     ConstraintBackend,
     ConstraintTableConfig,
     GRConfig,
@@ -199,7 +198,7 @@ def gr_config_from_mapping(
         ),
         beam_worker_decision=validate_beam_worker_decision(beam_raw.get("worker_decision")),
         beam_engine_driven=validate_beam_engine_driven(beam_raw.get("engine_driven")),
-        beam_execution_mode=validate_beam_execution_mode(beam_raw.get("execution_mode", "legacy")),
+        beam_execution_mode=validate_beam_execution_mode(beam_raw.get("execution_mode")),
         schema_version=validate_schema_version(
             mapping.get("schema_version", GR_CONFIG_SCHEMA_VERSION)
         ),
@@ -252,7 +251,7 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         beam["worker_decision"] = config.beam_worker_decision
     if config.beam_engine_driven is not None:
         beam["engine_driven"] = config.beam_engine_driven
-    if config.beam_execution_mode is not BeamExecutionMode.LEGACY:
+    if config.beam_execution_mode is not None:
         beam["execution_mode"] = config.beam_execution_mode.value
 
     return {
@@ -365,7 +364,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
             additional_config.get(BEAM_ENGINE_DRIVEN_KEY)
         ),
         beam_execution_mode=validate_beam_execution_mode(
-            additional_config.get(BEAM_EXECUTION_MODE_KEY, "legacy")
+            additional_config.get(BEAM_EXECUTION_MODE_KEY)
         ),
     )
 
@@ -469,7 +468,7 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         # Both explicit values round-trip (an opt-out must survive a write).
         additional_config[BEAM_ENGINE_DRIVEN_KEY] = beam_engine_driven
 
-    if gr_config.beam_execution_mode is BeamExecutionMode.LEGACY:
+    if gr_config.beam_execution_mode is None:
         additional_config.pop(BEAM_EXECUTION_MODE_KEY, None)
     else:
         additional_config[BEAM_EXECUTION_MODE_KEY] = gr_config.beam_execution_mode.value
