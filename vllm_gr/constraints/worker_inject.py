@@ -100,7 +100,7 @@ def set_gr_constraint_resources(
     payload: dict,
     manager: ConstraintResourceManager | None = None,
 ) -> dict:
-    """Worker RPC method: idempotently cache constraint tables by digest.
+    """Worker RPC method: idempotently cache and preload constraint tables.
 
     Args:
         payload: the :func:`~vllm_gr.constraints.compiler.to_wire` wire dict
@@ -117,14 +117,13 @@ def set_gr_constraint_resources(
     Raises:
         ValueError: if the payload is malformed / digest mismatch, or a
             different digest is already cached (no silent swap).
+        RuntimeError: if the active runner lacks the required constraint hooks.
 
     Note:
-        This setter only caches the CPU-side resource (rebuilt via
+        This setter caches the CPU-side resource (rebuilt via
         :func:`~vllm_gr.constraints.compiler.from_wire`, which restores the
-        read-only arrays and verifies the digest).  It does *not* move tables
-        to a device; the platform provider loads them via
-        ``ConstrainedTopKExecution.load_tables`` (e.g. lazily on the first
-        ``run``), reading the resource from the manager by digest.
+        read-only arrays and verifies the digest), validates the active runner's
+        hooks, and preloads tables when its device is available.
     """
     from vllm_gr.constraints.compiler import from_wire
 
@@ -132,10 +131,10 @@ def set_gr_constraint_resources(
     target = manager if manager is not None else get_worker_manager()
     already = target.current_digest == resource.digest
     target.ensure(resource)
-    # Fail at startup when the active runner cannot run the raw-logits hook
-    # (e.g. a vllm-ascend build without ``_sample``): a Constraint Table
-    # request must never silently sample unconstrained.  Inert when ``self``
-    # has no model_runner yet (unit tests / mocked workers).
+    # Fail at startup when the active runner lacks a supported constraint hook
+    # combination: a Constraint Table request must never silently sample
+    # unconstrained.  Inert when ``self`` has no model_runner yet
+    # (unit tests / mocked workers).
     _verify_runner_sample_hook(self)
     # Preload the tables onto the device now that the resource is registered
     # (the runner is built when injection happens after init_device).  This is
@@ -153,10 +152,10 @@ def set_gr_constraint_resources(
 def _verify_runner_sample_hook(worker: Any) -> None:
     """Raise when the worker's runner lacks the Constraint Table sample hook.
 
-    Accepts the V1 ``_sample`` hook or the V2 persistent-stage execute /
-    sample_tokens pair. ModelRunner V2 deliberately leaves native ``sample``
-    untouched because its only supported Beam path is beam_search_v1, whose
-    stage runner samples directly from the canonical Constraint Backend.
+    Accepts the retained V1 ``_sample`` hook or a V1/V2 persistent-stage
+    execute_model / sample_tokens pair. CUDA ModelRunner V1 and V2 leave
+    native sampling untouched: their beam_search_v1 stage runner owns
+    constrained sampling directly.
 
     Only meaningful once ``init_device`` has built ``model_runner`` (the driver
     injects after that point); skipped otherwise so unit tests and mocked
@@ -168,6 +167,7 @@ def _verify_runner_sample_hook(worker: Any) -> None:
     from vllm_gr.v1.worker.model_runner_common import (
         _WORKER_EXECUTE_PATCH_MARKER,
         _WORKER_SAMPLE_PATCH_MARKER,
+        _WORKER_SAMPLE_TOKENS_PATCH_MARKER,
         _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
     )
 
@@ -175,19 +175,19 @@ def _verify_runner_sample_hook(worker: Any) -> None:
     v1_sample = getattr(runner_cls, "_sample", None)
     if v1_sample is not None and getattr(v1_sample, _WORKER_SAMPLE_PATCH_MARKER, False):
         return
+    sample_tokens = getattr(runner_cls, "sample_tokens", None)
     if getattr(
         getattr(runner_cls, "execute_model", None),
         _WORKER_EXECUTE_PATCH_MARKER,
         False,
-    ) and getattr(
-        getattr(runner_cls, "sample_tokens", None),
-        _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER,
-        False,
+    ) and (
+        getattr(sample_tokens, _WORKER_SAMPLE_TOKENS_PATCH_MARKER, False)
+        or getattr(sample_tokens, _WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False)
     ):
         return
     raise RuntimeError(
         "constraint tables require either the vllm-gr V1 raw-logits hook or "
-        "the V2 persistent-stage execute/sample_tokens hooks on active runner "
+        "the V1/V2 persistent-stage execute/sample_tokens hooks on active runner "
         f"{type(runner).__name__}. Constraint Tables cannot start on this "
         "worker; refusing to degrade to unconstrained sampling."
     )

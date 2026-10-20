@@ -211,9 +211,9 @@ def prepare_constraint_table(
 ) -> ConstraintTableResource:
     """Activate the platform backend, validate, and compile the resource.
 
-    Does not inject into workers; used by the OpenAI serving path where the
-    broadcast is deferred to the first ``beam_search`` (see
-    :func:`~vllm_gr.entrypoints.openai.serving_models.OpenAIServingModels._ensure_constraint_tables_injected`).
+    Does not inject into workers. Callers of the retained resource-injection
+    compatibility API must broadcast the returned resource separately.
+    Canonical V1 artifacts are loaded independently by each worker.
 
     ``catalog_path`` may be ``None`` — the tables are then built directly from
     the tokenizer's ``<s_a_*>`` / ``<s_b_*>`` / ``<s_c_*>`` groups (the default

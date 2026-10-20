@@ -706,17 +706,6 @@ def create_engine_config(self, usage_context=None, headless=False):
     return config
 
 
-def engine_args_accepts_gr_values() -> bool:
-    """Return whether :func:`patch_add_cli_args` is mounted.
-
-    The offline ``GRLLM`` Python API only threads ``catalog_path`` /
-    ``constraint_backend`` through ``LLM.__init__`` kwargs when this patch is
-    active; without it, ``EngineArgs.__init__`` would reject the extra keyword
-    arguments.
-    """
-    return EngineArgs.__init__ is _init_engine_args
-
-
 def patch_add_cli_args() -> None:
     EngineArgs.add_cli_args = add_cli_args
     EngineArgs.create_engine_config = create_engine_config

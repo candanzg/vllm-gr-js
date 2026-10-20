@@ -175,6 +175,83 @@ def test_set_gr_constraint_resources_accepts_v2_stage_hooks(
     assert status["cached"] is True
 
 
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("patch_execute", "patch_sample_tokens"),
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_inject_constraint_resources_requires_complete_cuda_v1_stage_hooks(
+    tokenizer: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_execute: bool,
+    patch_sample_tokens: bool,
+) -> None:
+    """Real V1 wrappers permit injection/preload without patching native _sample."""
+    from vllm_gr.constraints import worker_inject
+    from vllm_gr.v1.worker.gpu_model_runner_patch import make_patched_sample_tokens_gpu
+    from vllm_gr.v1.worker.model_runner_common import (
+        _WORKER_SAMPLE_PATCH_MARKER,
+        make_patched_execute_model,
+    )
+
+    class FakeRunner:
+        device = torch.device("cuda")
+        _gr_constraint_execution: Any = None
+
+        def _sample(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def execute_model(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def sample_tokens(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    native_sample = FakeRunner._sample
+    if patch_execute:
+        setattr(FakeRunner, "execute_model", make_patched_execute_model(FakeRunner.execute_model))
+    if patch_sample_tokens:
+        setattr(
+            FakeRunner, "sample_tokens", make_patched_sample_tokens_gpu(FakeRunner.sample_tokens)
+        )
+
+    class FakeWorker:
+        model_runner = FakeRunner()
+
+    install_worker_resource_hook(FakeWorker)
+    worker = FakeWorker()
+
+    def collective_rpc(method: str, *, args: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+        return [getattr(worker, method)(*args)]
+
+    engine = SimpleNamespace(engine_core=SimpleNamespace(collective_rpc=collective_rpc))
+    resource = _build_resource(tokenizer)
+    manager = ConstraintResourceManager()
+    monkeypatch.setattr(worker_inject, "_WORKER_MANAGER", manager)
+    adapter = MagicMock()
+    create_adapter = MagicMock(return_value=adapter)
+    monkeypatch.setattr("vllm_gr.constraints.startup.create_constraint_execution", create_adapter)
+
+    if not (patch_execute and patch_sample_tokens):
+        with pytest.raises(RuntimeError, match="Constraint Tables cannot start"):
+            inject_constraint_resources(engine, resource)
+        create_adapter.assert_not_called()
+        assert worker.model_runner._gr_constraint_execution is None
+        return
+
+    assert inject_constraint_resources(engine, resource) == [
+        {"digest": resource.digest, "cached": True}
+    ]
+    assert inject_constraint_resources(engine, resource) == [
+        {"digest": resource.digest, "cached": False}
+    ]
+    assert manager.current_digest == resource.digest
+    create_adapter.assert_called_once_with(device=FakeRunner.device)
+    adapter.load_tables.assert_called_once_with(manager.require(resource.digest))
+    assert worker.model_runner._gr_constraint_execution is adapter
+    assert FakeRunner._sample is native_sample
+    assert not getattr(FakeRunner._sample, _WORKER_SAMPLE_PATCH_MARKER, False)
+
+
 def test_install_worker_resource_hook_idempotent(tokenizer: MagicMock) -> None:
     class FakeWorker:
         pass
