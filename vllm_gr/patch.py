@@ -204,11 +204,7 @@ def _validate_request_types_patch() -> str | None:
     from vllm.v1.engine import EngineCoreRequestType
 
     valid = (
-        getattr(getattr(EngineCoreRequestType, "ADD_BATCH", None), "value", None) == b"\x06"
-        and getattr(getattr(EngineCoreRequestType, "BEAM_REQUEST_STEP_UPDATE", None), "value", None)
-        == b"\x07"
-        and getattr(getattr(EngineCoreRequestType, "SUBMIT_SESSION", None), "value", None)
-        == b"\x09"
+        getattr(getattr(EngineCoreRequestType, "SUBMIT_GR_SESSION", None), "value", None) == b"\x0a"
     )
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
@@ -216,54 +212,36 @@ def _validate_request_types_patch() -> str | None:
 def _validate_engine_clients_patch() -> str | None:
     from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
 
-    from vllm_gr.v1.engine.core_client import (
-        add_requests_async,
-        beam_request_step_update_async,
-        submit_session_async,
-    )
+    from vllm_gr.v1.engine.core_client import submit_gr_session_async
     from vllm_gr.v1.engine.core_client_patch import (
-        inproc_add_requests,
-        inproc_beam_request_step_update,
-        inproc_submit_session,
-        sync_mp_add_requests,
-        sync_mp_beam_request_step_update,
-        sync_mp_submit_session,
+        inproc_submit_gr_session,
+        sync_mp_submit_gr_session,
     )
 
     valid = (
-        AsyncMPClient.add_requests_async is add_requests_async
-        and AsyncMPClient.beam_request_step_update_async is beam_request_step_update_async
-        and SyncMPClient.add_requests is sync_mp_add_requests
-        and SyncMPClient.beam_request_step_update is sync_mp_beam_request_step_update
-        and InprocClient.add_requests is inproc_add_requests
-        and InprocClient.beam_request_step_update is inproc_beam_request_step_update
-        and getattr(AsyncMPClient, "submit_session_async", None) is submit_session_async
-        and getattr(SyncMPClient, "submit_session", None) is sync_mp_submit_session
-        and getattr(InprocClient, "submit_session", None) is inproc_submit_session
-        and getattr(InprocClient.get_output, "_vllm_gr_inproc_self_advance", False)
+        getattr(AsyncMPClient, "submit_gr_session_async", None) is submit_gr_session_async
+        and getattr(SyncMPClient, "submit_gr_session", None) is sync_mp_submit_gr_session
+        and getattr(InprocClient, "submit_gr_session", None) is inproc_submit_gr_session
     )
     return _verified(valid, "EngineCore client methods are not fully installed")
 
 
 def _validate_async_llm_patch() -> str | None:
     from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.llm_engine import LLMEngine
+    from vllm.v1.engine.output_processor import OutputProcessor
 
-    from vllm_gr.v1.engine.async_llm import (
-        _add_requests_batch_fn,
-        beam_request_step_update_fn,
-        prepare_request_fn,
-        register_beam_output_fn,
-        submit_session_fn,
-    )
+    from vllm_gr.v1.engine import gr_session_client
+    from vllm_gr.v1.engine.async_llm import _PROCESS_OUTPUTS_PATCH_MARKER
 
-    valid = (
-        AsyncLLM.prepare_request is prepare_request_fn
-        and AsyncLLM._add_requests_batch is _add_requests_batch_fn
-        and AsyncLLM.register_beam_output is register_beam_output_fn
-        and AsyncLLM.beam_request_step_update is beam_request_step_update_fn
-        and getattr(AsyncLLM, "submit_session", None) is submit_session_fn
-    )
-    return _verified(valid, "AsyncLLM grouped-beam methods are not fully installed")
+    valid = bool(getattr(OutputProcessor.process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False))
+    for cls, suffix in ((LLMEngine, "sync"), (AsyncLLM, "async")):
+        for operation in ("submit", "wait", "abort", "release"):
+            name = f"{operation}_gr_session"
+            valid = valid and getattr(cls, name, None) is getattr(
+                gr_session_client, f"{name}_{suffix}"
+            )
+    return _verified(valid, "GR frontend lifecycle methods are not fully installed")
 
 
 def _validate_engine_core_entrypoint_patch() -> str | None:
@@ -281,36 +259,26 @@ def _validate_engine_core_request_patch() -> str | None:
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
     from vllm_gr.v1.engine.core import (
-        _apply_beam_step,
-        _beam_self_advance,
-        _cache_beam_request,
-        _handle_beam_request_step_update,
+        _handle_submit_gr_session,
+        is_gr_session_retired,
         process_input_sockets,
     )
     from vllm_gr.v1.engine.engine_core_patch import (
-        _BEAM_STATE_INIT_MARKER,
         _CLIENT_REQUEST_PATCH_MARKER,
         _ENGINE_STEP_PATCH_MARKER,
         _PIS_PATCH_MARKER,
     )
 
     valid = (
-        getattr(EngineCore.__init__, _BEAM_STATE_INIT_MARKER, False)
-        and getattr(EngineCoreProc.__init__, _BEAM_STATE_INIT_MARKER, False)
-        and EngineCore._cache_beam_request is _cache_beam_request
-        and EngineCoreProc._cache_beam_request is _cache_beam_request
-        and EngineCore._handle_beam_request_step_update is _handle_beam_request_step_update
-        and EngineCoreProc._handle_beam_request_step_update is _handle_beam_request_step_update
-        and EngineCore._apply_beam_step is _apply_beam_step
-        and EngineCoreProc._apply_beam_step is _apply_beam_step
-        and EngineCore._beam_self_advance is _beam_self_advance
-        and EngineCoreProc._beam_self_advance is _beam_self_advance
+        getattr(EngineCore, "_handle_submit_gr_session", None) is _handle_submit_gr_session
+        and getattr(EngineCoreProc, "_handle_submit_gr_session", None) is _handle_submit_gr_session
+        and getattr(EngineCore, "is_gr_session_retired", None) is is_gr_session_retired
         and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
         and getattr(EngineCoreProc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
         and EngineCoreProc.process_input_sockets is process_input_sockets
         and getattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, False)
     )
-    return _verified(valid, "EngineCore beam request dispatch is not fully installed")
+    return _verified(valid, "EngineCore GR session dispatch is not fully installed")
 
 
 def _validate_scheduler_patch() -> str | None:
