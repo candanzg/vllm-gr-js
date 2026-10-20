@@ -1488,7 +1488,7 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
     """Create a BeamAttentionContext with sizing derived from model + GRConfig.
 
     Shared by the dummy-capture paths (GPU/NPU ``capture_beam_decode_graph``)
-    and the runtime lazy-creation path (``_get_or_create_beam_session``) so
+    and the persistent NPU stage runner so
     that the pool dimensions, dtype, and device are always derived from the
     same sources.  A single source of truth prevents silent size mismatches
     that would invalidate captured graphs if the runtime path rebuilt the

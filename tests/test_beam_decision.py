@@ -11,9 +11,8 @@ Covers the five correctness gaps fixed in the NPU post-processing port:
 - G3: ``worker_decision_enabled`` is gated on the xllm decode execution mode.
 - G4: the operator's GLOBAL prefix sums are converted to request-local form
   before persisting ``group_token_num``.
-- G5: the KV reorder runs in the SAME step as the decision, and the next
-  step's ``_get_or_create_beam_session`` consumes the recorded mapping
-  instead of re-applying it (``p . p != p``).
+- G5: the KV reorder runs in the SAME step as the decision and advances
+  the session's decode state.
 
 All tests run on CPU against the PyTorch reference decision path
 (``_run_torch_decision``); NPU fused-operator parity is covered by the
@@ -524,21 +523,6 @@ def test_same_step_reorder_applied_and_decode_step_advanced() -> None:
     for layer, pool in enumerate(context.pools):
         for b in range(beam_width):
             assert pool.unshared_key[0, b, :, :3, :].max().item() == float(layer), (layer, b)
-
-
-# ---------------------------------------------------------------------------
-# G6: terminal-step detection — loop length vs decode-only steps
-# ---------------------------------------------------------------------------
-
-
-def _terminal_runner(context: BeamAttentionContext, session: BeamSearchSession) -> SimpleNamespace:
-    """Runner stub for _get_or_create_beam_session terminal-step tests."""
-    return SimpleNamespace(
-        _beam_sessions={session.session_id: session},
-        _beam_context=context,
-        _vllm_gr_config=SimpleNamespace(beam_max_width=4, beam_max_decode_steps=4),
-        device=torch.device("cpu"),
-    )
 
 
 # ---------------------------------------------------------------------------
