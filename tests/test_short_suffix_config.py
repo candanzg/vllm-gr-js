@@ -50,11 +50,24 @@ def test_config_requires_boolean(value: Any) -> None:
         GRConfig(beam_max_width=128, enable_short_suffix_attention=value)
 
 
-def test_config_default_and_capacity() -> None:
-    assert GRConfig().enable_short_suffix_attention is False
-    with pytest.raises(ValueError, match="requires max_width"):
-        GRConfig(enable_short_suffix_attention=True)
-    assert GRConfig(beam_max_width=128, beam_max_decode_steps=32)
+@pytest.mark.parametrize("width", [None, 128])
+def test_config_defaults_enable_short_suffix_without_requiring_beam_pool(
+    width: int | None,
+) -> None:
+    config = GRConfig(beam_max_width=width)
+    assert config.enable_short_suffix_attention is True
+    assert GRConfig().enabled is False
+    worker = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": width})
+    assert GRConfig.from_vllm_config(worker) == config
+    canonical = gr_config_from_mapping(
+        {
+            "schema_version": 1,
+            "beam": {"max_width": width},
+            "constraint_table": {"max_top_k": 128},
+        }
+    )
+    assert canonical.enable_short_suffix_attention is True
+    assert gr_config_from_mapping(gr_config_to_mapping(canonical)) == canonical
 
 
 @pytest.mark.parametrize("capacity", [0, -1])
@@ -429,22 +442,23 @@ def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other
     torch.testing.assert_close(case.output, expected)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("cuda", [False, True])
+@pytest.mark.parametrize("width", [None, 128])
+@pytest.mark.parametrize("enabled", [None, False, True])
 def test_layer_constructor_validates_before_execution(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool
+    monkeypatch: pytest.MonkeyPatch, enabled: bool | None, width: int | None, cuda: bool
 ) -> None:
     import vllm.config
 
     from vllm_gr.v1.attention.backends import beam_attn
 
-    config = SimpleNamespace(
-        additional_config={
-            "vllm_gr_enable_short_suffix_attention": enabled,
-            "vllm_gr_beam_max_width": 128,
-        }
-    )
+    additional_config: dict[str, Any] = {"vllm_gr_beam_max_width": width}
+    if enabled is not None:
+        additional_config["vllm_gr_enable_short_suffix_attention"] = enabled
+    config = SimpleNamespace(additional_config=additional_config)
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda)
+    monkeypatch.setattr(beam_attn, "NPU_DEVICE", not cuda)
     monkeypatch.setattr(
         beam_attn,
         "_get_platform_execution_module",
@@ -460,7 +474,8 @@ def test_layer_constructor_validates_before_execution(
         "kv_cache_dtype": "auto",
         "logits_soft_cap": 10.0,
     }
-    if enabled:
+    active = cuda and width is not None and enabled is not False
+    if active:
         with pytest.raises(ValueError, match="softcap"):
             beam_attn.BeamAttentionImpl(**kwargs)
     else:
@@ -468,4 +483,4 @@ def test_layer_constructor_validates_before_execution(
 
     kwargs["logits_soft_cap"] = 0.0
     impl = beam_attn.BeamAttentionImpl(**kwargs)
-    assert impl.supports_quant_query_input is (not enabled)
+    assert impl.supports_quant_query_input is (not active)

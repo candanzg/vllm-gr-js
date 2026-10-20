@@ -190,7 +190,7 @@ def gr_config_from_mapping(
         attention_backend=validate_attention_backend(mapping.get("attention_backend")),
         beam_graph_enabled=graph_enabled,
         enable_short_suffix_attention=validate_enable_short_suffix_attention(
-            beam_raw.get("enable_short_suffix_attention", False)
+            beam_raw.get("enable_short_suffix_attention", True)
         ),
         beam_graph_batch_size=validate_beam_graph_batch_size(beam_raw.get("graph_batch_size", 1)),
         beam_max_width=validate_beam_max_width(beam_raw.get("max_width")),
@@ -240,8 +240,8 @@ def gr_config_to_mapping(config: GRConfig) -> dict[str, object]:
         "max_width": config.beam_max_width,
         "max_decode_steps": config.beam_max_decode_steps,
     }
-    if config.enable_short_suffix_attention:
-        beam["enable_short_suffix_attention"] = True
+    if not config.enable_short_suffix_attention:
+        beam["enable_short_suffix_attention"] = False
     if config.beam_graph_batch_size != 1:
         beam["graph_batch_size"] = config.beam_graph_batch_size
     # Keep omitted values omitted so existing schema-v1 artifacts round-trip
@@ -343,7 +343,7 @@ def parse_gr_config(vllm_config: object | None) -> GRConfig:
         vocab_offset=validate_vocab_offset(additional_config.get(VOCAB_OFFSET_KEY)),
         vocab_slice_size=validate_vocab_slice_size(additional_config.get(VOCAB_SLICE_SIZE_KEY)),
         enable_short_suffix_attention=validate_enable_short_suffix_attention(
-            additional_config.get(SHORT_SUFFIX_ATTENTION_KEY, False)
+            additional_config.get(SHORT_SUFFIX_ATTENTION_KEY, True)
         ),
         beam_graph_enabled=validate_beam_graph_enabled(
             additional_config.get(BEAM_GRAPH_ENABLED_KEY, True)
@@ -418,9 +418,9 @@ def write_gr_config(vllm_config: object, gr_config: GRConfig) -> None:
         additional_config[VOCAB_SLICE_SIZE_KEY] = vocab_slice_size
 
     if gr_config.enable_short_suffix_attention:
-        additional_config[SHORT_SUFFIX_ATTENTION_KEY] = True
-    else:
         additional_config.pop(SHORT_SUFFIX_ATTENTION_KEY, None)
+    else:
+        additional_config[SHORT_SUFFIX_ATTENTION_KEY] = False
 
     if gr_config.beam_graph_enabled:
         additional_config.pop(BEAM_GRAPH_ENABLED_KEY, None)

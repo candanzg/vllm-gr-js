@@ -1616,7 +1616,9 @@ def _create_beam_context(runner, gr_cfg, max_batch: int = 1):
         num_layers=model_config.get_num_layers(parallel_config),
         device=runner.device,
         dtype=model_config.dtype,
-        enable_short_suffix_attention=gr_cfg.enable_short_suffix_attention,
+        enable_short_suffix_attention=(
+            runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
+        ),
     )
 
 
