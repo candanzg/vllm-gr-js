@@ -682,11 +682,11 @@ def test_custom_b4_bucket_limit_uses_total_tokens(monkeypatch: pytest.MonkeyPatc
     assert NPUPrefillGraphRunner(runner, buckets=[4, 8, 12, 24]).buckets == [4, 8]
 
 
-def test_legacy_prefill_capture_keeps_b1_when_only_b4_configured() -> None:
+def test_prefill_capture_without_v1_keeps_b1_when_only_b4_configured() -> None:
     from vllm_gr.config import BeamExecutionMode
     from vllm_gr.v1.worker.gpu_prefill_graph_runner import _capture_request_counts
 
-    assert _capture_request_counts((4,), 4, BeamExecutionMode.LEGACY) == (1,)
+    assert _capture_request_counts((4,), 4, None) == (1,)
     assert _capture_request_counts((4,), 4, BeamExecutionMode.V1) == (4,)
 
 

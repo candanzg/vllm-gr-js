@@ -213,8 +213,8 @@ def patch_engine_core_process_entrypoint() -> None:
 
 
 def patch_batch_and_fork() -> None:
-    """Compatibility helper that installs the complete grouped-beam pipeline."""
-    from vllm_gr.v1.engine.core_client_patch import apply_batch_fork_patches
+    """Compatibility installer name for the V1 session pipeline."""
+    from vllm_gr.v1.engine.core_client_patch import apply_gr_session_patches
 
-    apply_batch_fork_patches()
+    apply_gr_session_patches()
     patch_engine_core_process_entrypoint()

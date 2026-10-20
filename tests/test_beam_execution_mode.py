@@ -14,12 +14,11 @@ from vllm_gr.config import (
     gr_config_from_mapping,
     gr_config_to_mapping,
 )
-from vllm_gr.config.execution import require_beam_execution_mode
 from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
 
 
-@pytest.mark.parametrize("mode", list(BeamExecutionMode))  # type: ignore[misc]
-def test_execution_mode_survives_both_config_encodings(mode: BeamExecutionMode) -> None:
+@pytest.mark.parametrize("mode", [None, BeamExecutionMode.V1])  # type: ignore[misc]
+def test_execution_mode_survives_both_config_encodings(mode: BeamExecutionMode | None) -> None:
     config = GRConfig(beam_execution_mode=mode)
     engine = SimpleNamespace(additional_config={})
     config.write_to_vllm_config(engine)
@@ -30,7 +29,7 @@ def test_execution_mode_survives_both_config_encodings(mode: BeamExecutionMode) 
     assert gr_config_from_mapping(gr_config_to_mapping(canonical)) == canonical
 
 
-@pytest.mark.parametrize("invalid", [None, True, "async", "auto", "", 1])  # type: ignore[misc]
+@pytest.mark.parametrize("invalid", ["legacy", True, "async", "auto", "", 1])  # type: ignore[misc]
 def test_execution_mode_rejects_ambiguous_values(invalid: Any) -> None:
     with pytest.raises(ValueError, match="execution_mode"):
         GRConfig(beam_execution_mode=invalid)
@@ -38,7 +37,8 @@ def test_execution_mode_rejects_ambiguous_values(invalid: Any) -> None:
 
 def test_native_async_does_not_select_v1() -> None:
     config = SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=True))
-    require_beam_execution_mode(config, BeamExecutionMode.LEGACY)
+    assert GRConfig.from_vllm_config(config).beam_execution_mode is None
+    assert not GRConfig.from_vllm_config(config).enabled
     with pytest.raises(ValueError, match="execution_mode='v1'"):
         validate_gr_execution_config(config)
 
@@ -54,8 +54,6 @@ def test_v1_requires_native_async() -> None:
     validate_gr_execution_config(config)
     config.device_config = SimpleNamespace(device="npu")
     validate_gr_execution_config(config)
-    with pytest.raises(ValueError, match="execution_mode='legacy'"):
-        require_beam_execution_mode(config, BeamExecutionMode.LEGACY)
 
 
 def test_v1_npu_startup_routes_to_acl_graph_capture(
@@ -178,12 +176,30 @@ def test_engine_validates_v2_beam_protocol_without_changing_defaults(
         raw = None
     args = SimpleNamespace(_vllm_gr_config_input=raw, beam_execution_mode=mode)
     original_additional_config = config.additional_config.copy()
-    if device_type == "cuda" and use_v2 and with_beam and mode != "v1":
+    if mode == "legacy":
+        with pytest.raises(ValueError, match="removed.*execution_mode='v1'"):
+            arg_utils_gr.create_engine_config(args)
+        assert config.additional_config == original_additional_config
+    elif device_type == "cuda" and use_v2 and with_beam and mode != "v1":
         with pytest.raises(ValueError, match="ModelRunner V2 Beam requires.*execution_mode='v1'"):
             arg_utils_gr.create_engine_config(args)
         assert config.additional_config == original_additional_config
     else:
         assert arg_utils_gr.create_engine_config(args) is config
         assert GRConfig.from_vllm_config(config).beam_execution_mode is (
-            BeamExecutionMode.V1 if mode == "v1" else BeamExecutionMode.LEGACY
+            BeamExecutionMode.V1 if mode == "v1" else None
         )
+
+
+@pytest.mark.parametrize("canonical", [False, True])  # type: ignore[misc]
+def test_legacy_mode_rejected_during_config_read(canonical: bool) -> None:
+    if canonical:
+        raw = gr_config_to_mapping(GRConfig(constraint_table=ConstraintTableConfig(max_top_k=4)))
+        beam = raw["beam"]
+        assert isinstance(beam, dict)
+        beam["execution_mode"] = "legacy"
+        additional = {"vllm_gr": raw}
+    else:
+        additional = {"vllm_gr_beam_execution_mode": "legacy"}
+    with pytest.raises(ValueError, match="removed.*execution_mode='v1'"):
+        GRConfig.from_vllm_config(SimpleNamespace(additional_config=additional))

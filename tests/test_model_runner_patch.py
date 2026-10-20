@@ -315,9 +315,9 @@ def test_apply_worker_patches_dispatches_to_v2_installer(
     assert called == ["v2"]
 
 
-@pytest.mark.parametrize("mode", list(BeamExecutionMode))  # type: ignore[misc]
+@pytest.mark.parametrize("mode", [None, BeamExecutionMode.V1])  # type: ignore[misc]
 def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
-    monkeypatch: pytest.MonkeyPatch, mode: BeamExecutionMode
+    monkeypatch: pytest.MonkeyPatch, mode: BeamExecutionMode | None
 ) -> None:
     from vllm_gr.v1.worker import gr_startup
 

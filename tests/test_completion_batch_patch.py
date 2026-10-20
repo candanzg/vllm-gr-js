@@ -223,11 +223,11 @@ def test_a_prompt_list_is_counted_before_capacity_is_consulted(
     assert _batch_size(capacity, make_request(prompt=[[1, 2]] * count)) == count
 
 
-def test_a_legacy_engine_is_left_alone(
+def test_an_engine_without_gr_beam_is_left_alone(
     serving: _BatchSelf, make_request: Callable[..., Any]
 ) -> None:
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(_ModeStub, "beam_execution_mode", BeamExecutionMode.LEGACY)
+        monkeypatch.setattr(_ModeStub, "beam_execution_mode", None)
         assert _batch_size(serving, make_request()) is None
 
 

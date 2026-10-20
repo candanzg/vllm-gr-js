@@ -229,7 +229,7 @@ def test_failed_reload_restores_old_hook_and_does_not_publish_partial_owner(
 
 
 @pytest.mark.parametrize(
-    "case", ["pipeline_parallel", "tensor_parallel", "lora", "speculative", "disabled", "legacy"]
+    "case", ["pipeline_parallel", "tensor_parallel", "lora", "speculative", "disabled", "unset"]
 )
 def test_unsupported_worker_never_requests_compact_vocab_or_installs_projection(
     lifecycle: Any, monkeypatch: pytest.MonkeyPatch, case: str
@@ -248,7 +248,7 @@ def test_unsupported_worker_never_requests_compact_vocab_or_installs_projection(
         monkeypatch.setenv("VLLM_GR_NPU_STAGE_LM_HEAD", "0")
     else:
         mapping = runner.vllm_config.additional_config["vllm_gr"]
-        mapping["beam"]["execution_mode"] = "legacy"
+        mapping["beam"].pop("execution_mode")
 
     make_load_model_with_constraint_backend(lambda self: _replace_model(self, 1.0))(runner)
     assert runner.constraint_backend is lifecycle.backends[-1]

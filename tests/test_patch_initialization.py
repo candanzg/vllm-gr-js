@@ -730,9 +730,9 @@ def test_npu_spawn_patch_forces_spawn_only_when_npu_initialized(
 @pytest.mark.parametrize(
     ("class_name", "method_name"),
     [
-        ("AsyncMPClient", "submit_session_async"),
-        ("SyncMPClient", "submit_session"),
-        ("InprocClient", "submit_session"),
+        ("AsyncMPClient", "submit_gr_session_async"),
+        ("SyncMPClient", "submit_gr_session"),
+        ("InprocClient", "submit_gr_session"),
     ],
 )  # type: ignore[misc]
 def test_client_validator_rejects_missing_merged_submission(
@@ -759,5 +759,5 @@ def test_async_llm_validator_rejects_missing_merged_submission(
 
     apply_async_llm_patches()
     assert _validate_async_llm_patch() is None
-    monkeypatch.delattr(AsyncLLM, "submit_session")
-    assert _validate_async_llm_patch() == "AsyncLLM grouped-beam methods are not fully installed"
+    monkeypatch.delattr(AsyncLLM, "submit_gr_session")
+    assert _validate_async_llm_patch() == "GR frontend lifecycle methods are not fully installed"

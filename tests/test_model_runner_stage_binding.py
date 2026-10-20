@@ -31,6 +31,24 @@ def _scheduled_frame(**metadata: object) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
+@pytest.mark.parametrize("mixed", [False, True])  # type: ignore[misc]
+def test_old_beam_frames_rejected_before_native_execution(use_v2: bool, mixed: bool) -> None:
+    worker = SimpleNamespace()
+    output = _scheduled_frame(beam_data={"session": {"is_beam_decode": True}})
+    if mixed:
+        output.num_scheduled_tokens["ordinary"] = 1
+    factory = (
+        model_runner_common.make_patched_execute_model_v2
+        if use_v2
+        else model_runner_common.make_patched_execute_model
+    )
+    with pytest.raises(ValueError, match="(?i)legacy"):
+        factory(_unexpected_native)(worker, output)
+    assert not hasattr(worker, "_current_beam_data")
+    assert not hasattr(worker, "execute_model_state")
+
+
+@pytest.mark.parametrize("use_v2", [False, True])  # type: ignore[misc]
 def test_execute_entry_binds_hooks_independently_of_environment(
     monkeypatch: pytest.MonkeyPatch, use_v2: bool
 ) -> None:
@@ -83,7 +101,7 @@ def test_v2_retirement_does_not_read_execution_mode(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.parametrize("frame_attr", [GR_STAGE_OUTPUT_ATTR, GR_RETIRE_OUTPUT_ATTR])  # type: ignore[misc]
-def test_v1_rejects_persistent_frames_in_legacy_mode_before_dispatch(
+def test_v1_rejects_persistent_frames_without_v1_before_dispatch(
     monkeypatch: pytest.MonkeyPatch, frame_attr: str
 ) -> None:
     worker = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))

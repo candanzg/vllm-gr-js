@@ -28,7 +28,7 @@ logger = init_logger(__name__)
 
 
 def _capture_request_counts(
-    configured: tuple[int, ...], max_num_seqs: int, mode: BeamExecutionMode
+    configured: tuple[int, ...], max_num_seqs: int, mode: BeamExecutionMode | None
 ) -> tuple[int, ...]:
     if mode is not BeamExecutionMode.V1:
         return (1,) if max_num_seqs >= 1 else ()
