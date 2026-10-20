@@ -189,17 +189,6 @@ def _validate_engine_args_patch() -> str | None:
     )
 
 
-def _validate_serving_models_patch() -> str | None:
-    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-
-    from vllm_gr.entrypoints.openai.serving_models import init_gr
-
-    return _verified(
-        OpenAIServingModels.__init__ is init_gr,
-        "OpenAIServingModels.__init__ does not reference the GR implementation",
-    )
-
-
 def _validate_request_types_patch() -> str | None:
     from vllm.v1.engine import EngineCoreRequestType
 
@@ -389,12 +378,6 @@ def _required_beam_patches() -> tuple[BeamPatch, ...]:
             "vllm_gr.engine.arg_utils_gr",
             "patch_add_cli_args",
             _validate_engine_args_patch,
-        ),
-        patch(
-            "serving_models",
-            "vllm_gr.entrypoints.openai.serving_models",
-            "patch_OpenAIServingModels_init",
-            _validate_serving_models_patch,
         ),
         patch(
             "batch_and_fork",
