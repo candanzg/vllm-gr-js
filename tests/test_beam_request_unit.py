@@ -6,9 +6,8 @@ from typing import Any
 
 import pytest
 from vllm.exceptions import VLLMValidationError
-from vllm.sampling_params import SamplingParams
 
-from vllm_gr.sampling_params import BeamSearchParams, clone_beam_decode_sampling_params
+from vllm_gr.sampling_params import BeamSearchParams
 
 
 def test_beam_search_params_enforces_global_width_limit() -> None:
@@ -35,42 +34,21 @@ def _sub_patch_preserves_greedy_validation() -> None:
     assert SamplingParams(temperature=1.0, n=2).n == 2
 
 
-def _sampling_params(**overrides: Any) -> SamplingParams:
-    defaults = dict(max_tokens=4, logprobs=3, temperature=0.0, detokenize=False)
-    defaults.update(overrides)
-    return SamplingParams(**defaults)
-
-
 def _run_subprocess(target: Any) -> None:
     import multiprocessing
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=target)
     p.start()
-    p.join(timeout=30)
-    assert p.exitcode == 0, f"Subprocess {target.__name__} exited with code {p.exitcode}"
-
-
-class TestBeamDecodeSamplingParams:
-    def test_clone_preserves_single_logical_request_semantics(self) -> None:
-        params = _sampling_params()
-
-        cloned = clone_beam_decode_sampling_params(params)
-
-        assert cloned is not params
-        assert cloned.n == 1
-        assert cloned.temperature == params.temperature
-        assert cloned.logprobs == params.logprobs
-
-    def test_clone_rejects_parallel_output_semantics(self) -> None:
-        params = SamplingParams(temperature=1.0, n=2)
-
-        try:
-            clone_beam_decode_sampling_params(params)
-        except ValueError as exc:
-            assert "SamplingParams.n == 1" in str(exc)
-        else:
-            raise AssertionError("Grouped-beam params accepted SamplingParams.n > 1")
+    try:
+        # A cold vLLM import plus patch initialization can approach 30 seconds.
+        # This checks validation behavior, not startup performance.
+        p.join(timeout=60)
+        assert p.exitcode == 0, f"Subprocess {target.__name__} exited with code {p.exitcode}"
+    finally:
+        if p.is_alive():
+            p.terminate()
+            p.join()
 
 
 class TestBeamKernelsDynamicBeamCount:

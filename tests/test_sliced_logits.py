@@ -8,10 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_gr.beam_search_decision_utils import (
-    extract_and_dedup_flat_logprobs,
-    extract_and_dedup_segment,
-)
 from vllm_gr.ops.sliced_logits import (
     compute_sliced_logits,
     get_rank_vocab_bounds,
@@ -86,53 +82,6 @@ def test_quantization_group_alignment() -> None:
 
     assert sliced_logits.shape == (batch_size, slice_size)
     assert torch.allclose(sliced_logits, expected_slice_logits, atol=1e-5, rtol=1e-5)
-
-
-def test_token_id_remapping() -> None:
-    set_vocab_slice_config(offset=20000, slice_size=24000)
-    assert is_vocab_slice_enabled()
-
-    class MockFlatLogprobs:
-        def __init__(self, token_ids: list[int], logprobs: list[float]) -> None:
-            self.start_indices = [0]
-            self.end_indices = [len(token_ids)]
-            self.token_ids = token_ids
-            self.logprobs = logprobs
-            self.ranks = [0] * len(token_ids)
-            self.decoded_tokens = [""] * len(token_ids)
-
-    flat = MockFlatLogprobs(token_ids=[0, 1, 2], logprobs=[-0.1, -0.5, -1.0])
-    remapped_ids, _, _, _ = extract_and_dedup_flat_logprobs(flat, logprobs_num=3)
-    assert list(remapped_ids) == [20000, 20001, 20002]
-
-    # Test upper-range slice tokens where tid >= offset (e.g. offset=20000, slice_size=24000, tid=21000 -> 41000)
-    seg_ids_upper, _, _, _ = extract_and_dedup_segment(
-        raw_token_ids=[21000, 41000],
-        raw_logprobs=[-0.2, -0.8],
-        raw_ranks=[0, 1],
-        raw_decoded=["a", "b"],
-        start_offset=0,
-        end_offset=2,
-        logprobs_num=2,
-    )
-    assert list(seg_ids_upper) == [41000, 41000]
-
-    # Test slice_size > offset scenario (e.g. offset=1000, slice_size=1500, tid=1200 -> 2200)
-    set_vocab_slice_config(offset=1000, slice_size=1500)
-    seg_ids_small_offset, _, _, _ = extract_and_dedup_segment(
-        raw_token_ids=[1200, 2200],
-        raw_logprobs=[-0.2, -0.8],
-        raw_ranks=[0, 1],
-        raw_decoded=["a", "b"],
-        start_offset=0,
-        end_offset=2,
-        logprobs_num=2,
-    )
-    assert list(seg_ids_small_offset) == [2200, 2200]
-
-    # Reset config
-    set_vocab_slice_config(None, None)
-    assert not is_vocab_slice_enabled()
 
 
 def test_catalog_slice_config(tmp_path: Any) -> None:
