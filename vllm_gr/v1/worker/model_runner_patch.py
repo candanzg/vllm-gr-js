@@ -325,25 +325,24 @@ def apply_worker_patches() -> None:
         runner_class._prepare_inputs = platform_module.make_patched_prepare_inputs(
             runner_class._prepare_inputs
         )
-        runner_class._bookkeeping_sync = platform_module.make_patched_bookkeeping_sync(
-            runner_class._bookkeeping_sync
-        )
+        bookkeeping_patch = getattr(platform_module, "make_patched_bookkeeping_sync", None)
+        if bookkeeping_patch is not None:
+            runner_class._bookkeeping_sync = bookkeeping_patch(runner_class._bookkeeping_sync)
+        else:
+            # CUDA V1 stages produce their own final output. Keep native
+            # bookkeeping intact for ordinary inference and verify its identity.
+            runner_class._vllm_gr_native_bookkeeping = runner_class._bookkeeping_sync
         # Pure-prefill graph interception: replays captured prefill graphs for
         # prompt batches inside _model_forward (installed on both platforms;
         # the runner classes expose _model_forward on vllm 0.22.1).
         model_forward_patch = getattr(platform_module, "make_patched_model_forward", None)
         if model_forward_patch is not None and hasattr(runner_class, "_model_forward"):
             runner_class._model_forward = model_forward_patch(runner_class._model_forward)
-        # Constraint Tables raw-logits hook: only where the runner exposes
-        # ``_sample`` (a vllm-ascend build may not).  A Constraint Table worker
-        # without the hook fails at injection (worker_inject), never here.
-        if hasattr(runner_class, "_sample"):
-            runner_class._sample = platform_module.make_patched_sample(runner_class._sample)
+        sample_patch = getattr(platform_module, "make_patched_sample", None)
+        if sample_patch is not None and hasattr(runner_class, "_sample"):
+            runner_class._sample = sample_patch(runner_class._sample)
 
-        # Async scheduling: sampling (and the worker-side beam decision that
-        # runs inside the patched ``_sample``) happens in ``sample_tokens``
-        # after ``execute_model`` returns.  Attach the decision to the output
-        # there.  NPU-only hook (the platform module provides it).
+        # Async V1 stages own sampling after execute_model returns.
         sample_tokens_patch = getattr(platform_module, "make_patched_sample_tokens", None)
         if sample_tokens_patch is not None and hasattr(runner_class, "sample_tokens"):
             runner_class.sample_tokens = sample_tokens_patch(runner_class.sample_tokens)
