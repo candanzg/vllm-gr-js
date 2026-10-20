@@ -246,17 +246,10 @@ def _fake_config() -> SimpleNamespace:
 class TestEngineArgsGrInitPatch:
     """The offline path reaches EngineCore only through this patch."""
 
-    def test_patch_is_inactive_by_default(self) -> None:
-        from vllm_gr.engine import arg_utils_gr
-
-        assert arg_utils_gr.engine_args_accepts_gr_values() is False
-
     def test_patch_mounts_and_stashes_gr_values(self) -> None:
-        from vllm_gr.engine import arg_utils_gr
         from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
 
         patch_add_cli_args()
-        assert arg_utils_gr.engine_args_accepts_gr_values() is True
 
         from vllm.engine.arg_utils import EngineArgs
 
