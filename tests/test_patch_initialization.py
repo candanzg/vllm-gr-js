@@ -29,7 +29,6 @@ def test_patch_plans_preserve_process_responsibilities() -> None:
         "openai_beam_search",
         "chat_sampling_conversion",
         "engine_args",
-        "serving_models",
         "batch_and_fork",
     ]
     assert engine_core_patches == [

@@ -14,16 +14,6 @@ from vllm.inputs import TokensPrompt
 
 from vllm_gr.config import BeamExecutionMode, ConstraintBackend, GRConfig
 from vllm_gr.config.validation import validate_beam_max_width
-from vllm_gr.constraints import (
-    BeamConstraintCoordinator,
-    create_constraint_strategy,
-)
-from vllm_gr.constraints.startup import install_constraint_table
-from vllm_gr.constraints.strategies import (
-    ConstraintTableStrategy,
-    TrieConstraintStrategy,
-)
-from vllm_gr.engine.arg_utils_gr import engine_args_accepts_gr_values
 from vllm_gr.logger import init_logger
 from vllm_gr.utils.npu_adapter import release_accelerator_memory
 
@@ -90,6 +80,12 @@ class GRLLM(LLM):
         beam_max_decode_steps: int | None = None,
         **kwargs,
     ):
+        if catalog_path is not None or constraint_backend is not None:
+            raise ValueError(
+                "Legacy catalog_path/constraint_backend arguments have been removed. "
+                "Use vllm_gr_config with beam.execution_mode='v1' and a canonical "
+                "constraint_table artifact."
+            )
         beam_max_width = validate_beam_max_width(beam_max_width)
         # vLLM 0.22 enables ModelRunner V2 automatically for Qwen3. Apply the
         # vllm-gr default before LLM.__init__ constructs VllmConfig so the V1
@@ -119,58 +115,6 @@ class GRLLM(LLM):
         self._shutdown_complete = False
         self._frontend_gc_registered = False
 
-        # Thread the GR values into the EngineArgs that LLM.__init__ builds
-        # internally (EngineArgs(model=..., **kwargs)); the arg_utils_gr patch
-        # stashes them and create_engine_config writes them into VllmConfig so
-        # EngineCore can learn the constraint backend before any request runs.
-        # Without this, the offline Python API compiles/injects the tables but
-        # EngineCore never marks requests constraint_prefill/constrained and the
-        # Worker raw-logits hook would never run.
-        #
-        # Only constraint_table strictly requires the patch: the tables must
-        # reach VllmConfig so every worker can run the raw-logits hook.  A
-        # Trie catalog is handled entirely driver-side (TrieConstraintStrategy
-        # below), so ``catalog_path`` with the default backend must not demand
-        # the plugin — vLLM 0.22 loads general plugins lazily from inside
-        # EngineArgs.__init__, which has not run yet at this point.
-        # Resolve the effective constraint backend here (before EngineArgs is
-        # built): on NPU with no explicit backend choice and a catalog
-        # available the platform default is Constraint Tables.  A user
-        # catalog_path is kept as the constraint data source (a Triples
-        # document for the promoted backend).  Without a catalog there is no
-        # constraint data to promote against — a GRLLM constructed with no
-        # catalog must stay unconstrained (legacy behavior) rather than force
-        # the tokenizer-based Constraint Table builder, which fails fast on
-        # tokenizers whose s_a/s_b/s_c groups exceed max_valid_items (e.g.
-        # OneRec 8192 > 500) and regresses catalog-free single-prompt tests.
-        # Explicit user choices (any backend) pass through unchanged.
-        from vllm_gr.engine.arg_utils_gr import (
-            _catalog_is_triples_document,
-            _is_npu_platform,
-        )
-
-        if (
-            constraint_backend is None
-            and catalog_path is not None
-            and _catalog_is_triples_document(catalog_path)
-            and beam_max_width is not None
-            and _is_npu_platform()
-        ):
-            constraint_backend = ConstraintBackend.CONSTRAINT_TABLE
-
-        gr_engine_args: dict[str, object] = {}
-        if engine_args_accepts_gr_values():
-            gr_engine_args["catalog_path"] = catalog_path
-            gr_engine_args["constraint_backend"] = constraint_backend
-        elif constraint_backend not in (None, ConstraintBackend.TRIE):
-            raise RuntimeError(
-                "vllm-gr runtime patches are not active: EngineArgs cannot "
-                "carry constraint_backend into VllmConfig. Ensure the vllm-gr "
-                "plugin is registered (vllm general_plugins) or call "
-                "vllm_gr.plugin.initialize_runtime() before constructing GRLLM "
-                "with constraint_backend='constraint_table'."
-            )
-
         # Beam-graph settings ride vLLM's native additional_config so they
         # survive into the spawned engine-core process (same channel as the
         # serve CLI flags; see vllm_gr/engine/arg_utils_gr.py).
@@ -188,56 +132,12 @@ class GRLLM(LLM):
 
         super().__init__(
             model=model,
-            **gr_engine_args,
             **kwargs,
         )
 
         _install_renderer_eos_token_id_cache()
 
-        self.catalog = None
-        self.constraint_strategy = None
-        self.constraint_coordinator = BeamConstraintCoordinator(None)
-        # Resolve the effective constraint backend from the engine config
-        # (create_engine_config already applied the NPU platform default: a
-        # sentinel catalog_path when Constraint Tables are auto-selected).
-        # Explicit user choices pass through unchanged.
         resolved_gr = GRConfig.from_vllm_config(getattr(self.llm_engine, "vllm_config", None))
-        effective_backend = resolved_gr.constraint_backend
-        effective_catalog_path = resolved_gr.catalog_path
-        canonical_table = resolved_gr.constraint_table
-        if canonical_table is not None and canonical_table.enabled:
-            # Canonical artifacts are loaded independently by every worker.
-            # The frontend strategy is only the request-routing marker that
-            # carries constraint_step/beam_suffix through the beam protocol.
-            self.constraint_strategy = ConstraintTableStrategy(canonical_table.path or "")
-            self.constraint_strategy.digest = canonical_table.artifact_digest
-            self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
-        elif effective_catalog_path is not None:
-            self.constraint_strategy = create_constraint_strategy(
-                backend=effective_backend,
-                tokenizer=self.get_tokenizer(),
-                catalog_path=effective_catalog_path,
-            )
-            self.constraint_coordinator = BeamConstraintCoordinator(self.constraint_strategy)
-            if isinstance(self.constraint_strategy, TrieConstraintStrategy):
-                self.catalog = self.constraint_strategy.catalog
-            elif isinstance(self.constraint_strategy, ConstraintTableStrategy):
-                # Constraint Tables compile on the driver and are broadcast to
-                # every worker before any beam-search step runs.  Failing here
-                # is a hard startup error — never a silent fall back to Trie.
-                model_config = self.llm_engine.model_config
-                get_vocab_size = getattr(model_config, "get_vocab_size", None)
-                vocab_size = (
-                    get_vocab_size() if callable(get_vocab_size) else model_config.vocab_size
-                )
-                resource = install_constraint_table(
-                    self.llm_engine,
-                    catalog_path=effective_catalog_path,
-                    tokenizer=self.get_tokenizer(),
-                    vocab_size=vocab_size,
-                )
-                self.constraint_strategy.digest = resource.digest
-
         if resolved_gr.beam_execution_mode is BeamExecutionMode.V1:
             from vllm_gr.utils.engine_lifecycle import acquire_frontend_startup_heap
 

@@ -131,8 +131,8 @@ def _install_fake_vllm_modules(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # vllm_gr.sampling_params subclasses the upstream BeamSearchParams, which is
     # a msgspec Struct (``dict=True, omit_defaults=True`` subclass kwargs).
-    class BeamSearchParams(  # type: ignore[call-arg]
-        msgspec.Struct,  # type: ignore[misc]
+    class BeamSearchParams(
+        msgspec.Struct,
         dict=True,
         omit_defaults=True,
     ):
@@ -361,126 +361,49 @@ class TestEngineArgsGrInitPatch:
         assert GRConfig.from_vllm_config(result) == GRConfig()
 
 
-class TestGrllmThreadsBackendIntoSuper:
-    """GRLLM.__init__ must forward the GR values into the EngineArgs kwargs."""
-
-    def _import_gr_and_patch_strategy(self, monkeypatch: pytest.MonkeyPatch) -> Any:
-        """Import GRLLM with the strategy/install call sites stubbed out."""
+class TestGrllmCanonicalConstruction:
+    def _import_gr(self, monkeypatch: pytest.MonkeyPatch) -> Any:
         import vllm_gr.entrypoints.gr as gr
-        import vllm_gr.plugin as plugin
-        from vllm_gr.constraints.strategies import ConstraintTableStrategy
-
-        monkeypatch.setattr(
-            gr,
-            "create_constraint_strategy",
-            lambda backend, tokenizer, catalog_path: ConstraintTableStrategy(catalog_path),
-        )
-        monkeypatch.setattr(
-            gr,
-            "install_constraint_table",
-            lambda engine, *, catalog_path, tokenizer, vocab_size: SimpleNamespace(digest="d-123"),
-        )
-        # ``GRLLM.__init__`` runs the full runtime initialization
-        # (check_environment + re_apply_patches + EngineCore entrypoint swap).
-        # The patch plan imports real vLLM serving/engine modules, which the
-        # fake non-package ``vllm.utils`` above shadows; the entrypoint swap
-        # additionally patches the real ``EngineCoreProc``.  Neither belongs
-        # to the wiring contract under test here (see
-        # test_pangu_llm_passthrough.py for initialize_runtime coverage), so
-        # both are stubbed at the plugin boundary.
-        monkeypatch.setattr(plugin, "initialize_runtime", lambda: {"patch_count": 0})
         import vllm_gr.entrypoints.openai.beam_search_patch as beam_search_patch
+        import vllm_gr.plugin as plugin
 
+        monkeypatch.setattr(plugin, "initialize_runtime", lambda: {"patch_count": 0})
         monkeypatch.setattr(beam_search_patch, "patch_engine_core_process_entrypoint", lambda: None)
+        monkeypatch.setattr(gr, "_install_renderer_eos_token_id_cache", lambda: None)
         return gr
 
-    def test_grllm_forwards_constraint_table_to_super(
+    def test_plain_construction_preserves_native_kwargs(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
-
-        patch_add_cli_args()
-        self._import_gr_and_patch_strategy(monkeypatch)
-        from vllm_gr.entrypoints.gr import GRLLM
-
-        llm = GRLLM(
-            model="Qwen/Qwen3-1.7B",
-            catalog_path="/models/triples.json",
-            constraint_backend="constraint_table",
-        )
-
-        # super().__init__ received the values for EngineArgs(model=..., **kwargs).
-        assert llm._last_kwargs["catalog_path"] == "/models/triples.json"
-        assert llm._last_kwargs["constraint_backend"] == "constraint_table"
-        # The offline strategy wiring still completes (compile + inject + digest).
-        assert llm.constraint_strategy.digest == "d-123"
-
-    def test_grllm_default_construction_threads_none_defaults(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
-
-        patch_add_cli_args()
-        self._import_gr_and_patch_strategy(monkeypatch)
-        from vllm_gr.entrypoints.gr import GRLLM
-
-        llm = GRLLM(model="Qwen/Qwen3-1.7B")
-
-        # constraint_backend default is None (not the TRIE enum): the
-        # arg_utils_gr patch treats the enum default as omitted so a
-        # canonical config can pass through **kwargs unchanged.
-        assert llm._last_kwargs["catalog_path"] is None
-        assert llm._last_kwargs["constraint_backend"] is None
-        assert llm.constraint_strategy is None
-        assert llm.catalog is None
-
-    def test_grllm_raises_when_gr_patch_not_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without the arg_utils patch, a constrained GRLLM must fail loudly."""
-        self._import_gr_and_patch_strategy(monkeypatch)
-        from vllm_gr.entrypoints.gr import GRLLM
-
-        with pytest.raises(RuntimeError, match="runtime patches are not active"):
-            GRLLM(
-                model="Qwen/Qwen3-1.7B",
-                catalog_path="/models/triples.json",
-                constraint_backend="constraint_table",
-            )
-
-    def test_grllm_plain_construction_without_patch_is_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A default GRLLM (no catalog) must work without the patch."""
-        self._import_gr_and_patch_strategy(monkeypatch)
-        from vllm_gr.entrypoints.gr import GRLLM
-
-        llm = GRLLM(model="Qwen/Qwen3-1.7B")
-
+        gr = self._import_gr(monkeypatch)
+        llm = gr.GRLLM(model="model")
         assert llm._last_kwargs == {}
-        assert llm.constraint_strategy is None
+        assert not hasattr(llm, "constraint_strategy")
 
-    def test_grllm_trie_catalog_without_patch_is_unchanged(
+    @pytest.mark.parametrize(
+        "kwargs",
+        [  # type: ignore[misc]
+            {"catalog_path": "/missing/catalog.json"},
+            {"constraint_backend": "trie"},
+            {"constraint_backend": "constraint_table"},
+        ],
+    )
+    def test_legacy_arguments_rejected_before_initialization(
+        self, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, str]
+    ) -> None:
+        gr = self._import_gr(monkeypatch)
+        initialize = mock.Mock(side_effect=AssertionError("must reject before runtime startup"))
+        monkeypatch.setattr("vllm_gr.plugin.initialize_runtime", initialize)
+        with pytest.raises(ValueError, match="removed.*vllm_gr_config"):
+            gr.GRLLM(model="model", **kwargs)
+        initialize.assert_not_called()
+
+    def test_canonical_config_passed_without_legacy_injection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A Trie catalog (default backend) must not demand an explicit backend.
-
-        Regression: the Pangu OneRec offline benchmark constructs
-        ``GRLLM(model, catalog_path=...)`` with the default Trie backend.
-        ``GRLLM.__init__`` now runs ``initialize_runtime()`` explicitly, so the
-        EngineArgs patch is always active by the time the kwargs are threaded;
-        the catalog reaches ``vllm_config.additional_config`` and the strategy
-        is built from the resolved config.  With the patch genuinely absent
-        (a defensive-only state) construction must still not raise — the
-        strategy is simply not built.
-        """
-        self._import_gr_and_patch_strategy(monkeypatch)
-        from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
-        from vllm_gr.entrypoints.gr import GRLLM
-
-        # Patch-active (the guaranteed post-initialize_runtime state): the
-        # catalog threads through and the strategy builds from the config.
-        patch_add_cli_args()
-        llm = GRLLM(model="Qwen/Qwen3-1.7B", catalog_path="/models/catalog.json")
-
-        assert llm._last_kwargs["catalog_path"] == "/models/catalog.json"
-        assert llm._last_kwargs["constraint_backend"] is None
-        assert llm.constraint_strategy is not None
+        gr = self._import_gr(monkeypatch)
+        config = {"schema_version": 1, "beam": {"execution_mode": "v1"}}
+        llm = gr.GRLLM(model="model", vllm_gr_config=config, async_scheduling=True)
+        assert llm._last_kwargs == {"vllm_gr_config": config, "async_scheduling": True}
+        assert llm._last_kwargs["vllm_gr_config"] is config
+        assert not hasattr(llm, "constraint_coordinator")
