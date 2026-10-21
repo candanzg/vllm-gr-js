@@ -4,14 +4,11 @@ import os
 import sys
 import time
 import traceback
+from importlib import import_module
 from typing import Literal
 
 import aiohttp
 import requests
-import vllm
-import vllm.benchmarks.datasets
-import vllm.benchmarks.serve
-import vllm.benchmarks.throughput
 from tqdm import tqdm
 from vllm.benchmarks.datasets import add_dataset_parser as original_add_parser
 from vllm.benchmarks.datasets import get_samples as original_get_samples
@@ -436,7 +433,7 @@ def patched_add_cli_args(parser):
     parser.add_argument(
         "--beam-search-v1",
         action="store_true",
-        help="Use canonical V1 and measure sequential text-to-text cache misses",
+        help="Select Beam benchmarking (all GR Beam benchmarks use V1)",
     )
     parser.add_argument("--constraint-triples", help="Canonical three-step constraint JSON for V1")
     parser.add_argument(
@@ -498,29 +495,16 @@ def patched_validate_args(args):
 
 
 def _run_offline_beam_search_benchmark(args):
-    """
-    Run offline beam search benchmark for OneRec dataset.
-
-    This is called when --use-beam-search is specified for offline throughput mode.
-    It replaces the standard throughput benchmark for beam search scenarios.
-    """
-
-    try:
-        from vllm_gr.sampling_params import BeamSearchParams
-    except ImportError:
-        from vllm.sampling_params import BeamSearchParams
+    """Run the supported OneRec Beam benchmark through persistent V1."""
     from transformers import AutoTokenizer
 
+    from benchmarks.open_one_rec.one_rec_v1_benchmark import run_v1_benchmark
     from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
-    from vllm_gr.entrypoints.gr import GRLLM
 
-    # Initialize tokenizer
+    if not getattr(args, "constraint_triples", None) or not getattr(args, "output_json", None):
+        raise ValueError("Offline Beam V1 requires --constraint-triples and --output-json")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-
-    use_v1 = getattr(args, "beam_search_v1", False)
-    sample_size = max(args.num_prompts, args.warmup_requests) if use_v1 else args.num_prompts
-    # Load dataset
-    logger.info(f"Loading OneRec dataset from {args.dataset_path}")
+    sample_size = max(args.num_prompts, args.warmup_requests)
     dataset = OneRecDataset(
         dataset_path=args.dataset_path,
         task_types=args.task_types.split(","),
@@ -529,92 +513,12 @@ def _run_offline_beam_search_benchmark(args):
         sample_size=sample_size,
         enable_thinking=getattr(args, "enable_thinking", None),
     )
-
-    # Sample requests
     requests = dataset.sample(
         num_requests=sample_size,
-        no_oversample=use_v1,
+        no_oversample=True,
         tokenizer=tokenizer,
     )
-
-    if use_v1:
-        from benchmarks.open_one_rec.one_rec_v1_benchmark import run_v1_benchmark
-
-        run_v1_benchmark(args, tokenizer, requests)
-        return
-
-    prompts = [{"prompt": req.prompt} for req in requests]
-
-    # Create beam search parameters
-    beam_width = getattr(args, "n", 8)
-    max_tokens = requests[0].expected_output_len if requests else 128
-    if hasattr(args, "output_len") and args.output_len is not None:
-        max_tokens = args.output_len
-
-    params = BeamSearchParams(
-        beam_width=beam_width,
-        max_tokens=max_tokens,
-        temperature=0.0,
-    )
-
-    # Add vLLM-GR specific parameters if available
-    if hasattr(BeamSearchParams, "begin_token"):
-        params.begin_token = "<|sid_begin|>"
-        params.end_token = "<|sid_end|>"
-
-    logger.info(f"Running beam search benchmark with {beam_width} beams on {len(prompts)} prompts")
-    logger.info(f"Max tokens per request: {max_tokens}")
-
-    # Keep engine cleanup scoped to the process that owns the offline engine.
-    # Online benchmarks are clients of a separate server and must not register
-    # process-wide vLLM distributed cleanup callbacks.
-    logger.info(f"Initializing GRLLM with model: {args.model}")
-    with GRLLM(
-        model=args.model,
-        trust_remote_code=True,
-        max_logprobs=args.max_logprobs if hasattr(args, "max_logprobs") else 2048,
-        attention_config={"backend": "CUSTOM"},
-        # Add other relevant vLLM arguments if available in args
-        **(
-            {"max_num_batched_tokens": getattr(args, "max_num_batched_tokens", None)}
-            if hasattr(args, "max_num_batched_tokens") and args.max_num_batched_tokens
-            else {}
-        ),
-    ) as llm:
-        start_time = time.perf_counter()
-        outputs = llm.beam_search(prompts, params)
-        end_time = time.perf_counter()
-
-    # Calculate metrics
-    total_tokens = sum(len(output.sequences) * max_tokens for output in outputs)
-    elapsed_time = end_time - start_time
-
-    # Prepare results
-    results = {
-        "elapsed_time": elapsed_time,
-        "num_requests": len(prompts),
-        "total_num_tokens": total_tokens,
-        "requests_per_second": len(prompts) / elapsed_time,
-        "tokens_per_second": total_tokens / elapsed_time,
-        "beam_width": beam_width,
-    }
-
-    logger.info("\n" + "=" * 60)
-    logger.info("Offline Beam Search Benchmark Results")
-    logger.info("=" * 60)
-    for key, value in results.items():
-        if isinstance(value, float):
-            logger.info(f"{key}: {value:.2f}")
-        else:
-            logger.info(f"{key}: {value}")
-    logger.info("=" * 60)
-
-    # Save results if requested
-    if hasattr(args, "output_json") and args.output_json:
-        os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
-        with open(args.output_json, "w") as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"\nResults saved to: {args.output_json}")
+    run_v1_benchmark(args, tokenizer, requests)
 
 
 def patched_main(args):
@@ -669,15 +573,21 @@ def patched_serve_main(args):
 # ============================================================================
 logger.info("Patching vllm.benchmarks for OneRec support")
 
-vllm.benchmarks.datasets.get_samples = patched_get_samples
-vllm.benchmarks.datasets.add_dataset_parser = patched_add_parser
-vllm.benchmarks.throughput.add_cli_args = patched_add_cli_args
-vllm.benchmarks.throughput.get_requests = patched_get_requests
-vllm.benchmarks.throughput.validate_args = patched_validate_args
-vllm.benchmarks.throughput.main = patched_main
-vllm.benchmarks.serve.add_cli_args = patched_serve_add_cli_args
-vllm.benchmarks.serve.get_samples = patched_get_samples
-vllm.benchmarks.serve.main = patched_serve_main
+# Cached submodules may outlive their parent-package attribute bindings.
+# Resolve the actual modules rather than traversing vllm.benchmarks attributes.
+_datasets_module = import_module("vllm.benchmarks.datasets")
+_throughput_module = import_module("vllm.benchmarks.throughput")
+_serve_module = import_module("vllm.benchmarks.serve")
+
+_datasets_module.get_samples = patched_get_samples
+_datasets_module.add_dataset_parser = patched_add_parser
+_throughput_module.add_cli_args = patched_add_cli_args
+_throughput_module.get_requests = patched_get_requests
+_throughput_module.validate_args = patched_validate_args
+_throughput_module.main = patched_main
+_serve_module.add_cli_args = patched_serve_add_cli_args
+_serve_module.get_samples = patched_get_samples
+_serve_module.main = patched_serve_main
 
 # Also patch the CLI module if it already imported the original reference
 if "vllm.entrypoints.cli.benchmark.serve" in sys.modules:

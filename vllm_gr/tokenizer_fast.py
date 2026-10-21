@@ -57,8 +57,13 @@ def _rust_decode_verified(tokenizer, backend) -> bool:
     Probed once per tokenizer instance (cached weakly).  Every *special*
     added token is compared (these are exactly the ids whose handling can
     diverge), plus a small sample of regular added tokens, under both
-    ``skip_special_tokens`` values.
+    ``skip_special_tokens`` values.  Wrapper cleanup can change multi-token
+    sequences, so it must be disabled before using the raw backend.
     """
+    # Check before the cached probe: this setting can change at runtime.
+    if getattr(tokenizer, "clean_up_tokenization_spaces", False):
+        return False
+
     try:
         cached = _RUST_DECODE_VERIFIED.get(tokenizer)
     except TypeError:

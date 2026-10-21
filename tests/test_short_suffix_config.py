@@ -3,7 +3,7 @@
 # mypy: disallow-untyped-decorators=False
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -42,6 +42,8 @@ def test_config_roundtrip(enabled: bool, capacity: int) -> None:
     worker = SimpleNamespace(additional_config={})
     legacy.write_to_vllm_config(worker)
     assert GRConfig.from_vllm_config(worker) == legacy
+    GRConfig(beam_max_width=256).write_to_vllm_config(worker)
+    assert GRConfig.from_vllm_config(worker).enable_short_suffix_attention is False
 
 
 @pytest.mark.parametrize("value", [None, "1", 1])
@@ -50,11 +52,159 @@ def test_config_requires_boolean(value: Any) -> None:
         GRConfig(beam_max_width=128, enable_short_suffix_attention=value)
 
 
-def test_config_default_and_capacity() -> None:
-    assert GRConfig().enable_short_suffix_attention is False
-    with pytest.raises(ValueError, match="requires max_width"):
-        GRConfig(enable_short_suffix_attention=True)
-    assert GRConfig(beam_max_width=128, beam_max_decode_steps=32)
+@pytest.mark.parametrize("width", [None, 128])
+def test_config_defaults_disable_short_suffix_with_or_without_beam_pool(
+    width: int | None,
+) -> None:
+    config = GRConfig(beam_max_width=width)
+    assert config.enable_short_suffix_attention is False
+    assert GRConfig().enabled is False
+    worker = SimpleNamespace(additional_config={"vllm_gr_beam_max_width": width})
+    assert GRConfig.from_vllm_config(worker) == config
+    canonical = gr_config_from_mapping(
+        {
+            "schema_version": 1,
+            "beam": {"max_width": width},
+            "constraint_table": {"max_top_k": 128},
+        }
+    )
+    assert canonical.enable_short_suffix_attention is False
+    assert gr_config_from_mapping(gr_config_to_mapping(canonical)) == canonical
+
+
+def _short_suffix_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    *,
+    enabled: bool | None = None,
+    width: int | None = 128,
+    cuda: bool = True,
+    fa_version: Literal[2, 3, 4] | None = None,
+    custom: bool = True,
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    from vllm.config import AttentionConfig
+
+    from vllm_gr.config import (
+        BeamExecutionMode,
+        ConstraintTableConfig,
+        GRAttentionBackend,
+    )
+    from vllm_gr.engine import arg_utils_gr
+
+    options: dict[str, Any] = {} if enabled is None else {"enable_short_suffix_attention": enabled}
+    if source == "canonical":
+        options.update(schema_version=1, constraint_table=ConstraintTableConfig(max_top_k=128))
+    gr_config = GRConfig(
+        beam_max_width=width,
+        beam_execution_mode=BeamExecutionMode.V1,
+        attention_backend=GRAttentionBackend.CUSTOM if custom else None,
+        **options,
+    )
+    config = SimpleNamespace(
+        additional_config={},
+        attention_config=AttentionConfig(flash_attn_version=fa_version),
+        scheduler_config=SimpleNamespace(async_scheduling=True, enable_chunked_prefill=False),
+    )
+    args = SimpleNamespace()
+    if source == "canonical":
+        args._vllm_gr_config_input = gr_config_to_mapping(gr_config)
+    else:
+        gr_config.write_to_vllm_config(config)
+    monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *args: config)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: cuda)
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: not cuda)
+    return config, args
+
+
+@pytest.mark.parametrize("source", ["canonical", "legacy"])
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({}, None),
+        ({"enabled": True}, None),
+        ({"fa_version": 2}, 2),
+        ({"fa_version": 3}, 3),
+        ({"fa_version": 4}, 4),
+        ({"enabled": True, "fa_version": 2}, 2),
+        ({"enabled": False}, None),
+        ({"enabled": False, "fa_version": 3}, 3),
+        ({"enabled": False, "fa_version": 4}, 4),
+        ({"width": None}, None),
+        ({"cuda": False}, None),
+        ({"custom": False}, None),
+    ],
+)
+def test_engine_preserves_flash_attention_version(
+    monkeypatch: pytest.MonkeyPatch, source: str, options: dict[str, Any], expected: int | None
+) -> None:
+    from vllm_gr.engine import arg_utils_gr
+
+    config, args = _short_suffix_engine_config(monkeypatch, source, **options)
+    assert arg_utils_gr.create_engine_config(args) is config
+    assert config.attention_config.flash_attn_version == expected
+    assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is options.get(
+        "enabled", False
+    )
+
+
+@pytest.mark.parametrize("source", ["canonical", "legacy"])
+@pytest.mark.parametrize(
+    ("enabled", "fa_version"),
+    [(None, None), (False, None), (None, 2), (True, 2), (True, None), (True, 3)],
+)
+def test_sm90_default_preserves_fa3_and_fusion_requires_explicit_fa2(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    enabled: bool | None,
+    fa_version: Literal[2, 3] | None,
+) -> None:
+    import vllm.config
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends import fa_utils
+
+    from vllm_gr.engine import arg_utils_gr
+    from vllm_gr.v1.attention.backends import beam_attn, beam_attn_gpu
+
+    flash = pytest.importorskip("vllm.vllm_flash_attn.flash_attn_interface")
+    config, args = _short_suffix_engine_config(
+        monkeypatch, source, enabled=enabled, fa_version=fa_version
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(
+        fa_utils,
+        "current_platform",
+        SimpleNamespace(
+            is_xpu=lambda: False,
+            is_rocm=lambda: False,
+            get_device_capability=lambda: DeviceCapability(9, 0),
+        ),
+    )
+    monkeypatch.setattr(flash, "is_fa_version_supported", lambda version: version in (2, 3))
+    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    monkeypatch.setattr(beam_attn, "NPU_DEVICE", False)
+    monkeypatch.setattr(beam_attn, "_get_platform_execution_module", lambda: beam_attn_gpu)
+    # Exercise the installed vLLM selector: an ordinary SM90 default is FA3.
+    expected = 3 if fa_version is None else fa_version
+    assert beam_attn_gpu.get_flash_attn_version(head_size=128) == expected
+    arg_utils_gr.create_engine_config(args)
+    assert config.attention_config.flash_attn_version == fa_version
+    assert GRConfig.from_vllm_config(config).enable_short_suffix_attention is (enabled is True)
+    kwargs: dict[str, Any] = dict(
+        num_heads=16,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=8,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+    if enabled is True and expected != 2:
+        with pytest.raises(ValueError, match="FlashAttention 2"):
+            beam_attn.BeamAttentionImpl(**kwargs)
+    else:
+        impl = beam_attn.BeamAttentionImpl(**kwargs)
+        assert impl.vllm_flash_attn_version == expected
+        assert impl.supports_quant_query_input is (enabled is not True)
 
 
 @pytest.mark.parametrize("capacity", [0, -1])
@@ -429,22 +579,23 @@ def test_cascade_nonpure_batches_use_generic_attention_without_overwriting_other
     torch.testing.assert_close(case.output, expected)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("cuda", [False, True])
+@pytest.mark.parametrize("width", [None, 128])
+@pytest.mark.parametrize("enabled", [None, False, True])
 def test_layer_constructor_validates_before_execution(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool
+    monkeypatch: pytest.MonkeyPatch, enabled: bool | None, width: int | None, cuda: bool
 ) -> None:
     import vllm.config
 
     from vllm_gr.v1.attention.backends import beam_attn
 
-    config = SimpleNamespace(
-        additional_config={
-            "vllm_gr_enable_short_suffix_attention": enabled,
-            "vllm_gr_beam_max_width": 128,
-        }
-    )
+    additional_config: dict[str, Any] = {"vllm_gr_beam_max_width": width}
+    if enabled is not None:
+        additional_config["vllm_gr_enable_short_suffix_attention"] = enabled
+    config = SimpleNamespace(additional_config=additional_config)
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", True)
+    monkeypatch.setattr(beam_attn, "CUDA_DEVICE", cuda)
+    monkeypatch.setattr(beam_attn, "NPU_DEVICE", not cuda)
     monkeypatch.setattr(
         beam_attn,
         "_get_platform_execution_module",
@@ -460,7 +611,8 @@ def test_layer_constructor_validates_before_execution(
         "kv_cache_dtype": "auto",
         "logits_soft_cap": 10.0,
     }
-    if enabled:
+    active = cuda and width is not None and enabled is True
+    if active:
         with pytest.raises(ValueError, match="softcap"):
             beam_attn.BeamAttentionImpl(**kwargs)
     else:
@@ -468,4 +620,4 @@ def test_layer_constructor_validates_before_execution(
 
     kwargs["logits_soft_cap"] = 0.0
     impl = beam_attn.BeamAttentionImpl(**kwargs)
-    assert impl.supports_quant_query_input is (not enabled)
+    assert impl.supports_quant_query_input is (not active)

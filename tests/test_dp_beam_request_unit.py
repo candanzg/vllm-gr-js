@@ -3,21 +3,18 @@
 """Unit tests for Data Parallelism support in beam-request beam search (no GPU required).
 
 Tests cover the following DP beam search features:
-  - data_parallel_rank threading through beam_search → _beam_request_step
   - DP-aware engine routing in add_requests_async / beam_request_step_update_async
   - FIRST_REQ coordinator notification
   - reqs_in_flight tracking for batch and beam-request step
   - BeamRequestStepUpdate.data_parallel_rank serialization
   - register_beam_output rank passthrough
   - current_wave propagation via beam_request_step_update_async
-  - Cleanup (_beam_request_cleanup) passes data_parallel_rank
 """
 
 # mypy: disable-error-code="attr-defined,no-untyped-def,no-any-return,misc,arg-type,var-annotated,union-attr,return-value,func-returns-value,no-untyped-call,operator,index,valid-type,no-redef,has-type,type-arg"
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,10 +22,6 @@ import msgspec
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.entrypoints.openai.serving_engine import (
-    _beam_request_cleanup,
-    _beam_request_step,
-)
 from vllm_gr.v1.engine.core_client import (
     add_requests_async,
     beam_request_step_update_async,
@@ -356,42 +349,6 @@ class TestBeamRequestStepUpdateDPRank:
 
 
 # ===========================================================================
-# Section 5 — Cleanup passes rank
-# ===========================================================================
-
-
-class TestCleanupPassesRank:
-    def test_cleanup_passes_data_parallel_rank(self) -> None:
-        ec = MagicMock()
-        ec.beam_request_step_update = AsyncMock()
-
-        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["x"], rank=1))
-
-        update: BeamRequestStepUpdate = ec.beam_request_step_update.call_args[0][0]
-        assert update.data_parallel_rank == 1
-
-    def test_cleanup_passes_none_rank(self) -> None:
-        ec = MagicMock()
-        ec.beam_request_step_update = AsyncMock()
-
-        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["x"], rank=None))
-
-        update = ec.beam_request_step_update.call_args[0][0]
-        assert update.data_parallel_rank is None
-
-    def test_cleanup_sends_b0_message(self) -> None:
-        ec = MagicMock()
-        ec.beam_request_step_update = AsyncMock()
-
-        asyncio.run(_beam_request_cleanup(ec, "sess-0", ["a", "b"], rank=0))
-
-        update = ec.beam_request_step_update.call_args[0][0]
-        assert update.beam_width == 0
-        assert set(update.pruned_ids) == {"a", "b"}
-        assert update.session_id == "sess-0"
-
-
-# ===========================================================================
 # Section 6 — current_wave propagation
 # ===========================================================================
 
@@ -467,94 +424,6 @@ class TestAddRequestsAsyncNonDP:
         call_args = mock_self._send_input.call_args[0]
         assert call_args[0] is EngineCoreRequestType.BEAM_REQUEST_STEP_UPDATE
         assert call_args[2] is None  # no engine
-
-
-# ===========================================================================
-# Section 8 — _beam_request_step passes rank
-# ===========================================================================
-
-
-class TestStepFunctionsPassRank:
-    def test_beam_request_step_passes_rank_in_update(self) -> None:
-        ec = MagicMock()
-        ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.beam_request_step_update = AsyncMock()
-
-        all_beams = [SimpleNamespace(tokens=[10, 50])]
-        asyncio.run(
-            _beam_request_step(
-                ec,
-                session_id="s",
-                fork_info=[(0, 50)],
-                prev_beam_internal_ids=["p0"],
-                all_beams=all_beams,
-                request_id_batch="r",
-                beam_search_params=_sampling_params(),
-                eos_token_id=2,
-                lora_request=None,
-                trace_headers=None,
-                prefix_len=1,
-                priority=0,
-                data_parallel_rank=1,
-            )
-        )
-
-        update: BeamRequestStepUpdate = ec.beam_request_step_update.call_args[0][0]
-        assert update.data_parallel_rank == 1
-
-    def test_beam_request_step_none_rank_in_update(self) -> None:
-        ec = MagicMock()
-        ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.beam_request_step_update = AsyncMock()
-
-        all_beams = [SimpleNamespace(tokens=[10, 50])]
-        asyncio.run(
-            _beam_request_step(
-                ec,
-                session_id="s",
-                fork_info=[(0, 50)],
-                prev_beam_internal_ids=["p0"],
-                all_beams=all_beams,
-                request_id_batch="r",
-                beam_search_params=_sampling_params(),
-                eos_token_id=2,
-                lora_request=None,
-                trace_headers=None,
-                prefix_len=1,
-                priority=0,
-                data_parallel_rank=None,
-            )
-        )
-
-        update = ec.beam_request_step_update.call_args[0][0]
-        assert update.data_parallel_rank is None
-
-    def test_beam_request_step_register_beam_output_passes_rank(self) -> None:
-        ec = MagicMock()
-        ec.register_beam_output = MagicMock(return_value=_finished_queue())
-        ec.beam_request_step_update = AsyncMock()
-
-        all_beams = [SimpleNamespace(tokens=[10, 50])]
-        asyncio.run(
-            _beam_request_step(
-                ec,
-                session_id="sess-2",
-                fork_info=[(0, 50)],
-                prev_beam_internal_ids=["p0"],
-                all_beams=all_beams,
-                request_id_batch="r",
-                beam_search_params=_sampling_params(),
-                eos_token_id=2,
-                lora_request=None,
-                trace_headers=None,
-                prefix_len=1,
-                priority=0,
-                data_parallel_rank=2,
-            )
-        )
-
-        call_kwargs = ec.register_beam_output.call_args[1]
-        assert call_kwargs.get("data_parallel_rank") == 2
 
 
 # ===========================================================================

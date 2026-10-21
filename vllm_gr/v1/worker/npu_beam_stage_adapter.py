@@ -95,16 +95,40 @@ class NPUEagerStagePlan:
                 "scheduler total does not match logical request token counts"
             )
         if execution.kind == "prefill":
-            if not execution.produces_output or counts != execution.num_prompt_tokens_by_request:
+            if not execution.produces_output:
                 raise BeamExecutionContractError(
-                    "NPU eager Multi-Batch Prefill must contain every prompt token"
+                    "NPU eager execution requires a complete output-producing Prefill"
                 )
-            logits = tuple(offset - 1 for offset in execution.prompt_token_offsets[1:])
+            # Native new-request data snapshots the cached prefix before this
+            # dispatch. Only the remaining prompt tokens have hidden-state rows.
+            computed_by_request = {
+                request.req_id: request.num_computed_tokens
+                for request in getattr(scheduler_output, "scheduled_new_reqs", ())
+            }
+            logits = []
+            offset = 0
+            for request_id, count, length in zip(
+                execution.request_ids, counts, execution.num_prompt_tokens_by_request, strict=True
+            ):
+                computed = computed_by_request.get(request_id, 0)
+                if (
+                    isinstance(computed, bool)
+                    or not isinstance(computed, int)
+                    or computed < 0
+                    or computed + count != length
+                ):
+                    raise BeamExecutionContractError(
+                        "NPU Prefill must complete each prompt: "
+                        f"request_id={request_id!r}, cached_tokens={computed!r}, "
+                        f"scheduled_tokens={count}, prompt_tokens={length}"
+                    )
+                offset += count
+                logits.append(offset - 1)
             return cls(
                 execution,
                 counts,
                 total,
-                logits,
+                tuple(logits),
                 tuple(range(execution.batch_size)),
                 None,
             )

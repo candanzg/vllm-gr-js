@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -406,6 +408,87 @@ def test_engine_creation_writes_enabled_canonical_config(
         pytest.raises(ValueError, match="cannot be combined"),
     ):
         create_engine_config(conflicting_engine_args)
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])  # type: ignore[misc]
+def test_benchmark_server_command_uses_canonical_attention_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    import huggingface_hub.constants
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    from vllm_gr.engine import arg_utils_gr
+    from vllm_gr.entrypoints.cli.serve import GRServeSubcommand
+
+    raw = _canonical_mapping(str(tmp_path / "table.safetensors"))
+    raw["attention_backend"] = "CUSTOM"
+    raw["beam"] = {
+        "execution_mode": "v1",
+        "max_width": 128,
+        "max_decode_steps": 3,
+        "graph_enabled": device == "cuda",
+        "worker_decision": True,
+    }
+    table = raw["constraint_table"]
+    assert isinstance(table, dict)
+    table["backend"] = device
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+
+    # Execute the actual server command with an argument recorder instead of
+    # launching a model. This catches legacy flags left behind in the script.
+    script = (Path(__file__).parent / "system/run_benchmark_and_verify.sh").read_text()
+    command = script.split('echo "Starting OneRec online server"\n', 1)[1]
+    command = command.split("\nSERVER_PID=$!", 1)[0]
+    captured = subprocess.run(
+        [
+            "bash",
+            "-eu",
+            "-c",
+            r"""vllm-gr() { printf '%s\0' "$@"; }
+"""
+            + command
+            + "\nwait",
+        ],
+        env={
+            **os.environ,
+            "config_path": str(config_path),
+            "run_port": "7000",
+            "MODEL_PATH": str(tmp_path),
+        },
+        capture_output=True,
+        check=True,
+    )
+    parser = FlexibleArgumentParser()
+    serve = GRServeSubcommand()
+    serve.subparser_init(parser.add_subparsers(dest="subparser"))
+    args = parser.parse_args(captured.stdout.decode().split("\0")[:-1])
+    serve.validate(args)
+    # ServeSubcommand.cmd normally normalizes the positional model before
+    # constructing EngineArgs. Keep this config-only test local and offline.
+    args.model = args.model_tag
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    engine_args = arg_utils_gr.from_cli_args(EngineArgs, args)
+    assert engine_args.model == str(tmp_path)
+    config = SimpleNamespace(
+        additional_config={},
+        attention_config=SimpleNamespace(backend=None),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=args.async_scheduling,
+            enable_chunked_prefill=args.enable_chunked_prefill,
+        ),
+    )
+    monkeypatch.setattr(arg_utils_gr, "origin_create_engine_config", lambda *a: config)
+    monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: device == "cuda")
+    monkeypatch.setattr(arg_utils_gr, "_is_npu_platform", lambda: device == "npu")
+
+    result = arg_utils_gr.create_engine_config(engine_args)
+
+    assert result.attention_config.backend is AttentionBackendEnum.CUSTOM
+    assert result.additional_config[GR_CONFIG_KEY]["attention_backend"] == "CUSTOM"
+    assert result.additional_config[GR_CONFIG_KEY]["constraint_table"]["backend"] == device
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]

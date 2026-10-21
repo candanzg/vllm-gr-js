@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Core contracts for GPU ModelRunner wrappers."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -1153,11 +1154,15 @@ def test_capture_beam_decode_graph_forwards_run_under_inference_mode(
     assert graph.installed is True
 
 
-def test_create_beam_context_uses_grconfig_params() -> None:
+@pytest.mark.parametrize("device", ["cuda", "cpu", "privateuseone"])  # type: ignore[misc]
+@pytest.mark.parametrize("enabled", [None, False, True])  # type: ignore[misc]
+def test_create_beam_context_uses_grconfig_params(device: str, enabled: bool | None) -> None:
     """_create_beam_context must pass gr_cfg.max_width/max_decode_steps."""
     from unittest.mock import MagicMock, patch
 
     gr_cfg = GRConfig(beam_max_width=64, beam_max_decode_steps=10)
+    if enabled is not None:
+        gr_cfg = replace(gr_cfg, enable_short_suffix_attention=enabled)
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             get_num_kv_heads=lambda pc: 8,
@@ -1166,7 +1171,7 @@ def test_create_beam_context_uses_grconfig_params() -> None:
             dtype=torch.float16,
         ),
         parallel_config=SimpleNamespace(),
-        device=torch.device("cpu"),
+        device=torch.device(device),
     )
 
     with patch("vllm_gr.v1.beam.beam_attention_context.BeamAttentionContext") as MockCtx:
@@ -1180,7 +1185,9 @@ def test_create_beam_context_uses_grconfig_params() -> None:
         assert call_kwargs["max_decode_steps"] == 10
         assert call_kwargs["dtype"] is torch.float16
         assert call_kwargs["max_batch"] == 1
-        assert call_kwargs["enable_short_suffix_attention"] is False
+        assert call_kwargs["enable_short_suffix_attention"] is (
+            device == "cuda" and enabled is True
+        )
 
 
 def test_create_beam_context_dtype_from_model_config() -> None:

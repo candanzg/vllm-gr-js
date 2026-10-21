@@ -658,9 +658,13 @@ class BeamBatchSearchRunner:
         self.layout = layout
         self.state = first.state
         self.workspace = first.workspace
-        self.session = first.session
         self.state_index = 0
         self.workspace_index = 0
+
+    @property
+    def session(self) -> BeamSearchSession:
+        # Rebind replaces sessions; state/workspace retain their validated storage.
+        return self.runners[0].session
 
     @property
     def sessions(self) -> tuple[BeamSearchSession, ...]:

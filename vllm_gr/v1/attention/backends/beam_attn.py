@@ -205,9 +205,12 @@ class BeamAttentionImpl(AttentionImpl):
         from vllm_gr.config import GRConfig
 
         config = GRConfig.from_vllm_config(get_current_vllm_config_or_none())
-        if config.enable_short_suffix_attention:
-            if not CUDA_DEVICE:
-                raise ValueError("Short suffix attention requires CUDA")
+        short_suffix_attention = (
+            CUDA_DEVICE
+            and config.beam_max_width is not None
+            and config.enable_short_suffix_attention
+        )
+        if short_suffix_attention:
             from vllm_gr.v1.attention.backends.beam_attn_gpu import (
                 validate_short_suffix_attention,
             )
@@ -223,7 +226,7 @@ class BeamAttentionImpl(AttentionImpl):
                 self.sinks,
             )
         # The fused suffix consumes model-dtype queries, not quantized Q.
-        self.supports_quant_query_input = not config.enable_short_suffix_attention
+        self.supports_quant_query_input = not short_suffix_attention
         self.use_cascade = True
 
     @staticmethod

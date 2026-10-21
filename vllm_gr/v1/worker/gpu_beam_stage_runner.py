@@ -999,11 +999,28 @@ def get_stage_runner(
         or context.max_batch < view.batch_size
     ):
         raise ValueError("existing Beam context and workspace capacity are incompatible")
+    # Check live storage before resetting state or allocating new sessions.
+    # The key covers every pool and shared buffer; validating the final slot
+    # also checks capacity for all contiguous request-major rows.
+    # Do this before reuse_adapter so rejection cannot leave partially reset state.
+    resource_key = BeamSearchRunner.validate_resources(
+        context,
+        workspace,
+        beam_width=m.beam_params.beam_width,
+        max_new_tokens=m.beam_params.max_tokens,
+        kv_slot=view.batch_size - 1,
+    )
+    resources_match = existing is not None and all(
+        runner._resource_key == resource_key for runner in existing.beam.runners
+    )
+    if existing is not None and existing.graph is not None and not resources_match:
+        raise ValueError("captured Beam resource addresses or layouts changed")
     # The graph captures the adapter's fixed Forward and attention buffers,
     # not the request-local Beam state or its effective token budget.
     reuse_adapter = (
         existing is not None
         and existing.closed
+        and resources_match
         and existing.beam.state.beam_width == m.beam_params.beam_width
         and existing.beam.session.context is context
         and existing.beam.workspace is workspace

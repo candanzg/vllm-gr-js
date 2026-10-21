@@ -8,8 +8,10 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_gr.constraints.backend import ConstraintMetadata, ConstraintOutput
+from vllm_gr.v1.beam.execution_batch import BeamExecutionContractError
 from vllm_gr.v1.beam.npu_execution_batch import (
     NPUBeamExecutionBatch,
     restore_npu_cache_pool_layout,
@@ -79,6 +81,125 @@ def test_npu_eager_plan_keeps_logical_prefill_and_expands_decode_rows() -> None:
     assert next_decode.decode_positions == (3, 3, 3, 4, 4, 4)
     assert next_decode.execution.stage_index == 2
     assert next_decode.execution.decode_step == 1
+
+
+def _cached_prefill_output(cached: tuple[int, ...]) -> SimpleNamespace:
+    scheduled = _eager_stage_output(kind="prefill", batch_size=len(cached))
+    metadata = next(iter(scheduled.gr_stage_metadata.values()))
+    lengths = tuple(257 + 128 * index for index in range(len(cached)))
+    metadata.num_prompt_tokens_by_request = lengths
+    metadata.num_prompt_tokens = sum(lengths)
+    scheduled.scheduled_new_reqs = [
+        NewRequestData(
+            req_id=request_id,
+            prompt_token_ids=[1] * length,
+            mm_features=[],
+            sampling_params=None,
+            pooling_params=None,
+            block_ids=([index],),
+            num_computed_tokens=computed,
+            lora_request=None,
+        )
+        for index, (request_id, length, computed) in enumerate(
+            zip(metadata.request_ids, lengths, cached, strict=True)
+        )
+    ]
+    scheduled.num_scheduled_tokens = {
+        request.req_id: length - request.num_computed_tokens
+        for request, length in zip(scheduled.scheduled_new_reqs, lengths, strict=True)
+    }
+    scheduled.total_num_scheduled_tokens = sum(scheduled.num_scheduled_tokens.values())
+    return scheduled
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("cached", "expected_logits"),
+    [
+        ((0,), (256,)),
+        ((128,), (128,)),
+        ((256,), (0,)),
+        ((0, 0), (256, 641)),
+        ((128, 0), (128, 513)),
+        ((256, 384), (0, 1)),
+        ((128, 0, 512, 256), (128, 513, 514, 899)),
+        ((256, 384, 512, 640), (0, 1, 2, 3)),
+    ],
+)
+def test_npu_prefill_cache_hit_uses_scheduled_logits_and_full_decode_positions(
+    cached: tuple[int, ...], expected_logits: tuple[int, ...]
+) -> None:
+    scheduled = _cached_prefill_output(cached)
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    assert plan.logits_indices == expected_logits
+    assert plan.model_token_count == expected_logits[-1] + 1
+    assert plan.logical_scheduled_tokens == tuple(scheduled.num_scheduled_tokens.values())
+    assert tuple(r.num_computed_tokens for r in scheduled.scheduled_new_reqs) == cached
+
+    # Cached tokens contribute to Decode positions, but not Prefill hidden rows.
+    decode = _eager_stage_output(kind="decode", batch_size=len(cached))
+    metadata = next(iter(decode.gr_stage_metadata.values()))
+    metadata.num_prompt_tokens_by_request = plan.execution.num_prompt_tokens_by_request
+    metadata.num_prompt_tokens = sum(metadata.num_prompt_tokens_by_request)
+    decode_plan = NPUEagerStagePlan.from_scheduler_output(decode)
+    winners = torch.arange(len(cached) * 3, dtype=torch.int32).view(len(cached), 3)
+    input_ids = torch.empty(len(cached) * 3, dtype=torch.int32)
+    positions = torch.empty_like(input_ids)
+    NPUEagerFirstDecodeHandoff.from_prefill(plan, winners).bind_first_decode(
+        decode_plan, input_ids, positions
+    )
+    assert input_ids.tolist() == winners.flatten().tolist()
+    assert positions.tolist() == [
+        length for length in plan.execution.num_prompt_tokens_by_request for _ in range(3)
+    ]
+
+
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "fault",
+    ["chunk", "missing_progress", "short", "long", "negative", "noninteger", "boolean"],
+)
+def test_npu_prefill_rejects_incomplete_or_invalid_cached_progress(fault: str) -> None:
+    scheduled = _cached_prefill_output((128, 256))
+    request = scheduled.scheduled_new_reqs[0]
+    if fault == "chunk":
+        next(iter(scheduled.gr_stage_metadata.values())).produces_output = False
+    elif fault == "missing_progress":
+        scheduled.scheduled_new_reqs.clear()
+    elif fault in ("short", "long"):
+        scheduled.num_scheduled_tokens[request.req_id] += -1 if fault == "short" else 1
+        scheduled.total_num_scheduled_tokens = sum(scheduled.num_scheduled_tokens.values())
+    else:
+        setattr(
+            request,
+            "num_computed_tokens",
+            {"negative": -1, "noninteger": 128.0, "boolean": True}[fault],
+        )
+    with pytest.raises(BeamExecutionContractError):
+        NPUEagerStagePlan.from_scheduler_output(scheduled)
+
+
+def test_npu_prefill_preparation_preserves_cached_geometry() -> None:
+    scheduled = _cached_prefill_output((128, 0, 512, 256))
+    plan = NPUEagerStagePlan.from_scheduler_output(scheduled)
+    counts = np.asarray([129, 385, 1, 385], dtype=np.int32)
+    worker = SimpleNamespace(
+        device=torch.device("cpu"),
+        _current_scheduler_output=scheduled,
+        _current_beam_info={"req_ids": []},
+    )
+    stage = object.__new__(NPUEagerBeamStageRunner)
+    stage.worker, stage.pending_plan = worker, plan
+    hidden = torch.arange(900)
+    spec_metadata, compressed = object(), object()
+
+    def native(self: Any, output: Any, native_counts: Any) -> tuple[Any, ...]:
+        assert self is worker and output is scheduled and native_counts is counts
+        assert tuple(r.num_computed_tokens for r in output.scheduled_new_reqs) == (128, 0, 512, 256)
+        return object(), spec_metadata, 900, compressed
+
+    logits, spec, total, returned_compressed = stage.prepare_inputs(native, scheduled, counts)
+    assert hidden[logits.long()].tolist() == [128, 513, 514, 899]
+    assert spec is spec_metadata and returned_compressed is compressed and total == 900
+    assert counts.tolist() == [129, 385, 1, 385]
 
 
 def test_npu_prepare_unproxies_and_preserves_four_item_contract(
