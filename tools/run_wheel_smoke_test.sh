@@ -99,6 +99,11 @@ if target == "cuda" and requirements.get("vllm") != "==0.30.0":
     raise SystemExit(f"CUDA wheel has wrong vLLM requirement: {requirements.get('vllm')}")
 if target in {"cpu", "npu"} and "vllm" in requirements:
     raise SystemExit(f"{target} wheel unexpectedly depends on vLLM")
+# Loaded by file path from vllm_gr/lmcache_patch.py, so it must ship as package
+# data; without it the LMCache patch does nothing in wheel installs.
+adapter = origin.parent / "3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py"
+if not adapter.is_file():
+    raise SystemExit(f"wheel is missing the LMCache adapter: {adapter}")
 print(f"vllm-gr {version} from {origin}")
 PY
 )

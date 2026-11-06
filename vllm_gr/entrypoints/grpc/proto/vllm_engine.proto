@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copied from smg-grpc-proto==0.4.6: smg_grpc_proto/proto/vllm_engine.proto.
-// Upstream project: https://github.com/lightseekorg/smg
+// Upstream project: https://github.com/lightseekorg/smg (Apache-2.0)
 // GR extensions (original package, service, field numbers and methods retained):
 // - TokenizedInput.input_ids_i64_le = 3: optional binary int64 prompt.
 // - GenerateRequest.beam_search = 8: GR beam parameters.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copied from smg-grpc-proto==0.4.6: smg_grpc_proto/proto/common.proto.
-// Upstream project: https://github.com/lightseekorg/smg
+// Upstream project: https://github.com/lightseekorg/smg (Apache-2.0)
 // No schema changes; retained as a dependency of vllm_engine.proto.
 
 syntax = "proto3";

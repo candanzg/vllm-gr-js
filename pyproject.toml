@@ -32,6 +32,10 @@ classifiers = [
 # See README.md for platform installation instructions.
 
 [project.optional-dependencies]
+# Experimental gRPC entrypoint (`vllm-gr serve --grpc`). The smg-* packages come
+# from https://github.com/lightseekorg/smg and are Apache-2.0 licensed; the
+# extended .proto copies and their generated bindings live under
+# vllm_gr/entrypoints/grpc/ (see generated/README.md).
 grpc = [
     "grpcio>=1.84.0,<2",
     "protobuf>=7.35.1,<8",
@@ -50,6 +54,9 @@ dev = [
     "mypy",
     "psutil",
     "PyYAML>=6.0",
+    # Regenerates vllm_gr/entrypoints/grpc/generated/. Pinned: the bundled protoc
+    # version is written into the output, so another release yields a diff.
+    "grpcio-tools==1.84.0",
 ]
 # DEPRECATED: use `pip install -e .` — platform deps come from setup.py
 # Kept for one transition release so legacy `.[gpu]` installs still receive
@@ -76,7 +83,10 @@ where = ["."]
 include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
-"vllm_gr" = ["_version.py", "*.json"]
+# 3rd_party/ is not an importable package (its name is not an identifier) and
+# lmcache_patch.py loads the adapter by file path. include-package-data already
+# ships it via the VCS file list; declare it so packaging does not depend on that.
+"vllm_gr" = ["_version.py", "*.json", "3rd_party/**/*.py"]
 "vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
 
 [tool.setuptools_scm]

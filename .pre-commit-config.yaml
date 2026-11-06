@@ -191,6 +191,15 @@ repos:
       entry: python tools/pre_commit/check_english.py
       language: python
 
+    # always_run: the top-level exclude hides generated/ from every hook's file
+    # list, so a hand edit there would never trigger a file-scoped check.
+    - id: check-grpc-generated
+      name: Check gRPC bindings match their .proto sources
+      entry: python tools/generate_grpc_proto.py --check
+      language: python
+      additional_dependencies: [grpcio-tools==1.84.0]
+      always_run: true
+      pass_filenames: false
 
     - id: run-tests
       name: Run all tests

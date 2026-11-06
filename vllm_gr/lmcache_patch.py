@@ -44,6 +44,13 @@ def _load_lmcache_adapter() -> ModuleType | None:
         / "vllm_v1_adapter.py"
     )
     if not adapter_path.exists():
+        # Only reached when LMCache was requested, so a missing file means the
+        # installation dropped it (it ships as package data, not a module).
+        logger.warning(
+            "LMCache was requested but the vllm-gr adapter is missing at %s; "
+            "the installation is incomplete and the LMCache patch is not applied.",
+            adapter_path,
+        )
         return None
 
     spec = importlib.util.spec_from_file_location(_ADAPTER_MODULE_NAME, adapter_path)

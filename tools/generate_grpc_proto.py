@@ -1,25 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Generate the extended SMG bindings with package-relative imports/private pools."""
+"""Generate the extended SMG bindings with package-relative imports/private pools.
 
+Usage:
+    python tools/generate_grpc_proto.py           # rewrite generated/ in place
+    python tools/generate_grpc_proto.py --check   # fail if generated/ is stale
+
+Requires ``grpcio-tools==1.84.0`` (declared in the ``dev`` extra). The bundled
+protoc version is part of the output, so a different grpcio-tools release can
+produce a spurious diff.
+"""
+
+import argparse
+import difflib
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+GRPC_ROOT = Path(__file__).resolve().parents[1] / "vllm_gr/entrypoints/grpc"
+GENERATED_FILES = ("common_pb2.py", "vllm_engine_pb2.py", "vllm_engine_pb2_grpc.py")
 
-def main():
-    root = Path(__file__).resolve().parents[1] / "vllm_gr/entrypoints/grpc"
-    output = root / "generated"
+
+def generate(output: Path) -> None:
+    proto_dir = GRPC_ROOT / "proto"
     subprocess.run(
         [
             sys.executable,
             "-m",
             "grpc_tools.protoc",
-            f"-I{root / 'proto'}",
+            f"-I{proto_dir}",
             f"--python_out={output}",
             f"--grpc_python_out={output}",
-            str(root / "proto/common.proto"),
-            str(root / "proto/vllm_engine.proto"),
+            str(proto_dir / "common.proto"),
+            str(proto_dir / "vllm_engine.proto"),
         ],
         check=True,
     )
@@ -47,5 +61,53 @@ def main():
         path.write_text(text)
 
 
+def check() -> int:
+    """Regenerate into a scratch directory and diff against the committed copy."""
+    committed = GRPC_ROOT / "generated"
+    with tempfile.TemporaryDirectory() as scratch:
+        fresh = Path(scratch)
+        generate(fresh)
+        produced = sorted(path.name for path in fresh.glob("*.py"))
+        if produced != sorted(GENERATED_FILES):
+            print(f"unexpected generator output: {produced}", file=sys.stderr)
+            return 1
+        stale = []
+        for name in GENERATED_FILES:
+            expected = (fresh / name).read_text().splitlines(keepends=True)
+            current_path = committed / name
+            current = (
+                current_path.read_text().splitlines(keepends=True) if current_path.exists() else []
+            )
+            if expected != current:
+                stale.append(name)
+                sys.stderr.writelines(
+                    difflib.unified_diff(
+                        current, expected, f"committed/{name}", f"regenerated/{name}", n=1
+                    )
+                )
+    if stale:
+        print(
+            f"\nStale gRPC bindings: {', '.join(stale)}.\n"
+            "Run `python tools/generate_grpc_proto.py` and commit the result.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify generated/ matches the .proto sources without modifying it",
+    )
+    args = parser.parse_args()
+    if args.check:
+        return check()
+    generate(GRPC_ROOT / "generated")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
