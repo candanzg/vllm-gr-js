@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import sys
 import unittest
 from unittest import mock
 
@@ -44,25 +43,3 @@ class TestServeAttentionBackendDefault(unittest.TestCase):
     def test_custom_explicit_preserves_value(self) -> None:
         args = self.parser.parse_args(["serve", "--attention-backend", "CUSTOM"])
         self.assertEqual(args.attention_backend, "CUSTOM")
-
-
-class TestNonServeNoMutation(unittest.TestCase):
-    """Verify that non-serve commands are not affected by the default."""
-
-    def test_handle_gr_flags_does_not_mutate_argv_for_check_env(self) -> None:
-        from vllm_gr.entrypoints.cli.main import _handle_gr_flags
-
-        original_argv = ["vllm-gr", "check-env"]
-        with mock.patch.object(sys, "argv", original_argv):
-            _handle_gr_flags()
-            self.assertNotIn("--attention-backend", sys.argv)
-            self.assertEqual(sys.argv, original_argv)
-
-    def test_handle_gr_flags_does_not_mutate_argv_for_unknown_command(self) -> None:
-        from vllm_gr.entrypoints.cli.main import _handle_gr_flags
-
-        original_argv = ["vllm-gr", "unknown-cmd"]
-        with mock.patch.object(sys, "argv", original_argv):
-            _handle_gr_flags()
-            self.assertNotIn("--attention-backend", sys.argv)
-            self.assertEqual(sys.argv, original_argv)

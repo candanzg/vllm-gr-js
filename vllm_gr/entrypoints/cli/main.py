@@ -20,27 +20,6 @@ def _version() -> str:
         return __version__
 
 
-def _handle_gr_flags() -> None:
-    """Handle specific gr related flags."""
-    if "serve" not in sys.argv:
-        return
-
-    # Check for LMCache connector in args
-    for idx, arg in enumerate(sys.argv):
-        if arg.startswith("--kv-transfer-config"):
-            if "LMCacheConnectorV1" in arg:
-                import os
-
-                os.environ["VLLM_GR_LMCACHE_PATCH"] = "1"
-            if arg == "--kv-transfer-config" and idx + 1 < len(sys.argv):
-                if "LMCacheConnectorV1" in sys.argv[idx + 1]:
-                    import os
-
-                    os.environ["VLLM_GR_LMCACHE_PATCH"] = "1"
-
-    return
-
-
 def main() -> None:
     # Configure this before importing vLLM. The parent value is inherited by
     # EngineCore and Worker subprocesses launched by the serve command.
@@ -55,9 +34,6 @@ def main() -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     import vllm_gr.entrypoints.cli.check_env as gr_check_env
-
-    _handle_gr_flags()
-
     from vllm_gr.entrypoints.utils import patch_banner
 
     patch_banner()

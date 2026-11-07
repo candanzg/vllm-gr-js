@@ -112,18 +112,8 @@ def test_optional_patch_count_tracks_actual_installation(
         "apply_sliced_logits_patch",
         mock.Mock(side_effect=(True, False)),
     )
-    monkeypatch.setattr(
-        runtime_patch.lmcache_patch,
-        "is_lmcache_adapter_requested",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        runtime_patch.lmcache_patch,
-        "apply_lmcache_adapter",
-        mock.Mock(side_effect=(True, False)),
-    )
 
-    assert runtime_patch._apply_gr_beam_patches() == 2
+    assert runtime_patch._apply_gr_beam_patches() == 1
     assert runtime_patch._apply_gr_beam_patches() == 0
 
 

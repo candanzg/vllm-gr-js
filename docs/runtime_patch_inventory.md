@@ -10,7 +10,6 @@ The recorded pre-upgrade runtime baseline is:
 
 - `vllm==0.22.1`
 - `vllm-ascend==0.22.1rc1` for the NPU path
-- LMCache is optional and must be validated against the version installed in the target environment
 
 The upstream source revisions used for compatibility analysis are:
 
@@ -27,8 +26,7 @@ decision remains open. The Ascend 0.30.0rc2 baseline at
 `43bc85f9b375281452d0af7005dc9fa752f43884` completed NPU validation
 (unit, integration, eager/graph end-to-end, dynamic beam, prefill graphs, and
 benchmark gates). The subsequent config-filter refactor has host regression
-coverage and still requires NPU startup and inference revalidation. Optional
-integrations such as LMCache remain unvalidated.
+coverage and still requires NPU startup and inference revalidation.
 
 ## Risk Levels
 
@@ -60,7 +58,6 @@ aligned with it.
 | GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py`, `gpu_model_runner_v2_patch.py` | `model_runner_patch.apply_worker_patches` | selected CUDA V1/V2 runner hooks are incomplete | `_validate_model_runner_patch`; V1/V2 GPU, dispatcher, and stage-parity tests | GPU worker |
 | GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
 | GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
-| GR-PATCH-014 | bundled LMCache adapter | `lmcache_patch.apply_lmcache_adapter` | LMCache environment flag or connector argument | installer result; optional patch-count test | worker |
 | GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
 | GR-PATCH-016 | `vllm_gr/npu_spawn_patch.py` | `vllm_gr.npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
 | GR-PATCH-018 | `vllm_gr/v1/ascend_compat.py` | `apply_penalties_warmup_oom_guard` | NPUWorker `init_device` runs and the native penalties warmup is present | installer result; NPU startup at `--max_num_seqs 2048` | NPU worker |
@@ -302,23 +299,6 @@ aligned with it.
     - plugin loading order can affect the final registration.
 - Removal condition: vLLM supports named third-party backend identities or another non-conflicting registration mechanism.
 
-### GR-PATCH-014 — LMCache Integration Override
-
-- Source: `vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py`
-- Installer: `vllm_gr/lmcache_patch.py`
-- Orchestration: `vllm_gr/patch.py`
-- Targets:
-    - `RequestTracker.from_new_request`
-    - `ReqMeta.from_request_tracker`
-    - `ReqMeta.__annotations__`
-    - `LMCacheConnectorV1Impl.start_load_kv`
-    - `save_kv_layer`
-    - `wait_for_save`
-- Risk: Critical
-- Activation: optional; enabled only when the LMCache integration is requested.
-- Dependencies include tracker lifecycle, connector parent state, connector metadata requests, slot mappings, and load/save semantics.
-- Removal condition: LMCache exposes the required grouped Beam metadata and lifecycle extension points directly.
-
 ### GR-PATCH-015 — Sliced Vocabulary Projection
 
 - Source: `vllm_gr/ops/sliced_logits.py`
@@ -456,7 +436,6 @@ part of the current frontend contract.
 ```text
 additional_config["vllm_gr_catalog_path"]
 additional_config["vllm_gr_attention_backend"]
-VLLM_GR_LMCACHE_PATCH
 VLLM_USE_V2_MODEL_RUNNER
 ```
 
@@ -480,6 +459,11 @@ canonical V1 constraint artifact loads in the worker, covered by
 `test_canonical_worker_enables_vocab_slice_before_first_forward` and
 `tests/test_gr_config_v1.py`. The ID is retained in the YAML `retired_patches`
 section and must not be counted as an active installer.
+
+**GR-PATCH-014 — LMCache Integration Override** is retired. The experimental
+integration had no supported version pin or vLLM 0.30 validation. Its adapter,
+installer, CLI activation, and usage guide have been removed. The ID is retained
+in the YAML `retired_patches` section and must not be counted as an active installer.
 
 **GR-PATCH-017 — NPU Worker Memory Counters** is retired. Its removal
 condition was met by the 0.30 upgrade: vllm-ascend 0.30.0rc2 replaced

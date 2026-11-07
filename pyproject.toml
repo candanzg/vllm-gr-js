@@ -83,10 +83,7 @@ where = ["."]
 include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
-# 3rd_party/ is not an importable package (its name is not an identifier) and
-# lmcache_patch.py loads the adapter by file path. include-package-data already
-# ships it via the VCS file list; declare it so packaging does not depend on that.
-"vllm_gr" = ["_version.py", "*.json", "3rd_party/**/*.py"]
+"vllm_gr" = ["_version.py", "*.json"]
 "vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
 
 [tool.setuptools_scm]

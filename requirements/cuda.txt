@@ -7,4 +7,3 @@ numpy==2.2.6
 opencv-python-headless>=4.13.0
 
 vllm==0.30.0
-# Keep LMCache out of the default install for now.

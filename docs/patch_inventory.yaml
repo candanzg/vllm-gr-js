@@ -208,19 +208,6 @@ patches:
         - _compute_beam_bounds
     removal_condition: vLLM supports named third-party backend identities without a shared CUSTOM slot
 
-  - id: GR-PATCH-014
-    owner: vllm_gr/3rd_party/lmcache/integration/vllm/vllm_v1_adapter.py
-    installer: vllm_gr.lmcache_patch.apply_lmcache_adapter
-    activation: VLLM_GR_LMCACHE_PATCH is true or argv selects LMCacheConnectorV1
-    validator_or_test:
-      - vllm_gr.lmcache_patch.apply_lmcache_adapter return value
-      - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
-    process_roles: [worker]
-    target: LMCacheConnectorV1Impl
-    risk: critical
-    contract: null
-    removal_condition: LMCache exposes grouped Beam metadata and lifecycle extension points
-
   - id: GR-PATCH-015
     owner: vllm_gr/ops/sliced_logits.py
     installer: vllm_gr.ops.sliced_logits_patch.apply_sliced_logits_patch
@@ -300,6 +287,10 @@ retired_patches:
     replacement_coverage:
       - tests/constraints/test_cuda_backend.py::test_canonical_worker_enables_vocab_slice_before_first_forward
       - tests/test_gr_config_v1.py
+  - id: GR-PATCH-014
+    historical_target: LMCache RequestTracker, ReqMeta, and LMCacheConnectorV1Impl
+    reason: Experimental LMCache integration removed; no supported version pin or vLLM 0.30 validation
+    replacement_coverage: []
   - id: GR-PATCH-017
     historical_target: NPUWorker.profile_memory in vllm_ascend.worker.worker or vllm_ascend.worker.worker_v1
     reason: Removal condition met by the 0.30 upgrade; vllm-ascend 0.30.0rc2 replaced profile_memory with log_memory_stats, which reads the two allocator counters directly, and the installer found no native method to wrap on that runtime

@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm_gr import lmcache_patch, npu_spawn_patch, pangu_compat
+from vllm_gr import npu_spawn_patch, pangu_compat
 from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1 import ascend_compat
 
@@ -529,11 +529,6 @@ def _apply_gr_beam_patches(force: bool = False) -> int:
 
     if sliced_logits_patch.apply_sliced_logits_patch():
         patch_count += 1
-    try:
-        if lmcache_patch.is_lmcache_adapter_requested() and lmcache_patch.apply_lmcache_adapter():
-            patch_count += 1
-    except Exception as exc:
-        logger.debug("vllm_gr: Skipping LMCache adapter patch: %s", exc)
 
     if patch_count > 0:
         logger.info(
