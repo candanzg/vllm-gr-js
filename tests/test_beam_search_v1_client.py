@@ -629,3 +629,6 @@ def test_engine_only_client_reuses_session_methods() -> None:
             await client.prepare_request(None)
 
     asyncio.run(run())
+
+
+pytestmark = pytest.mark.cpu_test

@@ -266,3 +266,6 @@ def test_v1_async_flow_closes_only_after_session_is_returned(failure_stage: str)
         frontend.close.assert_not_awaited()
     else:
         frontend.close.assert_awaited_once_with(session)
+
+
+pytestmark = pytest.mark.cpu_test

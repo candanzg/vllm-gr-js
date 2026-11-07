@@ -469,3 +469,6 @@ def test_inject_verifies_all_worker_acks(tokenizer: MagicMock) -> None:
         _verify_injected(resource, [{"digest": "deadbeef"}])
     with pytest.raises(RuntimeError, match="expected"):
         _verify_injected(resource, [{"cached": True}])  # missing digest
+
+
+pytestmark = pytest.mark.cpu_test

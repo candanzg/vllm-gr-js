@@ -184,3 +184,6 @@ def test_sid_stage_vocab_rejects_other_or_unknown_device(device: str | None) -> 
 @_parametrize("device", ["cuda", "cuda:0", "npu", "npu:0", None])
 def test_full_vocabulary_default_keeps_device_admission(device: str | None) -> None:
     validate_gr_device_config(_device_config(device, enabled=False))
+
+
+pytestmark = pytest.mark.cpu_test

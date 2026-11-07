@@ -338,3 +338,6 @@ def test_initial_selection_rejects_fabricated_w_parent_rows() -> None:
     candidates = _constraint_candidates(0, [0, 1], [[10], [11]], [[-0.1], [-0.2]])
     with pytest.raises(ValueError, match="exactly one"):
         select_initial_beams((candidates,), beam_width=2)
+
+
+pytestmark = pytest.mark.cpu_test

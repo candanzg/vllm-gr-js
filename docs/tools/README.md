@@ -70,6 +70,61 @@ That command requires pytest, setuptools, and packaging, but does not establish
 inference support. Check the [coverage map](../development.md#select-regression-coverage)
 for the tests associated with other code areas.
 
+### Test tiers
+
+Every test declares the platforms it runs on with a tier marker registered in
+`pyproject.toml`; collection fails and lists the modules when one is missing.
+As in upstream vLLM, the markers only describe the environment and never skip
+a test, so each host selects its tier with `-m`:
+
+```bash
+python -m pytest tests -m 'cpu_test and not gpu_test and not npu_test'  # CPU host
+python -m pytest tests -m 'gpu_test or (not cpu_test and not npu_test)'  # CUDA host
+python -m pytest tests -m 'npu_test or (not cpu_test and not gpu_test)'  # NPU host
+```
+
+| Marker | Use when the test |
+| --- | --- |
+| `cpu_test` | passes with no accelerator visible |
+| `gpu_test` | needs a CUDA device |
+| `npu_test` | needs the Ascend runtime (`torch_npu`, vLLM-Ascend, xllm-ops) |
+| `model_test` | also needs model weights; combine it with a tier |
+
+A device marker on a test, class, or `pytest.param` overrides the module's
+`cpu_test`; the expressions above implement that. A test marked both
+`gpu_test` and `npu_test` runs once on each kind of accelerator host. Do not
+use `-m 'not cpu_test'` on an accelerator host: it drops the device tests that
+live in `cpu_test` modules. `tests/kernels/` and `tests/st/` default
+undeclared tests to `gpu_test`, so NPU and host-side tests there must declare
+their tier.
+
+Choose the tier from what the test executes, not from its file name; many
+`test_npu_*.py` modules run on any machine. On a CUDA host, hide the GPUs and
+check which tests pass:
+
+```bash
+CUDA_VISIBLE_DEVICES="" python -m pytest -q -rs tests/test_example.py
+```
+
+On an Ascend host, run that check where the Ascend runtime is not installed,
+such as a CPU-only container, because a test can depend on `torch_npu`
+imports as well as on visible devices. Mark device tests the same way on
+both platforms, and keep the availability guard next to the marker:
+
+```python
+@pytest.mark.gpu_test
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_cuda_path() -> None: ...
+
+
+@pytest.mark.npu_test
+@pytest.mark.skipif(not _npu_is_available(), reason="NPU is not available")
+def test_npu_path() -> None: ...
+```
+
+When only some parameters need a device, mark those parameters, for example
+`pytest.param("cuda", marks=pytest.mark.gpu_test)`.
+
 ### Device and model tests
 
 Select a device allocated for the run and use the matching installed runtime.

@@ -912,3 +912,6 @@ def test_online_entrypoint_rejects_dp_before_submission(local_only: bool, local_
             online=True,
         )
     engine.submit_gr_session.assert_not_called()
+
+
+pytestmark = pytest.mark.cpu_test

@@ -70,3 +70,6 @@ def test_rejects_invalid_vocab_and_special_ids() -> None:
         compute_tokenizer_digest(_tokenizer(vocab={"a": True}))
     with pytest.raises(ValueError, match="bos_token_id"):
         compute_tokenizer_digest(_tokenizer(bos_token_id=True))
+
+
+pytestmark = pytest.mark.cpu_test

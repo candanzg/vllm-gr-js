@@ -1010,3 +1010,6 @@ def test_temperatures_for_rows_falls_back_to_default() -> None:
     runner = SimpleNamespace(input_batch=None, sampler=None)
     temps = _temperatures_for_rows(runner, [0], torch.device("cpu"))
     assert torch.equal(temps, torch.tensor([1.0], dtype=torch.float32))
+
+
+pytestmark = pytest.mark.cpu_test

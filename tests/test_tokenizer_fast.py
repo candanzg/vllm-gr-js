@@ -101,3 +101,6 @@ def test_cleanup_change_after_cached_probe_preserves_decode_parity() -> None:
             assert fast_batch_decode(tokenizer, SEQUENCES, skip_special_tokens) == (
                 tokenizer.batch_decode(SEQUENCES, skip_special_tokens=skip_special_tokens)
             )
+
+
+pytestmark = pytest.mark.cpu_test

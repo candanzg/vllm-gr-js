@@ -244,3 +244,6 @@ def test_only_supported_capture_phase_errors_can_request_recovery(
     if phase != "restore":
         assert graph.worker.model is graph.original_model
         assert not graph.installed
+
+
+pytestmark = pytest.mark.cpu_test

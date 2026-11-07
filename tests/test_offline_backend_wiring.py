@@ -401,3 +401,6 @@ class TestGrllmCanonicalConstruction:
         assert llm._last_kwargs == {"vllm_gr_config": config, "async_scheduling": True}
         assert llm._last_kwargs["vllm_gr_config"] is config
         assert not hasattr(llm, "constraint_coordinator")
+
+
+pytestmark = pytest.mark.cpu_test

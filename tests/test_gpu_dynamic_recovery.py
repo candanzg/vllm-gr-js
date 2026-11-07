@@ -142,3 +142,6 @@ def test_runtime_capture_recovery(monkeypatch, failure):
     assert hooks.decode_logits(owner) == "eager"
     assert graph.capture.call_count == 2
     assert set(worker._gr_runtime_decode_capture_failures) == {(1, 4), (1, 2)}
+
+
+pytestmark = pytest.mark.cpu_test

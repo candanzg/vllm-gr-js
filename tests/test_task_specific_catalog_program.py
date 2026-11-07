@@ -62,3 +62,6 @@ def test_create_task_specific_catalog(
     assert output == output_path
     assert count == 2
     assert catalog == expected
+
+
+pytestmark = pytest.mark.cpu_test

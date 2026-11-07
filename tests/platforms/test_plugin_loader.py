@@ -183,3 +183,6 @@ def test_activate_current_backend_rejects_unknown_platform(
     message = str(exc_info.value)
     assert "requested='cpu'" in message
     assert "available=('cuda', 'npu')" in message
+
+
+pytestmark = pytest.mark.cpu_test

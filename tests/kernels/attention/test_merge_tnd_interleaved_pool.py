@@ -32,7 +32,7 @@ from vllm_gr.v1.attention.backends.merge_tnd_attention_outputs import (
 DEVICES = ["cpu"]
 try:
     if torch.npu.is_available():
-        DEVICES.append("npu")
+        DEVICES.append(pytest.param("npu", marks=pytest.mark.npu_test))
 except AttributeError:
     pass
 
@@ -100,3 +100,6 @@ def test_extract_suffix_kv_contiguous_unchanged(device: str) -> None:
     out_k, out_v = extract_suffix_kv_pytorch(k, v, slots)
     assert torch.equal(out_k, k.view(-1, heads, head_dim)[slots])
     assert torch.equal(out_v, v.view(-1, heads, head_dim)[slots])
+
+
+pytestmark = pytest.mark.cpu_test

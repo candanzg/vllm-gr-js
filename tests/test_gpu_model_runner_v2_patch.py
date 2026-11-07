@@ -398,3 +398,6 @@ def test_prepare_inputs_preserves_native_batch_state_for_ordinary_requests() -> 
     prepared = v2.make_patched_prepare_inputs_v2(native)(worker, scheduled, state, desc)
     assert prepared is result
     native.assert_called_once_with(worker, scheduled, state, desc)
+
+
+pytestmark = pytest.mark.cpu_test

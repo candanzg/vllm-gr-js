@@ -230,3 +230,6 @@ def test_invalid_stage_geometry_is_rejected(
 
     with pytest.raises(BeamExecutionContractError, match=message):
         BeamBatchExecutionView.from_stage_metadata(metadata)
+
+
+pytestmark = pytest.mark.cpu_test

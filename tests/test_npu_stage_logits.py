@@ -134,6 +134,7 @@ def test_three_stage_projection_preserves_original_processor_semantics(
     assert snapshot["fallback_counts"] == {}
 
 
+@pytest.mark.npu_test
 @pytest.mark.parametrize("sid_domain", [False, True])
 def test_stage_projection_routes_replicated_mode_under_ascend_dispatch(
     context: Any, monkeypatch: pytest.MonkeyPatch, sid_domain: bool
@@ -758,7 +759,7 @@ def test_weight_update_hooks_preserve_native_behavior_without_active_projection(
     assert worker.finish_weight_update() == "finished"
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu_test
 @pytest.mark.parametrize("update_api", ["runner", "worker"])
 def test_npu_hot_update_refreshes_inference_buffers_at_native_boundary(
     context: Any, update_api: str
@@ -890,3 +891,6 @@ def test_sid_projection_remains_optional_for_ineligible_or_disabled_models(
         ctx.head.quant_method = SimpleNamespace()
     assert install_npu_sid_stage_projection(ctx.runner, vocab) is None
     assert ctx.processor._get_logits == original
+
+
+pytestmark = pytest.mark.cpu_test

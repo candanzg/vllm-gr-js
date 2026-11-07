@@ -519,3 +519,6 @@ def test_runtime_cleanup_is_opt_in_even_when_native_operation_fails(
         graph.uninstall.assert_not_called()
         graph.clear.assert_not_called()
         assert all(getattr(runner, name) is value for name, value in runtime.items())
+
+
+pytestmark = pytest.mark.cpu_test

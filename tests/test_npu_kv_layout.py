@@ -454,3 +454,6 @@ def test_module_import_is_stdlib_only() -> None:
     spec.loader.exec_module(module)
     assert isinstance(module, ModuleType)
     assert callable(module.apply_npu_contiguous_kv_cache_patch)
+
+
+pytestmark = pytest.mark.cpu_test

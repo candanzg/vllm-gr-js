@@ -9,20 +9,40 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--run-slow", action="store_true", default=False, help="run slow tests")
 
 
-def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line("markers", "slow: mark test as slow to run")
-    config.addinivalue_line(
-        "markers",
-        "npu_integration: require a complete, usable Ascend NPU runtime",
+# Marker registration lives in pyproject.toml so IDE test runners and
+# `pytest --markers` see the same list. Only `slow`/`slow_test` skip themselves,
+# matching the upstream convention that hardware markers are descriptive and
+# selected with `-m` by the runner.
+_SLOW_MARKERS = ("slow", "slow_test")
+# Every test declares where it runs; see docs/tools/README.md#test-tiers.
+_TIER_MARKERS = ("cpu_test", "gpu_test", "npu_test")
+
+
+def _require_tier_markers(items: list[pytest.Item]) -> None:
+    # Directory conftests under tests/kernels and tests/st add their defaults
+    # before this hook runs, and pytest's own -m deselection runs after it, so
+    # this sees every collected item.
+    missing = sorted(
+        {
+            item.nodeid.split("::")[0]
+            for item in items
+            if not any(marker in item.keywords for marker in _TIER_MARKERS)
+        }
     )
+    if missing:
+        raise pytest.UsageError(
+            "Test modules without a tier marker (cpu_test, gpu_test or npu_test); "
+            "see docs/tools/README.md#test-tiers:\n  " + "\n  ".join(missing)
+        )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    _require_tier_markers(items)
     if config.getoption("--run-slow"):
         return
     skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
     for item in items:
-        if "slow" in item.keywords:
+        if any(marker in item.keywords for marker in _SLOW_MARKERS):
             item.add_marker(skip_slow)
 
 

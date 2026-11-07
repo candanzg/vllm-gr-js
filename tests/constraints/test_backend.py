@@ -128,3 +128,6 @@ def test_info_remains_a_diagnostic_value_after_table_metadata_replacement() -> N
     changed = replace(info, max_rows=7)
     assert info.max_rows == 2
     assert changed.max_rows == 7
+
+
+pytestmark = pytest.mark.cpu_test

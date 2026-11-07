@@ -205,3 +205,6 @@ def test_cpu_close_is_idempotent_and_preserves_info() -> None:
     assert backend.info == info
     with pytest.raises(RuntimeError, match="closed"):
         _select(backend, torch.zeros(1, 6), [[0, 0, 0]], step=0, top_k=1)
+
+
+pytestmark = pytest.mark.cpu_test

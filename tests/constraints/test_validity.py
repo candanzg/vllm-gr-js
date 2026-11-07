@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from tests.constraints.test_table import make_table
@@ -64,3 +65,6 @@ def test_valid_mask_is_a_contiguous_prefix_independent_of_scores() -> None:
 
     assert mask.is_contiguous()
     assert mask.tolist() == [[True, True], [True, False], [False, False]]
+
+
+pytestmark = pytest.mark.cpu_test

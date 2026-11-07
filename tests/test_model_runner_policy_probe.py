@@ -48,3 +48,6 @@ def test_probe_separates_capture_policy_from_backend_capacity(
         max_num_seqs=max_seqs,
         enforce_eager=eager,
     ) == (1024 if runner == "v2" else 128, expected)
+
+
+pytestmark = pytest.mark.cpu_test

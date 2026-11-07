@@ -140,6 +140,7 @@ def test_sampling_patch_covers_both_openai_prompt_shapes(monkeypatch) -> None:
     assert CompletionRequest.to_beam_search_params is to_beam_search_params
 
 
+@pytest.mark.npu_test  # type: ignore[misc]
 def test_vllm_ascend_model_runner_patch_contract() -> None:
     if importlib.util.find_spec("vllm_ascend") is None:
         pytest.skip("vllm-ascend is not installed")
@@ -170,3 +171,6 @@ def test_vllm_ascend_model_runner_patch_contract() -> None:
             "spec_decode_metadata",
         ),
     )
+
+
+pytestmark = pytest.mark.cpu_test

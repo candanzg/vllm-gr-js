@@ -535,3 +535,6 @@ def test_run_rejects_non_contiguous_output(
         execution.run(
             torch.randn(2, 20), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(0), 0, 2
         )
+
+
+pytestmark = pytest.mark.cpu_test

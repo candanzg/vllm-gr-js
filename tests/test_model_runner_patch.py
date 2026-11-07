@@ -445,3 +445,6 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     assert model_runner_patch.is_worker_runner_patched(Runner)
     assert Runner().capture_model() == 17
     assert events == ["native", "stages" if mode is BeamExecutionMode.V1 else "legacy"]
+
+
+pytestmark = pytest.mark.cpu_test

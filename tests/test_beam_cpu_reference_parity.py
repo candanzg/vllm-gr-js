@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 import numpy.typing as npt
+import pytest
 import torch
 
 from vllm_gr.ops.onerec_decode import (
@@ -193,3 +194,6 @@ def test_exact_tie_parity_uses_lower_logical_flat_index() -> None:
     assert [beam.parent_beam_indices[-1] for beam in reference.items[0].beams] == (
         out_parents[0].tolist()
     )
+
+
+pytestmark = pytest.mark.cpu_test

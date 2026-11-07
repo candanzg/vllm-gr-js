@@ -38,10 +38,13 @@ from vllm_gr.v1.engine.gr_async_scheduler import (
     consume_gr_retirement,
 )
 
-pytestmark = pytest.mark.skipif(
-    current_platform.device_type == "npu",
-    reason="V1 async scheduler tests are temporarily disabled on NPU",
-)
+pytestmark = [
+    pytest.mark.cpu_test,
+    pytest.mark.skipif(
+        current_platform.device_type == "npu",
+        reason="V1 async scheduler tests are temporarily disabled on NPU",
+    ),
+]
 
 
 @pytest.fixture

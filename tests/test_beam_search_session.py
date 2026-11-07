@@ -374,3 +374,6 @@ def test_context_uses_xllm_buffers_flag_tracks_device_type() -> None:
     # NPU device type is simulated with a plain string gate-equivalent, since
     # torch.device("npu") is not constructible on non-Ascend hosts.
     assert getattr(type("D", (), {"type": "npu"})(), "type", None) == "npu"
+
+
+pytestmark = pytest.mark.cpu_test

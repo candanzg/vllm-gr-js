@@ -660,3 +660,6 @@ def test_wire_decode_and_request_validation_have_distinct_boundaries() -> None:
     decoded = decoder.decode([msgspec.msgpack.encode(raw)])
     with pytest.raises(BeamContractError, match="protocol_version"):
         validate_beam_batch_request(decoded)
+
+
+pytestmark = pytest.mark.cpu_test

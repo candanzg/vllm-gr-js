@@ -304,6 +304,7 @@ def test_context_rejects_nonpositive_capacity_before_allocating(capacity: int) -
         )
 
 
+@pytest.mark.gpu_test
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("capacity", [4, 8, 16, 32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -798,3 +799,6 @@ def test_fused_suffix_uses_the_fa2_emulating_kernel_for_every_prefix_backend(
         scale=1.0,
     )
     assert len(calls) == 1
+
+
+pytestmark = pytest.mark.cpu_test

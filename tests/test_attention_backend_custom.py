@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -307,3 +309,6 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+pytestmark = pytest.mark.cpu_test

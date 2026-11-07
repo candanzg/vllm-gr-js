@@ -473,3 +473,12 @@ class ForwardRouting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# `python tests/test_npu_prefill_bsnd.py` must keep working without pytest.
+try:
+    import pytest
+except ImportError:
+    pass
+else:
+    pytestmark = pytest.mark.cpu_test

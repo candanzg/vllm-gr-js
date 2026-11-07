@@ -262,3 +262,6 @@ def test_legacy_mode_rejected_during_config_read(canonical: bool) -> None:
         additional = {"vllm_gr_beam_execution_mode": "legacy"}
     with pytest.raises(ValueError, match="removed.*execution_mode='v1'"):
         GRConfig.from_vllm_config(SimpleNamespace(additional_config=additional))
+
+
+pytestmark = pytest.mark.cpu_test

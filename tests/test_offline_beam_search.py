@@ -285,3 +285,6 @@ def test_offline_unconstrained_beam_search_v1(
         if process.is_alive():
             process.kill()
             process.join()
+
+
+pytestmark = pytest.mark.gpu_test

@@ -23,7 +23,10 @@ def _devices() -> list[pytest.ParameterSet]:
         pytest.param(
             torch.device("cuda"),
             id="cuda",
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
+            marks=[
+                pytest.mark.gpu_test,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
+            ],
         ),
     ]
 
@@ -371,3 +374,6 @@ def test_beam_kernels_cache_returns_none() -> None:
     )
 
     assert result is None
+
+
+pytestmark = pytest.mark.cpu_test

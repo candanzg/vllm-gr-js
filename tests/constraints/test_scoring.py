@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vllm_gr.constraints.scoring import INVALID_LOGIT, score_selected_tokens
@@ -89,3 +90,6 @@ def test_nan_window_propagates_error_signal() -> None:
         torch.ones(1),
     )
     assert torch.isnan(actual).all()
+
+
+pytestmark = pytest.mark.cpu_test

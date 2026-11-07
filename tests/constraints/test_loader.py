@@ -463,3 +463,6 @@ def test_readiness_failure_closes_backend_and_preserves_exception(
             raise
     assert raised.value is error
     assert backend._first_token_ids is None  # noqa: SLF001
+
+
+pytestmark = pytest.mark.cpu_test

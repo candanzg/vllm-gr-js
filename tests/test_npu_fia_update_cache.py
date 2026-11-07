@@ -348,3 +348,6 @@ def test_recapture_invalidates_cache_and_restores_capture_state(
         recapture()
     assert state == {"capturing": True, "entry": previous_entry}
     cache.assert_full_update()
+
+
+pytestmark = pytest.mark.cpu_test

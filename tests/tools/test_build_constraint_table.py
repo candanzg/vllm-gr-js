@@ -213,3 +213,6 @@ def test_local_model_directory_allows_omitted_revision(tmp_path: Path) -> None:
     model_path.mkdir()
 
     assert _resolve_model_revision(str(model_path), None) is None
+
+
+pytestmark = pytest.mark.cpu_test

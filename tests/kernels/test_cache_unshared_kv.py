@@ -96,3 +96,6 @@ def test_cache_unshared_kv_torch_validates_current_shape() -> None:
             block_table,
             decode_step,
         )
+
+
+pytestmark = pytest.mark.cpu_test

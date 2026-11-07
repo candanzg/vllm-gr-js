@@ -1277,3 +1277,6 @@ def test_terminal_transport_accepts_requested_optional_fields(
         _terminal_result(request, SimpleNamespace(kv_transfer_params={"gr_batch_result": payload}))
         == result
     )
+
+
+pytestmark = pytest.mark.cpu_test

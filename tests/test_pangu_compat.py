@@ -59,3 +59,6 @@ def test_installer_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _model_config(architecture="OtherForCausalLM", tied=True)
     ModelConfig.maybe_untie_word_embeddings(config)
     assert calls == [config]
+
+
+pytestmark = pytest.mark.cpu_test

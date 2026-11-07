@@ -190,3 +190,6 @@ def test_npu_shutdown_clears_sid_maps_before_native_failure() -> None:
     assert runner._gr_npu_sid_stage_vocab is None
     assert runner._gr_npu_stage_projection is None
     assert closed == [True]
+
+
+pytestmark = pytest.mark.cpu_test

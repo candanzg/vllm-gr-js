@@ -45,6 +45,8 @@ if not beam_ops.is_available():
         allow_module_level=True,
     )
 
+pytestmark = pytest.mark.npu_test
+
 _BEAM_WIDTH = 8
 _BEGIN_TOKEN = "<|sid_begin|>"
 _END_TOKEN = "<|sid_end|>"
@@ -653,14 +655,16 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
                 process.wait()
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu_test
+@pytest.mark.model_test
 @pytest.mark.slow
 @pytest.mark.timeout(660)
 def test_onerec_v1_npu_public_api_end_to_end(tmp_path: Path) -> None:
     _run_subprocess(tmp_path)
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu_test
+@pytest.mark.model_test
 @pytest.mark.slow
 @pytest.mark.timeout(660)
 def test_onerec_v1_npu_graph_shape_switch(tmp_path: Path) -> None:

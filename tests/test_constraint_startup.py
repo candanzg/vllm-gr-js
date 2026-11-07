@@ -361,3 +361,6 @@ class TestPrepareConstraintTable:
                 vocab_size=1000,
                 gr_config=GRConfig(),
             )
+
+
+pytestmark = pytest.mark.cpu_test

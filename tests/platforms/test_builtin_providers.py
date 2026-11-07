@@ -154,3 +154,6 @@ def test_npu_environment_check_delegates_complete_validation(
 
     assert npu.NPU_BACKEND.check_environment() is expected
     check_ascend.assert_called_once_with(require_npu_platform=True)
+
+
+pytestmark = pytest.mark.cpu_test

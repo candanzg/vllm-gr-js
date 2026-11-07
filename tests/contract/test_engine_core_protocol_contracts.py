@@ -412,3 +412,6 @@ def test_gr_dispatch_only_admits_v1(monkeypatch) -> None:
         engine, EngineCoreRequestType.SUBMIT_GR_SESSION, batch
     )
     assert handled == [(engine, batch)]
+
+
+pytestmark = pytest.mark.cpu_test

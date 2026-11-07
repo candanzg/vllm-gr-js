@@ -187,3 +187,6 @@ def test_forward_probe_observes_real_arguments_and_restores(
     assert event["actual_tokens"] == 4 and event["padded_tokens"] == 6
     assert event["gr_prefill_replay_delta"] == {"6": 1}
     json.dumps(events, allow_nan=False)
+
+
+pytestmark = pytest.mark.cpu_test

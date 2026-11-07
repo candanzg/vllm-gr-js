@@ -90,3 +90,6 @@ def test_invalid_v1_payload_rejected_at_decode() -> None:
             EngineCoreRequestType.SUBMIT_GR_SESSION,
             _frames({"not": "a batch"}),
         )
+
+
+pytestmark = pytest.mark.cpu_test

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm_gr.constraints.scoring import INVALID_LOGIT
@@ -148,3 +149,6 @@ def test_rec_constrained_topk_bucketed_path_accepts_scalar_temperature() -> None
     )
     assert tokens.shape == (1, 1)
     assert probs.shape == (1, 1)
+
+
+pytestmark = pytest.mark.cpu_test

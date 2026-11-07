@@ -145,3 +145,6 @@ def test_workspace_result_count_bounds() -> None:
         workspace.result_count(3)
     with pytest.raises(ValueError, match="result_width"):
         workspace.result_count(1, 5)
+
+
+pytestmark = pytest.mark.cpu_test

@@ -121,3 +121,6 @@ def test_stage_replacement_and_capacity_are_runner_specific(v2: bool) -> None:
         # A new V1 stage replaces the input storage: drop every length bucket.
         graph.discard_geometry.assert_called_once_with(2, 4)
     assert hooks.required_constraint_rows(2, 4) == (8 if v2 else 4)
+
+
+pytestmark = pytest.mark.cpu_test

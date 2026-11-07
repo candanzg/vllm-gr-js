@@ -295,3 +295,6 @@ def test_representable_temperatures_preserve_supported_admission(
     core.add_request.assert_called_once()
     core._handle_request_preproc_error.assert_not_called()
     assert core.output_queue.empty()
+
+
+pytestmark = pytest.mark.cpu_test

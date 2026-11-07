@@ -448,3 +448,6 @@ def test_shutdown_add_keeps_native_abort_semantics(core):
     assert core.output_queue.empty()
     assert not core.scheduler.requests
     assert not getattr(core.scheduler, "_gr_v1_sessions", {})
+
+
+pytestmark = pytest.mark.cpu_test

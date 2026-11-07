@@ -372,3 +372,6 @@ def test_ab_rejects_missing_final_pass(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing A/B pass"):
         compare(base, pr, BASE_SHA, PR_SHA)
+
+
+pytestmark = pytest.mark.cpu_test

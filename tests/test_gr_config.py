@@ -1141,3 +1141,6 @@ def test_engine_config_merge_keeps_npu_execution_choice(execution: NPUDecodeExec
     assert result.npu_decode_execution is execution
     assert result.beam_graph_batch_size == 4
     assert result.beam_max_width == 32
+
+
+pytestmark = pytest.mark.cpu_test

@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+pytestmark = pytest.mark.gpu_test
+
 _MODULE_READY = time.monotonic()
 _MEASUREMENTS: dict[str, Any] = {"phases": {}, "rows": [], "events": []}
 _EVIDENCE_PATH: Path | None = None
@@ -1154,6 +1156,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.model_test
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize("runner", ["v1", "v2"])
 @pytest.mark.parametrize(
@@ -1219,6 +1222,7 @@ def test_onerec_v1_completion_batch_online(
 
 
 @pytest.mark.slow
+@pytest.mark.model_test
 @pytest.mark.timeout(660)
 @pytest.mark.parametrize("runner", ["v1", "v2"])
 @pytest.mark.parametrize("online", [False, True])

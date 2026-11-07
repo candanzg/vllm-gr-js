@@ -816,3 +816,6 @@ def test_workspace_pool_rejects_invalid_getter_buffers_before_capture(
         graph.capture(names=("layer.0",))
     assert graph.api.events == []
     assert graph.api.calls == []
+
+
+pytestmark = pytest.mark.cpu_test

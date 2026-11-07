@@ -339,7 +339,12 @@ def _native_processor(vocab_size: int, head_dtype: torch.dtype | None = None) ->
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "device,dtype", [("cpu", torch.float32), ("cuda", torch.float16), ("cuda", torch.bfloat16)]
+    "device,dtype",
+    [
+        ("cpu", torch.float32),
+        pytest.param("cuda", torch.float16, marks=pytest.mark.gpu_test),
+        pytest.param("cuda", torch.bfloat16, marks=pytest.mark.gpu_test),
+    ],
 )
 @pytest.mark.parametrize("head_dtype", [None, torch.float32])  # type: ignore[misc]
 @pytest.mark.parametrize("skip_gather", [False, True])  # type: ignore[misc]
@@ -515,6 +520,7 @@ def test_v2_topk_clamp_reuses_an_already_wrapped_import() -> None:
     assert calls == [(3, True)]
 
 
+@pytest.mark.gpu_test  # type: ignore[misc]
 @pytest.mark.parametrize("logits_mode", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("width", [1, 7])  # type: ignore[misc]
 @pytest.mark.parametrize("num_logprobs", [0, 1, 5])  # type: ignore[misc]
@@ -549,3 +555,6 @@ def test_v2_compute_topk_scores_clamped_to_sliced_width(
         output = module.compute_topk_scores(logits, num_logprobs, sampled, logits_mode=logits_mode)
         torch.testing.assert_close(output.logprob_token_ids, ids)
         torch.testing.assert_close(output.logprobs, expected)
+
+
+pytestmark = pytest.mark.cpu_test

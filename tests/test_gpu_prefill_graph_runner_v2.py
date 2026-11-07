@@ -556,3 +556,6 @@ def test_failed_cuda_health_check_aborts(
     with pytest.raises(RuntimeError, match="device unhealthy"):
         manager.capture()
     assert not manager._graphs_captured
+
+
+pytestmark = pytest.mark.cpu_test

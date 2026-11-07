@@ -311,3 +311,6 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
         assert events == [*expected, "shutdown"]
     assert len(artifacts) == 1
     assert not artifacts[0].parent.exists()
+
+
+pytestmark = pytest.mark.cpu_test

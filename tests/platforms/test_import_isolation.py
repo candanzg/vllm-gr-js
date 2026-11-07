@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def test_platform_package_and_builtins_do_not_load_hardware_modules() -> None:
     project_root = Path(__file__).resolve().parents[2]
@@ -54,3 +56,6 @@ for module_name in (
         capture_output=True,
         text=True,
     )
+
+
+pytestmark = pytest.mark.cpu_test

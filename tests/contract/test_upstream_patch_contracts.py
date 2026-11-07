@@ -7,6 +7,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import pytest
 import regex as re
 import yaml
 
@@ -104,3 +105,6 @@ def test_gpu_model_runner_private_method_contracts() -> None:
         "hidden_states",
         "num_scheduled_tokens",
     ]
+
+
+pytestmark = pytest.mark.cpu_test

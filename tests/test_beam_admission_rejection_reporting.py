@@ -302,3 +302,6 @@ def test_a_refused_ordinary_request_reaches_the_caller_as_a_client_error() -> No
     with pytest.raises(VLLMValidationError) as caught:
         raise_if_error(processor)
     assert str(caught.value) == REASON
+
+
+pytestmark = pytest.mark.cpu_test

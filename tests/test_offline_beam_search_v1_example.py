@@ -217,3 +217,6 @@ def test_npu_graph_example_requires_replay_only_for_decode(
         output = capsys.readouterr().out
         assert '"npu_beam_graph"' in output
         assert "request=0 returned_beams=1" in output and "request=1 returned_beams=1" in output
+
+
+pytestmark = pytest.mark.cpu_test

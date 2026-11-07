@@ -257,3 +257,6 @@ def test_engine_config_preserves_supported_and_existing_paths(
     assert effective.beam_sid_stage_vocab == gr_config.beam_sid_stage_vocab
     assert effective.beam_execution_mode is gr_config.beam_execution_mode
     assert config.use_v2_model_runner is use_v2
+
+
+pytestmark = pytest.mark.cpu_test

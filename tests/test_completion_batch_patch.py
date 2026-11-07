@@ -679,3 +679,6 @@ def test_decode_capacity_is_checked_before_batch_submission(
         assert not serving.beam_calls
         assert delegate == [request]
         assert "NPU Decode" in _declines(logged)[0][2]
+
+
+pytestmark = pytest.mark.cpu_test

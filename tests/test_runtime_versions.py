@@ -186,3 +186,6 @@ def test_ascend_environment_rejects_wrong_triton_ascend_version(version: str) ->
         pytest.raises(RuntimeError, match="required 3.6.0"),
     ):
         check_ascend_environment()
+
+
+pytestmark = pytest.mark.cpu_test

@@ -254,3 +254,6 @@ def test_atomic_save_streams_without_materializing_the_whole_artifact(
     digest = save_constraint_table_artifact(make_table(), output)
 
     assert digest == _digest(output.read_bytes())
+
+
+pytestmark = pytest.mark.cpu_test

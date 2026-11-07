@@ -580,3 +580,6 @@ def test_profile_stops_after_either_stage_fails(
     assert events == ["start", "stop"]
     if failed_stage == "generate":
         assert not state.beam_calls
+
+
+pytestmark = pytest.mark.cpu_test

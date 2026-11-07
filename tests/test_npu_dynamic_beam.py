@@ -463,3 +463,6 @@ def test_stage_selection_matches_independent_beam_reference_and_preserves_reques
             assert torch.equal(pool.unshared_key[2], key)
             assert torch.equal(pool.unshared_value[2], value)
         reference = expected
+
+
+pytestmark = pytest.mark.cpu_test

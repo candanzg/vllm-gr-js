@@ -310,3 +310,6 @@ def test_different_tasks_dipping_in_different_rounds_do_not_fail(
     _, result, _, failures = summarize(tmp_path, 3, baseline)
     assert result["suspected_tasks"] == ["video"]
     assert failures == []
+
+
+pytestmark = pytest.mark.cpu_test

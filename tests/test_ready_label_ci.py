@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import regex as re
 import yaml
 
@@ -677,3 +678,6 @@ new AsyncFunction('github', 'context', 'core', fixture.script)(github, context, 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+pytestmark = pytest.mark.cpu_test

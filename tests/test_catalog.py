@@ -174,3 +174,6 @@ def test_catalog_multiple_items_long_shared_prefix(mock_tokenizer: MagicMock) ->
     finally:
         if os.path.exists(catalog_path):
             os.remove(catalog_path)
+
+
+pytestmark = pytest.mark.cpu_test

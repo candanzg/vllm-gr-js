@@ -104,3 +104,6 @@ def test_gpu_model_forward_intercepts_pure_prefill(
     result = wrapped(runner, input_ids="ids", positions="pos")
     assert result == "orig_out"
     assert original_calls == [("ids", "pos"), ("ids", "pos"), ("ids", "pos")]
+
+
+pytestmark = pytest.mark.cpu_test

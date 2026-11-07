@@ -759,3 +759,6 @@ def test_async_llm_validator_rejects_missing_merged_submission(
     owner = {"AsyncLLM": AsyncLLM, "LLMEngine": LLMEngine}[class_name]
     monkeypatch.delattr(owner, method_name)
     assert _validate_async_llm_patch() == "GR frontend lifecycle methods are not fully installed"
+
+
+pytestmark = pytest.mark.cpu_test

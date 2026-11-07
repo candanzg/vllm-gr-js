@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from vllm_gr.platforms import cuda, npu
 
 
@@ -59,3 +61,6 @@ def test_cuda_provider_returns_cuda_execution_and_preserves_device() -> None:
     assert isinstance(default_execution, CUDAConstrainedTopKExecution)
     assert isinstance(explicit_execution, CUDAConstrainedTopKExecution)
     assert explicit_execution._device == "cuda"  # noqa: SLF001
+
+
+pytestmark = pytest.mark.cpu_test

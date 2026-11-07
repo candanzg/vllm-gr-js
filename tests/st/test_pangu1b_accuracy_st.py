@@ -24,6 +24,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +52,9 @@ def _parse_cli_summary(stdout: str) -> dict:
         return json.loads(text[start : end + 1])
 
 
+@pytest.mark.gpu_test
+@pytest.mark.npu_test
+@pytest.mark.model_test
 class TestPangu1bAccuracyST(unittest.TestCase):
     """End-to-end accuracy ST for Pangu via offline inference example."""
 
@@ -114,6 +119,7 @@ class TestPangu1bAccuracyST(unittest.TestCase):
         self.assertEqual(summary["num_samples"], 8)
 
 
+@pytest.mark.cpu_test
 class TestPangu1bAccuracyUnitHooks(unittest.TestCase):
     """Lightweight checks that do not load the full model."""
 

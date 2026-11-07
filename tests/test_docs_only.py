@@ -16,3 +16,6 @@ def test_docs_only_classifier() -> None:
     assert node is not None
     root = Path(__file__).resolve().parents[1]
     subprocess.run([node, "--test", "tests/test_docs_only.js"], cwd=root, check=True)
+
+
+pytestmark = pytest.mark.cpu_test

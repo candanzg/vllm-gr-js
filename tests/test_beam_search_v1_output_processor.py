@@ -362,3 +362,6 @@ def test_default_output_is_compact_without_prompt_materialization() -> None:
     assert output.sequences[0].token_ids == (10, 3, 4, 20)
     assert output.sequences[0].cumulative_logprob == -1.25
     assert tokenizer.decode_calls == 0
+
+
+pytestmark = pytest.mark.cpu_test

@@ -457,3 +457,6 @@ def test_short_prefix_stays_native(monkeypatch, tmp_path):
         block_size=16,
     )
     assert policy.resolve_prefix_plan(long, **args) is not None
+
+
+pytestmark = pytest.mark.cpu_test

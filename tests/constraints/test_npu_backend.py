@@ -147,3 +147,6 @@ def test_npu_close_is_idempotent_preserves_info_and_releases_owned_state() -> No
     assert backend._first_token_ids is None  # noqa: SLF001
     with pytest.raises(RuntimeError, match="closed"):
         backend.select(torch.zeros(1, 6), _metadata())
+
+
+pytestmark = pytest.mark.cpu_test

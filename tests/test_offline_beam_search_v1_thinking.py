@@ -533,3 +533,6 @@ def test_main_dispatches_thinking_without_catalog_check_or_artifact(
     monkeypatch.setattr(example.tempfile, "TemporaryDirectory", unexpected_beam_call)
     example.main()
     assert received == [args]
+
+
+pytestmark = pytest.mark.cpu_test

@@ -10,6 +10,7 @@ from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from tools.ci.resolve_benchmark_policy import load_policy, resolve_policy
@@ -466,3 +467,6 @@ printf '%s\\n' "$device" "$board_id"
                     for key in baseline:
                         if key not in (*keys, "BENCHMARK_POLICY_NAME", "PANGU1B_POLICY_SOURCE"):
                             self.assertEqual(values[key], baseline[key], key)
+
+
+pytestmark = pytest.mark.cpu_test

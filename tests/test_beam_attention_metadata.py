@@ -471,7 +471,7 @@ def test_only_npu_incremental_geometry_uses_async_upload(
     assert transfers == [is_npu]
 
 
-@pytest.mark.npu_integration  # type: ignore[misc]
+@pytest.mark.npu_test  # type: ignore[misc]
 def test_npu_async_metadata_upload_survives_pinned_allocator_reuse() -> None:
     """Queued uploads retain immutable payloads after their local source dies."""
     pytest.importorskip("torch_npu")
@@ -1310,3 +1310,6 @@ def test_identity_row_proof_is_not_reused_for_same_shape_changed_prefix() -> Non
     assert first.npu_prefix_rows_are_identity
     assert not changed.npu_prefix_rows_are_identity
     assert restored.npu_prefix_rows_are_identity
+
+
+pytestmark = pytest.mark.cpu_test

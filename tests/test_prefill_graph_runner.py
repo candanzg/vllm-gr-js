@@ -1334,3 +1334,6 @@ def test_npu_prefill_capture_skips_mixed_attention_groups() -> None:
     beam_builder = object.__new__(BeamAttentionMetadataBuilder)
     runner = SimpleNamespace(attn_groups=[[Group(beam_builder), Group(object())]])
     assert NPUPrefillGraphRunner._supports_beam_prefill_capture(runner) is False
+
+
+pytestmark = pytest.mark.cpu_test

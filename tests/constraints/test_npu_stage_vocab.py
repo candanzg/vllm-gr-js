@@ -352,3 +352,6 @@ def test_select_restores_minus_one_padding_without_remapping_it_to_a_valid_token
             assert output.valid_mask[0, 0] and not output.valid_mask[0, 2]
     finally:
         backend.close()
+
+
+pytestmark = pytest.mark.cpu_test

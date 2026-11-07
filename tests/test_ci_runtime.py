@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from tools.ci import resolve_runtime as runtime
@@ -296,3 +297,6 @@ class TestRuntimeWorkflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+pytestmark = pytest.mark.cpu_test

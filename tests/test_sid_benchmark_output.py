@@ -47,3 +47,6 @@ def test_fixed_sid3_benchmark_rejects_early_stop_and_nonfinite_scores() -> None:
         validate_candidates([((100, 200), -0.25)], 1)
     with pytest.raises(ValueError, match="finite"):
         validate_candidates([((100, 200, 300), float("nan"))], 1)
+
+
+pytestmark = pytest.mark.cpu_test

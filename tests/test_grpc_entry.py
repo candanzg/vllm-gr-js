@@ -1076,3 +1076,6 @@ def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
         assert all(getattr(upstream, name) is value for name, value in original.items())
 
     asyncio.run(run())
+
+
+pytestmark = pytest.mark.cpu_test

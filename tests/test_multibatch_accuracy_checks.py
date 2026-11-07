@@ -46,3 +46,6 @@ def test_score_drift_remains_visible_when_candidates_match() -> None:
 def test_invalid_results_fail(output: list[Any], reason: str) -> None:
     with pytest.raises(AssertionError, match=reason):
         validate_output(output, width=2, steps=1, legal={(1,), (2,)})
+
+
+pytestmark = pytest.mark.cpu_test

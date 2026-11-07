@@ -18,6 +18,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
@@ -146,3 +148,6 @@ class TestPanguGrllmShutdown(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+pytestmark = pytest.mark.cpu_test

@@ -553,3 +553,6 @@ def test_engine_creation_serializes_cuda_decision_defaults(
     assert "engine_driven" not in payload["beam"]
     assert parse_gr_config(vllm_config).beam_worker_decision is True
     assert parse_gr_config(vllm_config).beam_engine_driven is None
+
+
+pytestmark = pytest.mark.cpu_test

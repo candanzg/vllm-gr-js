@@ -48,3 +48,6 @@ def test_release_memory_preserves_npu_initialization_state(
     cuda.synchronize.assert_called_once_with()
     cuda.empty_cache.assert_called_once_with()
     cuda.ipc_collect.assert_called_once_with()
+
+
+pytestmark = pytest.mark.cpu_test

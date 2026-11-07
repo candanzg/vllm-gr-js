@@ -247,3 +247,6 @@ def test_shared_driver_imports_each_selected_runtime(
             assert data["source"] == root.name
             driver_digests.add(data["driver"])
     assert len(driver_digests) == 1
+
+
+pytestmark = pytest.mark.cpu_test

@@ -31,7 +31,7 @@ def context(batch, device):
     )
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu_test)])
 @pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize("source,target", [(4, 2), (2, 4), (3, 3)])
 def test_request_local_kv_fanout(device, batch, source, target):
@@ -168,7 +168,7 @@ def test_widening_keeps_multiple_winners_from_one_parent():
     torch.testing.assert_close(result["out_log_probs"], torch.tensor([[-0.2, -0.3], [-0.3, -0.4]]))
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu_test)])
 def test_decode_branch_candidates_are_independent_from_retained_widths(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
@@ -293,3 +293,6 @@ def test_gpu_single_step_packing_filters_before_return_limit(bad, returned):
     assert output.device[3].item() == 1
     assert output.device[4].item() == 12
     assert output.device[6:7].view(torch.float32).item() == pytest.approx(-0.2)
+
+
+pytestmark = pytest.mark.cpu_test

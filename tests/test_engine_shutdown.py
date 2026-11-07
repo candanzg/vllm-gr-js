@@ -57,3 +57,6 @@ def test_shutdown_error_is_not_retried_without_the_budget() -> None:
         shutdown_sync_engine(engine)
 
     shutdown.assert_called_once_with(timeout=10)
+
+
+pytestmark = pytest.mark.cpu_test

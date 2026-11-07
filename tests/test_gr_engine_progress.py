@@ -73,3 +73,6 @@ def test_step_failure_propagates_without_fabricating_output() -> None:
         make_patched_process_engine_step(_native_step)(engine)
     engine.output_queue.put_nowait.assert_not_called()
     engine.post_step.assert_not_called()
+
+
+pytestmark = pytest.mark.cpu_test

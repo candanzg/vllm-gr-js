@@ -429,3 +429,6 @@ def test_startup_failure_is_local_to_batch(
     assert should_replay_decode_graph(worker, SimpleNamespace(ready=True), batch_size=4)
     with pytest.raises(RuntimeError, match="not ready"):
         should_replay_decode_graph(worker, SimpleNamespace(ready=False), batch_size=4)
+
+
+pytestmark = pytest.mark.cpu_test

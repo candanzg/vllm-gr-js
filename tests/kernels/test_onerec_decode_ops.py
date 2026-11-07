@@ -342,6 +342,7 @@ def test_registered_final_select_is_visible_to_torch_compile() -> None:
         torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
+@pytest.mark.gpu_test  # type: ignore[misc]
 @pytest.mark.skipif(  # type: ignore[misc]
     not torch.cuda.is_available(), reason="CUDA is required"
 )
@@ -364,3 +365,6 @@ def test_topk_torch_cuda_graph(case: str) -> None:
     torch.accelerator.synchronize()
     for expected, actual in zip(torch_result, graph_result):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+pytestmark = pytest.mark.cpu_test

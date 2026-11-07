@@ -235,3 +235,6 @@ def test_non_default_hash_serializers_match_python_tokens(
     incremental = hasher(list_request)
     assert len(incremental) == 1
     assert hasher(array_request) == incremental
+
+
+pytestmark = pytest.mark.cpu_test

@@ -6,6 +6,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pytest
+
 
 class TestServeAttentionBackendDefault(unittest.TestCase):
     """Verify --attention-backend defaults to CUSTOM for the serve subcommand,
@@ -43,3 +45,6 @@ class TestServeAttentionBackendDefault(unittest.TestCase):
     def test_custom_explicit_preserves_value(self) -> None:
         args = self.parser.parse_args(["serve", "--attention-backend", "CUSTOM"])
         self.assertEqual(args.attention_backend, "CUSTOM")
+
+
+pytestmark = pytest.mark.cpu_test

@@ -212,3 +212,6 @@ def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
         register_backend(provider)
 
     assert "missing=('create_constrained_topk_execution',)" in str(exc_info.value)
+
+
+pytestmark = pytest.mark.cpu_test

@@ -420,3 +420,6 @@ def test_ascend_entry_installs_filter_before_delegating(
         )
         == "ready"
     )
+
+
+pytestmark = pytest.mark.cpu_test

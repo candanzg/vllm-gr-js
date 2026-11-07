@@ -397,3 +397,6 @@ def test_npu_device_validation_accepts_partial_non_beam_config() -> None:
     from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
 
     validate_gr_device_config(SimpleNamespace(device_config=SimpleNamespace(device="npu")))
+
+
+pytestmark = pytest.mark.cpu_test

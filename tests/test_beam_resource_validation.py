@@ -196,3 +196,6 @@ def test_dispatch_mode_change_revalidates_safely() -> None:
         context, workspace = _resources()
         key = _validate(context, workspace)
     assert _validate(context, workspace) == key
+
+
+pytestmark = pytest.mark.cpu_test

@@ -488,3 +488,6 @@ def test_bad_tied_head_leaves_failure_evidence_without_final_output(
     # A real tokenizer conversion completed before the malformed head was read.
     assert (attempts[0] / "sid_token_ids.json").is_file()
     assert _snapshot(source) == before
+
+
+pytestmark = pytest.mark.cpu_test

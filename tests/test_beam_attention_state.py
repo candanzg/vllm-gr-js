@@ -61,3 +61,6 @@ def test_unknown_backend_requires_an_explicit_adapter() -> None:
             num_kv_heads=4,
             max_query_len=3,
         )
+
+
+pytestmark = pytest.mark.cpu_test

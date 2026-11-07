@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -84,3 +86,6 @@ class TestNPUGateRuntime(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+pytestmark = pytest.mark.cpu_test

@@ -248,3 +248,6 @@ def test_npu_budget_rejection_preserves_inflight_owner(core):
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
     scheduler.update_from_output(first, receipt(first))
     complete(core, "active")
+
+
+pytestmark = pytest.mark.cpu_test

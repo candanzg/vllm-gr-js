@@ -222,3 +222,6 @@ def test_process_catalog_with_sentinels(tmp_path: Path) -> None:
 
         if os.path.exists(output_path):
             os.remove(output_path)
+
+
+pytestmark = pytest.mark.cpu_test

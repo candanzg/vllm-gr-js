@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
@@ -226,3 +227,6 @@ def test_incremental_metadata_builder_uses_active_session_contract() -> None:
     # suffix_slot_mapping_out is an empty tensor (not None) in incremental path
     assert metadata.suffix_slot_mapping_out is not None
     assert metadata.suffix_slot_mapping_out.numel() == 0
+
+
+pytestmark = pytest.mark.cpu_test

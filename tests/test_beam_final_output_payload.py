@@ -106,3 +106,6 @@ def test_empty_compact_payload_failure(batch_size: int, empty_item: int) -> None
     assert result.failure is not None
     assert result.failure.code == "no_valid_beams"
     assert result.failure.item_index == empty_item
+
+
+pytestmark = pytest.mark.cpu_test

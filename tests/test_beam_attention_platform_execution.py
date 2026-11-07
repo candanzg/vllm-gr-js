@@ -152,6 +152,7 @@ def test_platform_dispatch_selects_exactly_one_execution_module(
     assert selected is (gpu_module if expected == "gpu" else npu_module)
 
 
+@pytest.mark.npu_test  # type: ignore[misc]
 @pytest.mark.skipif(  # type: ignore[misc]
     not _TORCH_NPU_IMPORTABLE, reason="torch_npu is not installed"
 )
@@ -645,3 +646,6 @@ def test_npu_prefill_attention_consumes_common_metadata(
     assert fia_kwargs["block_size"] == 16
     assert fia_kwargs["input_layout"] == "TND"
     assert torch.equal(output[:4], torch.zeros(4, 8, 64))
+
+
+pytestmark = pytest.mark.cpu_test

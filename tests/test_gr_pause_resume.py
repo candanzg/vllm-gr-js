@@ -281,3 +281,6 @@ def test_pause_after_last_cancel_waits_for_dispatches_and_release_proof(core, mo
     assert not core.scheduler._gr_v1_sessions
     assert core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
     assert model_dispatches(core) == [("A", 0)]
+
+
+pytestmark = pytest.mark.cpu_test

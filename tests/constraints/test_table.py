@@ -132,3 +132,6 @@ def test_validation_does_not_use_full_array_diff_repeat_or_unique(
     monkeypatch.setattr(np, "unique", forbidden)
 
     validate_constraint_table(make_table())
+
+
+pytestmark = pytest.mark.cpu_test

@@ -40,6 +40,8 @@ from tests.st.test_onerec_v1_npu_e2e import (  # noqa: E402
     _prompt_tokens,
 )
 
+pytestmark = pytest.mark.npu_test
+
 _WIDTH = 32
 _SCHEDULES = (None, (32, 32, 32), (32, 16, 8), (8, 16, 32))
 
@@ -384,7 +386,7 @@ def _run_regression(work_dir: Path) -> None:
                 ordinary_reference = ordinary_after
 
 
-@pytest.mark.npu_integration
+@pytest.mark.npu_test
 @pytest.mark.slow
 @pytest.mark.timeout(960)
 def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:

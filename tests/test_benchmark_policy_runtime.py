@@ -7,6 +7,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import pytest
+
 
 class BenchmarkPolicyRuntimeTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node.js is required")
@@ -17,3 +19,6 @@ class BenchmarkPolicyRuntimeTest(unittest.TestCase):
             cwd=root,
             check=True,
         )
+
+
+pytestmark = pytest.mark.cpu_test

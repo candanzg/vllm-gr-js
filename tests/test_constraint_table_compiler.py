@@ -524,3 +524,6 @@ def test_wire_rejects_2d_prefix2_values(tokenizer: MagicMock) -> None:
     }
     with pytest.raises(ValueError, match="1-D"):
         from_wire(wire)
+
+
+pytestmark = pytest.mark.cpu_test

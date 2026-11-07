@@ -7,6 +7,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import pytest
+
 
 class BenchmarkPolicyBootstrapTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for github-script tests")
@@ -20,3 +22,6 @@ class BenchmarkPolicyBootstrapTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+pytestmark = pytest.mark.cpu_test

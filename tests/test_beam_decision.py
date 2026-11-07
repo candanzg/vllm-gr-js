@@ -808,3 +808,6 @@ def test_select_candidates_v2_layout_rejects_narrow_payload() -> None:
     sampler_output = _sampler_output(candidates, probs)
 
     assert beam_decision._select_candidates(sampler_output, 4, v2_layout=True) is None
+
+
+pytestmark = pytest.mark.cpu_test

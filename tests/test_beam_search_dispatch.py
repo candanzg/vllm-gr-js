@@ -209,3 +209,6 @@ def test_offline_old_name_cannot_fall_back_to_upstream() -> None:
     llm = object.__new__(GRLLM)
     with pytest.raises(NotImplementedError, match=r"removed.*beam_search_v1"):
         llm.beam_search([], object(), output_mode="compact")
+
+
+pytestmark = pytest.mark.cpu_test

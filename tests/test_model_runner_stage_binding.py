@@ -166,3 +166,6 @@ def test_stage_capture_passes_bound_model_install_policy(
         owner._forward_hidden, persistent_install=hooks_type is stages._StageExecutionHooks
     )
     assert owner.graph is None
+
+
+pytestmark = pytest.mark.cpu_test

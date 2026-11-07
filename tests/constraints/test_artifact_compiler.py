@@ -6,6 +6,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from vllm_gr.constraints.artifact_compiler import (
     ConstraintTableArtifactCompiler,
@@ -59,3 +60,6 @@ def test_legacy_compiler_return_type_remains_unchanged() -> None:
         compile_relations_json([["1", "2", "3"]])
     )
     assert type(resource) is ConstraintTableResource
+
+
+pytestmark = pytest.mark.cpu_test

@@ -1092,3 +1092,6 @@ def test_slim_v2_wrapper_is_idempotent() -> None:
 
     wrapped = common.make_patched_execute_model_v2(execute_model)
     assert common.make_patched_execute_model_v2(wrapped) is wrapped
+
+
+pytestmark = pytest.mark.cpu_test

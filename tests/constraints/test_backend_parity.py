@@ -108,3 +108,6 @@ def test_exact_tie_contract_does_not_assert_slot_order() -> None:
         cpu_output.logprobs[0].sort().values,
         npu_output.logprobs[0].sort().values,
     )
+
+
+pytestmark = pytest.mark.cpu_test

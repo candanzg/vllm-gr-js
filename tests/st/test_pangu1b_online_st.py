@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import IO, Any, Iterator
 from unittest import mock
 
+import pytest
 import requests
 
 from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
@@ -208,6 +209,9 @@ def _chat_completion(
     return body
 
 
+@pytest.mark.gpu_test
+@pytest.mark.npu_test
+@pytest.mark.model_test
 class TestPangu1bOnlineServeST(unittest.TestCase):
     """End-to-end online ST for Pangu LLM passthrough via ``vllm-gr serve``."""
 
@@ -308,6 +312,7 @@ class TestPangu1bOnlineServeST(unittest.TestCase):
             self.assertGreaterEqual(accuracy, DEFAULT_MIN_ACCURACY)
 
 
+@pytest.mark.cpu_test
 class TestPangu1bOnlineUnitHooks(unittest.TestCase):
     """Lightweight checks that do not load the full model or start a server."""
 

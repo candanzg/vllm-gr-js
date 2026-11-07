@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 GPU_TEST = Path(__file__).parent / "kernels/attention/test_cascade_beam_attn_gpu.py"
 
 
@@ -75,3 +77,6 @@ class TestCascadeBeamAttentionGPUCollection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+pytestmark = pytest.mark.cpu_test

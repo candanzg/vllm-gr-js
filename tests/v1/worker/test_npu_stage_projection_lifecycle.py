@@ -298,3 +298,6 @@ def test_failed_native_reload_requires_complete_load_to_resume(lifecycle: Any) -
     torch.testing.assert_close(actual[:, :2], full[:, [17, 100]])
     make_shutdown_with_constraint_backend()(runner)
     assert all(backend.close_calls == 1 for backend in lifecycle.backends)
+
+
+pytestmark = pytest.mark.cpu_test

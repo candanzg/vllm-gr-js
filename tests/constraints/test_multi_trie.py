@@ -132,7 +132,15 @@ def test_v2_artifact_roundtrip_and_cpu_query(tmp_path: Path, count: int, step: i
 
 
 @pytest.mark.parametrize("count", [1, 2])  # type: ignore[misc]
-@pytest.mark.parametrize("mode", ["cpu", "cuda", "cuda_out", "cuda_raw"])  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "mode",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.gpu_test),
+        pytest.param("cuda_out", marks=pytest.mark.gpu_test),
+        pytest.param("cuda_raw", marks=pytest.mark.gpu_test),
+    ],
+)
 def test_checked_backends_share_root_defaults_and_range_errors(count: int, mode: str) -> None:
     if mode != "cpu" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
@@ -202,6 +210,7 @@ def test_checked_backends_share_root_defaults_and_range_errors(count: int, mode:
         backend.close()
 
 
+@pytest.mark.gpu_test  # type: ignore[misc]
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")  # type: ignore[misc]
 def test_worker_unchecked_selection_skips_public_validation(
     monkeypatch: pytest.MonkeyPatch,
@@ -252,6 +261,7 @@ def test_rejects_cross_root_key_and_boundary_corruption() -> None:
         )
 
 
+@pytest.mark.gpu_test  # type: ignore[misc]
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")  # type: ignore[misc]
 @pytest.mark.parametrize("count", [1, 2])  # type: ignore[misc]
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # type: ignore[misc]
@@ -304,3 +314,6 @@ def test_cuda_loader_readiness_and_all_stages_match_scalar_reference(
         else backend._first_token_offsets is not None
     )
     backend.close()
+
+
+pytestmark = pytest.mark.cpu_test

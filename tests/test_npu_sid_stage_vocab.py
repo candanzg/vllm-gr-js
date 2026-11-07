@@ -330,3 +330,6 @@ def test_sid_maps_do_not_change_generic_unconstrained_mode(stage_vocab: NPUSIDSt
         logits, SimpleNamespace(beam_params=SimpleNamespace(temperature=0.0))
     )
     assert result.token_ids[0, 0] == 0 and result.valid_mask[0, 0]
+
+
+pytestmark = pytest.mark.cpu_test

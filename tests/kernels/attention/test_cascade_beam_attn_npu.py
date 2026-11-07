@@ -48,6 +48,11 @@ try:
 except ImportError:  # keeps the module importable without pytest installed
     pytest = None  # type: ignore[assignment,unused-ignore]
 
+# Declare the tier before the module-level skip below, so the directory
+# default never relabels this NPU suite as gpu_test.
+if pytest is not None:
+    pytestmark = pytest.mark.npu_test
+
 # ---------------------------------------------------------------------------
 # NPU availability. Both `import torch_npu` and `torch.device("npu")` raise
 # (ImportError / RuntimeError respectively) on a machine without the Ascend

@@ -276,3 +276,6 @@ def test_npu_prefill_default_and_inherit_are_noops(
     )
     impl = beam_attn.BeamAttentionImpl(16, 128, 128**-0.5, 8, None, None, "auto")
     assert impl.prefill_flash_attn_version is None
+
+
+pytestmark = pytest.mark.cpu_test

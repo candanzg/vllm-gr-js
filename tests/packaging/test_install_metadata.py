@@ -140,3 +140,6 @@ def test_warn_deprecated_extra_install_emits_warning() -> None:
         assert any(isinstance(w.message, DeprecationWarning) for w in caught)
     finally:
         sys.argv = original_argv
+
+
+pytestmark = pytest.mark.cpu_test

@@ -29,3 +29,6 @@ def test_compute_beam_bounds_behavior(
     expected: tuple[int, int, int, int],
 ) -> None:
     assert _compute_beam_bounds(*args) == expected
+
+
+pytestmark = pytest.mark.cpu_test

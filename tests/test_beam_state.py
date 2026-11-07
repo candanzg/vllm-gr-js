@@ -134,3 +134,6 @@ def test_session_begin_can_reset_one_decision_row() -> None:
     session.begin_session(4, 0)
     assert torch.all(context.decision.sequence == 0)
     assert context.decision.worker_decode_steps == 0
+
+
+pytestmark = pytest.mark.cpu_test

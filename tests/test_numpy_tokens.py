@@ -240,6 +240,8 @@ def _cpu_uva_pool(monkeypatch):
     return buffer_utils.UvaBufferPool(1, dtype=torch.int32, max_concurrency=2)
 
 
+@pytest.mark.gpu_test
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("array_backed", [False, True])
 @pytest.mark.parametrize("uva_contents", [False, True])
 def test_native_v2_staging_batches_arrays_and_keeps_kernel_write_order(
@@ -337,6 +339,8 @@ def test_staged_contents_array_protocol_dtype_and_copy(chunks, dtype, copy):
         assert np.shares_memory(result, source) == (copy is not True)
 
 
+@pytest.mark.gpu_test
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("readonly", [False, True])
 def test_native_v2_array_transfer_preserves_output_buffer(readonly):
     from vllm.v1.worker.gpu import buffer_utils
@@ -354,6 +358,8 @@ def test_native_v2_array_transfer_preserves_output_buffer(readonly):
     assert source.flags.writeable != readonly
 
 
+@pytest.mark.gpu_test
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_native_v1_input_batch_copies_arrays_in_bulk():
     from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
@@ -383,3 +389,6 @@ def test_native_v1_input_batch_copies_arrays_in_bulk():
     np.testing.assert_array_equal(batch.token_ids_cpu[index, :4], source)
     assert batch.num_prompt_tokens[index] == 4
     assert batch.remove_request("id") is not None
+
+
+pytestmark = pytest.mark.cpu_test

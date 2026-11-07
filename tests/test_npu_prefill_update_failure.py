@@ -264,3 +264,6 @@ def test_failure_state_belongs_to_the_runner_instance(case: _ForwardCase) -> Non
     fresh.raise_if_failed()
     assert fresh._task_update_error is None
     assert fresh.has_captured_graph(4) is False
+
+
+pytestmark = pytest.mark.cpu_test

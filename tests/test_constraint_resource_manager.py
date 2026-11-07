@@ -147,3 +147,6 @@ def test_manager_and_execution_paired_lifecycle(tokenizer: MagicMock) -> None:
         torch.randn(2, 30), torch.zeros(2, 1, 1, dtype=torch.int32), torch.zeros(0), 0, 2
     )
     assert result.top_tokens.dtype == torch.int32
+
+
+pytestmark = pytest.mark.cpu_test

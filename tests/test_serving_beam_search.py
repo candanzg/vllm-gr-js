@@ -124,6 +124,7 @@ async def _run_serving_v1(loops, model_name, config, gpu_memory_utilization):
 
 
 @pytest.mark.slow  # type: ignore
+@pytest.mark.timeout(1200)  # three model/engine builds can exceed 600 s on L20
 @pytest.mark.asyncio  # type: ignore
 async def test_serving_beam_search(loops: int) -> None:
     await beam_search_test(loops)
@@ -176,3 +177,6 @@ def test_serving_gr_beam_search(loops: int) -> None:
     p.start()
     p.join()
     assert p.exitcode == 0
+
+
+pytestmark = pytest.mark.gpu_test

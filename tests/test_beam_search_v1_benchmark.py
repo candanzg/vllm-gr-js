@@ -362,3 +362,6 @@ def test_reused_workload_must_match_shared_interval(tmp_path: Path) -> None:
         benchmark._load_workload(
             path, requests=1, vocab_size=1000, token_id_start=100, token_id_end=199
         )
+
+
+pytestmark = pytest.mark.cpu_test

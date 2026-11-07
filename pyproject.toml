@@ -94,7 +94,20 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v"
+# Default guard; the long system tests carry their own @pytest.mark.timeout.
 timeout = 250
+# Mirrors the upstream vLLM convention: markers describe which execution
+# environment a test belongs to. They are descriptive, so CI selects with
+# `-m` rather than the framework skipping on hardware availability.
+markers = [
+    "slow: mark test as slow to run; skipped unless --run-slow is given",
+    "slow_test: alias of slow, kept for upstream naming consistency",
+    "cpu_test: mark test as CPU-only test",
+    "gpu_test: mark test as requiring a CUDA device",
+    "npu_test: mark test as requiring an Ascend NPU runtime",
+    "model_test: mark test as requiring model weights",
+    "network: mark test as requiring network access",
+]
 
 [tool.black]
 line-length = 100

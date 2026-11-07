@@ -350,3 +350,6 @@ def test_frontend_rollback_keeps_a_live_registration_on_other_errors() -> None:
         engine.add_request(request.request_id, request, request.sampling_params)
     # Native behavior: only a dead engine triggers the rollback.
     assert _frontend_state(engine.output_processor) == (1, 1, 0)
+
+
+pytestmark = pytest.mark.cpu_test

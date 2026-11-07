@@ -80,3 +80,6 @@ def test_recall_graph_gate_requires_every_b4_batch_to_replay() -> None:
     after[0]["gr_prefill_dispatches"] = {"replay:4": 1, "fallback:4:no_graph": 1}
     with pytest.raises(RuntimeError, match="expected 2 replays"):
         graph_delta(before, after, 2)
+
+
+pytestmark = pytest.mark.cpu_test

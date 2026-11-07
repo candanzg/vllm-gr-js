@@ -175,3 +175,6 @@ def test_encoder_decoder_input_is_refused_before_the_engine_is_reached() -> None
         _run(prompt, _client_params(ignore_eos=True), calls)
 
     assert calls == []
+
+
+pytestmark = pytest.mark.cpu_test

@@ -122,3 +122,6 @@ def test_fully_connected_uses_whole_universe() -> None:
     values = np.asarray(resource.prefix1_values)
     assert values.shape == (16,)
     assert set(values.tolist()) == {_sb_id(i) for i in range(4)}
+
+
+pytestmark = pytest.mark.cpu_test

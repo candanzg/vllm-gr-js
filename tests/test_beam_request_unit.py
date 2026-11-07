@@ -174,3 +174,6 @@ class TestBeamKernelsDynamicBeamCount:
 
 def test_plugin_preserves_native_greedy_validation() -> None:
     _run_subprocess(_sub_patch_preserves_greedy_validation)
+
+
+pytestmark = pytest.mark.cpu_test

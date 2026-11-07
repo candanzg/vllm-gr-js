@@ -995,3 +995,6 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     with pytest.raises(RuntimeError, match="geometry changed"):
         gpu_patch.initialize_beam_postprocess_workspaces(runner)
     assert allocate.call_count == 1
+
+
+pytestmark = pytest.mark.cpu_test

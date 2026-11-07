@@ -135,3 +135,6 @@ def test_engine_creation_removes_raw_retired_input_without_other_changes(
     assert not worker_warnings
     assert worker_config.beam_engine_driven is None
     assert not worker_config.enabled
+
+
+pytestmark = pytest.mark.cpu_test

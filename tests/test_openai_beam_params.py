@@ -124,3 +124,6 @@ def test_chat_http_handles_replaced_usage_info(
     finally:
         # Restore Pydantic's validator after monkeypatch has restored the field.
         ChatCompletionResponse.model_rebuild(force=True)
+
+
+pytestmark = pytest.mark.cpu_test
