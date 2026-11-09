@@ -18,7 +18,6 @@ import json
 import platform
 import subprocess
 import sys
-import tomllib
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -71,18 +70,13 @@ def declarations(repo: Path, device: str) -> dict[str, str]:
         package: literal(repo / "vllm_gr/_env_check.py", GUARDS[package]) for package in packages
     }
     base = literal(repo / "setup.py", "VLLM_GR_BASE_VERSION")
-    config = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
     cuda_lines = [
         line.split("#", 1)[0].strip()
         for line in (repo / "requirements/cuda.txt").read_text(encoding="utf-8").splitlines()
     ]
     pins = [line for line in cuda_lines if line.lower().startswith("vllm")]
-    if (
-        base != guards["vllm"]
-        or config["tool"]["setuptools_scm"]["fallback_version"] != base
-        or pins != [f"vllm=={base}"]
-    ):
-        raise ValueError("vLLM guard, CUDA pin, GR base and SCM fallback versions must agree")
+    if base != guards["vllm"] or pins != [f"vllm=={base}"]:
+        raise ValueError("vLLM guard, CUDA pin and GR base versions must agree")
     _check_version_fallback(repo, base)
     expected = {"vllm": base, "vllm-gr": base}
     if device == "npu":

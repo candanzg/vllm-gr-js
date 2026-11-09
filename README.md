@@ -8,6 +8,21 @@ vLLM-based Generative Recommender Inference Engine
 
 This repository focuses on vLLM-based generative recommendation inference, including the OneRec beam-search / catalog-constrained generation pipeline, the Pangu LLM passthrough path, example scripts, test suites, and GPU / NPU runtime adaptation code.
 
+## Runtime version contract
+
+vllm-gr patches vLLM internals, so each vllm-gr release supports exactly one
+vLLM version. vllm-gr **0.30.0** works only with **vLLM 0.30.0**; startup fails
+with an error for any other vLLM version.
+
+| Platform | vllm-gr | Required runtime | Provided by |
+| --- | --- | --- | --- |
+| CUDA | `0.30.0` | vLLM `0.30.0` | `requirements/cuda.txt` (installed automatically) |
+| Ascend NPU | `0.30.0+npu` | vLLM `0.30.0`, vLLM-Ascend `0.30.0rc2`, Triton-Ascend `3.6.0` | Vendor base image (see [Ascend guide](docs/quickstart-ascend.md)) |
+
+Python 3.11, 3.12, and 3.13 are supported. The runtime check lives in
+`vllm_gr/_env_check.py`; do not install a different vLLM into the same
+environment.
+
 ## Current Scope
 
 The current implementation targets inference scenarios and does not aim for full training-phase feature coverage.

@@ -45,7 +45,7 @@ class TestRuntimeResolution(unittest.TestCase):
         # A fixed synthetic prior-release fixture stays valid when the live candidate pins change.
         files = {
             "setup.py": 'VLLM_GR_BASE_VERSION = "0.29.0"\n',
-            "pyproject.toml": '[tool.setuptools_scm]\nfallback_version = "0.29.0"\n',
+            "pyproject.toml": '[project]\nname = "vllm-gr"\n',
             "vllm_gr/_env_check.py": (
                 '_SUPPORTED_VLLM_VERSION = "0.29.0"\n'
                 '_SUPPORTED_VLLM_ASCEND_VERSION = "0.29.0rc1"\n'
@@ -74,7 +74,6 @@ class TestRuntimeResolution(unittest.TestCase):
     def test_future_candidate_drives_runtime_without_ci_pin_changes(self) -> None:
         for name in (
             "setup.py",
-            "pyproject.toml",
             "vllm_gr/_env_check.py",
             "requirements/cuda.txt",
         ):
@@ -85,7 +84,6 @@ class TestRuntimeResolution(unittest.TestCase):
     def test_partial_pin_updates_fail(self) -> None:
         for name in (
             "setup.py",
-            "pyproject.toml",
             "vllm_gr/_env_check.py",
             "requirements/cuda.txt",
         ):

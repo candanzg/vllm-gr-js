@@ -2,7 +2,6 @@
 requires = [
     "setuptools>=77.0.3,<81.0.0",
     "wheel",
-    "setuptools-scm>=8.0",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -49,7 +48,6 @@ dev = [
     "pytest-cov>=4.0.0",
     "types-protobuf",
     "tblib",
-    "black",
     "ruff",
     "mypy",
     "psutil",
@@ -84,10 +82,7 @@ include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
 "vllm_gr" = ["_version.py", "*.json"]
-"vllm_gr.entrypoints.grpc" = ["proto/*.proto"]
-
-[tool.setuptools_scm]
-fallback_version = "0.30.0"
+"vllm_gr.entrypoints.grpc" = ["proto/*.proto", "generated/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -95,10 +90,6 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v"
 timeout = 250
-
-[tool.black]
-line-length = 100
-target-version = ['py311', 'py312', 'py313']
 
 [tool.ruff]
 extend-exclude = ["vllm_gr/entrypoints/grpc/generated"]

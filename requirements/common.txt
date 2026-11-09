@@ -6,13 +6,19 @@
 # require numpy>=2, while the Ascend stack pins numpy==1.26.4 through
 # triton-ascend. The two majors are therefore irreconcilable in one shared
 # list, so each platform declares its own pair.
+#
+# Constraint policy for every requirements file:
+# - Exact pins (==) only for the runtime whose internals vllm-gr patches
+#   (vllm, enforced at startup by vllm_gr/_env_check.py) and for packages with
+#   an ABI coupling validated per platform (numpy); state the reason inline.
+# - Everything else uses the lowest validated version as a lower bound (>=).
 
 msgspec
 regex
 pandas>=3.0.0
 requests>=2.32.0
 scikit-learn>=1.8.0
-pyarrow==23.0.0
+pyarrow>=23.0.0
 tqdm>=4.66.0
 safetensors>=0.6.2
 PyYAML>=6.0

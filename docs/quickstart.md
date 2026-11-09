@@ -61,7 +61,11 @@ vLLM runtime from `requirements/cuda.txt`. There is no CUDA extra. The Ascend
 path is validated on the vLLM-Ascend 0.30.0rc2 vendor image; see the
 [Ascend installation guide](quickstart-ascend.md) before attempting an NPU environment.
 
-> **Note:** Installing using `uv` (e.g. `uv pip install`) may cause race conditions during installation. It is recommended to use `pip` directly to ensure a predictable installation.
+> **Note:** Both `pip` and `uv pip` work; the project CI installs with
+> `uv pip install -e ".[dev,grpc]"`. Packages are built in an isolated
+> environment without Torch, so set `VLLM_GR_TARGET_DEVICE=cuda` (or `cpu`)
+> to select the platform requirements explicitly instead of relying on
+> detection.
 
 4. **Verify installation**
 

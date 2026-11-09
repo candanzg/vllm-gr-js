@@ -43,7 +43,7 @@ else
     rm -rf dist/ build/ vllm-gr.egg-info vllm_gr.egg-info
 fi
 
-"$PYTHON" -m pip install --quiet build wheel setuptools-scm
+"$PYTHON" -m pip install --quiet build wheel
 
 echo "Building wheel with VLLM_GR_TARGET_DEVICE=${VLLM_GR_TARGET_DEVICE:-<auto-detected by setup.py>}"
 "$PYTHON" -m build --wheel
