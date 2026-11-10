@@ -66,7 +66,7 @@ runtime conftest, matching the wheel smoke script:
 python -m pytest --confcutdir=tests/packaging -q tests/packaging/test_install_metadata.py
 ```
 
-That command requires pytest, setuptools, and packaging, but does not establish
+That command requires pip, pytest, setuptools, setuptools-scm, packaging, and Git, but does not establish
 inference support. Check the [coverage map](../development.md#select-regression-coverage)
 for the tests associated with other code areas.
 
