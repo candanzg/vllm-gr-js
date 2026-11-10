@@ -36,6 +36,10 @@ the installation procedure, runtime requirements, and execution contract.
 
 For the validated CUDA installation path, see [quickstart](docs/quickstart.md).
 
+For service security boundaries and vulnerability reporting, see the
+[security policy](SECURITY.md) and the upstream
+[vLLM security guide](https://docs.vllm.ai/en/latest/usage/security.html).
+
 ## Unified self-validation
 
 For code changes, start with [Contributing](CONTRIBUTING.md) and the

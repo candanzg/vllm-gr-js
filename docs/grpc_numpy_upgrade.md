@@ -62,10 +62,21 @@ cover the UVA assignment, buffer reuse, and array dtype/copy semantics.
 
 ## Usage and tests
 
+**Security:** In the supported vLLM runtime, the upstream gRPC listener is
+unencrypted and has no built-in authentication or authorization. The HTTP
+API key does not protect gRPC, including health and reflection. Do not expose
+the port to untrusted networks. Restrict backend access with network controls;
+use a trusted gateway when remote access requires TLS and access control. See
+the [security policy](../SECURITY.md) and the
+[vLLM security guide](https://docs.vllm.ai/en/latest/usage/security.html).
+Behavior depends on the installed vLLM version. In the reference implementation,
+omitting `--host` binds to `0.0.0.0`. The example below binds to loopback only;
+this limits reachability but does not add authentication.
+
 Install `pip install -e '.[grpc]'`, then use existing GR settings:
 
 ```bash
-vllm-gr serve /path/to/model --vllm-gr-config /path/to/gr-config.json --grpc --port 50051
+vllm-gr serve /path/to/model --vllm-gr-config /path/to/gr-config.json --grpc --host 127.0.0.1 --port 50051
 python examples/online_serving/grpc/client.py --address 127.0.0.1:50051
 python examples/online_serving/grpc/run_smoke.py --output /tmp/gr-grpc-smoke
 ```

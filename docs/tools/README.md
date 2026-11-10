@@ -266,6 +266,12 @@ path validates CUDA device mapping before acting; consult
 `tools/ci/check_cuda_device_mapping.py` and `tools/ci/gpu_process_guard.py` when
 changing that behavior.
 
+`scripts/kill_vllm_on_device.sh` sends SIGTERM to matching EngineCore processes
+on the selected GPUs and then requires those GPUs to have no compute processes.
+The name and device checks do not establish which job owns a process. Use it
+only on devices allocated to the cleanup job, not on shared devices where it
+could terminate another user's work.
+
 ## GitHub Actions tester
 
 `tools/run_act.sh` invokes `act` with Docker's NVIDIA runtime, selects and locks
