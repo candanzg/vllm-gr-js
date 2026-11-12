@@ -109,3 +109,15 @@ token families on this stack, see
 ```bash
 pip uninstall vllm-gr
 ```
+
+## Runtime integration roadmap
+
+- Keep runtime overrides traceable through stable ownership, explicit activation
+  conditions, and per-process installation contracts.
+- Reduce general-purpose wrappers once stable extension interfaces or native
+  behavior satisfy the existing serving, cancellation, and lifecycle tests.
+- Evaluate bulk logprob append semantics with equal, short, empty, and missing
+  metadata inputs before replacing its current optimized implementation.
+
+See [runtime patch contracts](docs/runtime_patch_inventory.md#installation-contracts-and-reports)
+for validation and removal requirements.

@@ -7,6 +7,9 @@ from collections.abc import AsyncGenerator, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
+from vllm_gr.patch_report import observed_installation
+
 if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.lora.request import LoRARequest
@@ -92,8 +95,9 @@ def beam_search_dispatch(
     )
 
 
+@observed_installation
 def patch_beam_search():
-    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+    GenerateBaseServing = resolve_symbol("GenerateBaseServing")
 
     from vllm_gr.entrypoints.openai.completion_batch_patch import patch_completion_batch
     from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
@@ -118,7 +122,7 @@ def patch_admission_rejection_reporting():
     """
     from functools import wraps
 
-    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
+    GenerateBaseServing = resolve_symbol("GenerateBaseServing")
     from vllm.exceptions import VLLMValidationError
 
     from vllm_gr.v1.engine.async_llm import (
@@ -167,8 +171,8 @@ def patch_client_request_id():
     """
     from functools import wraps
 
-    from vllm.entrypoints.serve.engine.serving import BaseServing
-    from vllm.v1.engine.output_processor import OutputProcessor
+    BaseServing = resolve_symbol("BaseServing")
+    OutputProcessor = resolve_symbol("OutputProcessor")
 
     from vllm_gr.v1.engine.async_llm import (
         _CLIENT_REQUEST_ID,
@@ -202,10 +206,12 @@ def patch_client_request_id():
     OutputProcessor.add_request = patched_add_request
 
 
+@observed_installation
 def patch_sampling():
     from pydantic import StrictInt
-    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+
+    ChatCompletionRequest = resolve_symbol("ChatCompletionRequest")
+    CompletionRequest = resolve_symbol("CompletionRequest")
 
     from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
@@ -226,10 +232,12 @@ def patch_sampling():
     CompletionRequest.model_rebuild(force=True)
 
 
+@observed_installation
 def patch_engine_core_process_entrypoint() -> None:
     """Wrap the EngineCore process entrypoint for spawn-based runtimes."""
     from vllm.logger import init_logger
-    from vllm.v1.engine.core import EngineCoreProc
+
+    EngineCoreProc = resolve_symbol("EngineCoreProc")
 
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
@@ -248,7 +256,7 @@ def patch_engine_core_process_entrypoint() -> None:
     if original_run_engine_core is run_engine_core:
         original_run_engine_core = current_run_engine_core
     run_engine_core._original_run_engine_core = original_run_engine_core
-    EngineCoreProc.run_engine_core = run_engine_core
+    EngineCoreProc.run_engine_core = staticmethod(run_engine_core)
 
 
 def patch_batch_and_fork() -> None:

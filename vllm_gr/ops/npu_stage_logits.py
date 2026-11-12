@@ -17,6 +17,7 @@ from vllm_gr.ops.sliced_logits import (
     SlicedLMHeadProxy,
     is_supported_unquantized_lm_head,
 )
+from vllm_gr.patch_report import observed_installation
 
 logger = init_logger(__name__)
 _MISSING = object()
@@ -408,6 +409,7 @@ def _make_weight_update_hook(original: Callable[..., Any], method_name: str) -> 
     return weight_update
 
 
+@observed_installation
 def install_npu_stage_weight_update_hooks(worker_cls: type[Any]) -> None:
     """Wrap the NPU worker's complete start/chunk/finish update transaction.
 

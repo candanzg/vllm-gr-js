@@ -201,6 +201,14 @@ repos:
       always_run: true
       pass_filenames: false
 
+    - id: check-patch-inventory
+      name: Check runtime patch inventory contracts
+      entry: python tools/check_patch_inventory.py
+      language: python
+      additional_dependencies: [PyYAML, regex]
+      pass_filenames: false
+      files: ^(vllm_gr/|tests/|docs/(patch_inventory.yaml|runtime_patch_inventory.md)|tools/check_patch_inventory.py)
+
     - id: run-tests
       name: Run all tests
       entry: bash tools/pre_commit/run_tests.sh

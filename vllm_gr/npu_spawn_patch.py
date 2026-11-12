@@ -19,6 +19,9 @@ from __future__ import annotations
 import logging
 import os
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
+from vllm_gr.patch_report import observed_installation
+
 logger = logging.getLogger("vllm_gr.npu_spawn_patch")
 
 _ORIGINAL_ATTR = "_vllm_gr_npu_spawn_original"
@@ -46,17 +49,23 @@ def _is_npu_spawn_wrapper(function: object) -> bool:
     return hasattr(function, _ORIGINAL_ATTR)
 
 
+@observed_installation
 def apply_npu_spawn_patch() -> bool:
     """Wrap upstream `_maybe_force_spawn` to also force spawn for NPU.
 
     Returns True if the wrapper was installed by this call. Idempotent: a
     already-wrapped target (including after a module reload) is left alone.
     """
-    import vllm.utils.system_utils as system_utils
-    import vllm.v1.executor.multiproc_executor as multiproc_executor
+    system_utils = resolve_symbol("system_utils")
+    multiproc_executor = resolve_symbol("multiproc_executor")
 
     current = getattr(system_utils, "_maybe_force_spawn", None)
-    if current is None or _is_npu_spawn_wrapper(current):
+    if current is None:
+        return False
+    if _is_npu_spawn_wrapper(current):
+        if multiproc_executor._maybe_force_spawn is not current:
+            multiproc_executor._maybe_force_spawn = current
+            return True
         return False
 
     def _maybe_force_spawn_with_npu() -> None:

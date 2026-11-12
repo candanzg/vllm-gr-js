@@ -10,6 +10,9 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
+from vllm_gr.patch_report import observed_installation
+
 logger = logging.getLogger("vllm_gr.pangu_compat")
 
 _PATCH_MARKER = "_vllm_gr_pangu_tied_embeddings_patch"
@@ -52,9 +55,10 @@ def _make_patched_maybe_untie(
     return patched
 
 
+@observed_installation
 def apply_pangu_tied_embeddings_patch() -> bool:
     """Install the Pangu loader compatibility wrapper once per process."""
-    from vllm.config import ModelConfig
+    ModelConfig = resolve_symbol("ModelConfig")
 
     current = ModelConfig.maybe_untie_word_embeddings
     if getattr(current, _PATCH_MARKER, False):

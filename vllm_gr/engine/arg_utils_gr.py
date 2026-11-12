@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import argparse
 import inspect
 import json
@@ -11,6 +12,7 @@ from typing import Final
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
 from vllm_gr.config import (
     DEFAULT_ONLINE_BATCH_SIZES,
     BeamExecutionMode,
@@ -28,6 +30,7 @@ from vllm_gr.config.parser import (
     normalize_gr_config_input,
 )
 from vllm_gr.config.validation import validate_beam_engine_driven
+from vllm_gr.patch_report import observed_installation
 
 
 def _catalog_is_triples_document(catalog_path: str) -> bool:
@@ -720,7 +723,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     # before EngineCoreClient spawns the process -- so it is the outermost
     # entrypoint and filters GR keys during vllm-ascend's init_ascend_config.
     if _is_npu_platform():
-        from vllm.v1.engine.core import EngineCoreProc
+        EngineCoreProc = resolve_symbol("EngineCoreProc")
 
         from vllm_gr.v1.ascend_compat import apply_engine_core_config_sanitizer
 
@@ -729,6 +732,7 @@ def create_engine_config(self, usage_context=None, headless=False):
     return config
 
 
+@observed_installation
 def patch_add_cli_args() -> None:
     EngineArgs.add_cli_args = staticmethod(add_cli_args)
     EngineArgs.create_engine_config = create_engine_config

@@ -24,6 +24,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_gr.patch_report import observe_existing, patch_phase
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
 from vllm_gr.v1.attention.backends.beam_attn_metadata import (
     BeamAttentionMetadata,
@@ -842,3 +843,9 @@ class BeamAttentionBackend(AttentionBackend):
         if use_mm_prefix:
             return "No multimodal prefix support."
         return None
+
+
+# Registration is observed after the class decorator has completed.
+
+with patch_phase("registration"):
+    observe_existing(("attention_registration",))

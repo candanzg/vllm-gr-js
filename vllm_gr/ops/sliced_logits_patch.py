@@ -7,11 +7,13 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
 from vllm_gr.ops.sliced_logits import (
     compute_sliced_logits,
     is_vocab_slice_enabled,
     set_vocab_slice_config,
 )
+from vllm_gr.patch_report import observed_installation
 
 logger = init_logger(__name__)
 
@@ -48,29 +50,38 @@ def _restore_vocab_slice_config() -> None:
         set_vocab_slice_config(offset, slice_size)
 
 
+@observed_installation
 def apply_sliced_logits_patch() -> bool:
     """Install sliced-logits hooks and report whether this call applied them."""
     global _SLICED_LOGITS_PATCHED
 
     if _SLICED_LOGITS_PATCHED:
-        return False
+        from vllm_gr.patch_verification import verify_sliced_logits
+
+        if verify_sliced_logits() is None:
+            return False
 
     try:
-        from vllm.model_executor.layers.logits_processor import LogitsProcessor
-        from vllm.v1.sample.sampler import Sampler
+        LogitsProcessor = resolve_symbol("LogitsProcessor")
+        Sampler = resolve_symbol("Sampler")
 
         _restore_vocab_slice_config()
 
-        original_init = LogitsProcessor.__init__
+        original_init = getattr(
+            LogitsProcessor.__init__, "_gr_sliced_logits_original", LogitsProcessor.__init__
+        )
 
         def patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
             if not is_vocab_slice_enabled():
                 _restore_vocab_slice_config()
 
+        patched_init._gr_sliced_logits_original = original_init
         LogitsProcessor.__init__ = patched_init
 
-        original_get_logits = LogitsProcessor._get_logits
+        original_get_logits = getattr(
+            LogitsProcessor._get_logits, "_gr_sliced_logits_original", LogitsProcessor._get_logits
+        )
 
         def patched_get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather=False):
             if hasattr(self, "_gr_vocab_slice"):
@@ -100,55 +111,63 @@ def apply_sliced_logits_patch() -> bool:
                 )
             return original_get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather)
 
+        patched_get_logits._gr_sliced_logits_original = original_get_logits
         LogitsProcessor._get_logits = patched_get_logits
 
         try:
-            original_gather = Sampler.gather_logprobs
+            original_gather = getattr(
+                Sampler.gather_logprobs, "_gr_sliced_logits_original", Sampler.gather_logprobs
+            )
 
-            @staticmethod
             def patched_gather_logprobs(logprobs, num_logprobs, token_ids, *args, **kwargs):
                 if logprobs is not None and logprobs.numel() > 0:
                     num_logprobs = min(num_logprobs, logprobs.size(-1))
                 return original_gather(logprobs, num_logprobs, token_ids, *args, **kwargs)
 
-            Sampler.gather_logprobs = patched_gather_logprobs
+            patched_gather_logprobs._gr_sliced_logits_original = original_gather
+            Sampler.gather_logprobs = staticmethod(patched_gather_logprobs)
         except Exception as exc:
             logger.debug("vllm_gr: Could not patch Sampler.gather_logprobs: %s", exc)
 
-        # V2 ModelRunner: sampling lives in the new worker-local module, whose
-        # ``compute_topk_scores`` does the same torch.topk the V1
-        # ``gather_logprobs`` clamp above protects. With a narrow catalog
-        # vocabulary slice the logits have far fewer columns than the request's
-        # num_logprobs (e.g. an impossible 3-token catalog slices to a single
-        # column), and the unclamped topk raises "selected index k out of
-        # range". The callers bind the function into their own module
-        # namespace (``from ... import compute_topk_scores``), so the clamp
-        # must be installed on every importer's binding, not just the defining
-        # module.
-        try:
-            from vllm.v1.worker.gpu.sample import logprob as v2_logprob
+        from vllm.platforms import current_platform
 
-            v2_logprob.compute_topk_scores = _make_clamped_v2_topk(v2_logprob.compute_topk_scores)
-        except Exception as exc:
-            logger.debug("vllm_gr: Could not patch V2 compute_topk_scores: %s", exc)
-
-        for _v2_module_name in (
-            "vllm.v1.worker.gpu.sample.sampler",
-            "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
-        ):
+        if current_platform.device_type == "cuda":
+            # V2 ModelRunner: sampling lives in the new worker-local module, whose
+            # ``compute_topk_scores`` does the same torch.topk the V1
+            # ``gather_logprobs`` clamp above protects. With a narrow catalog
+            # vocabulary slice the logits have far fewer columns than the request's
+            # num_logprobs (e.g. an impossible 3-token catalog slices to a single
+            # column), and the unclamped topk raises "selected index k out of
+            # range". The callers bind the function into their own module
+            # namespace (``from ... import compute_topk_scores``), so the clamp
+            # must be installed on every importer's binding, not just the defining
+            # module.
             try:
-                import importlib
+                v2_logprob = resolve_symbol("v2_logprob")
 
-                _v2_module = importlib.import_module(_v2_module_name)
-                _bound = getattr(_v2_module, "compute_topk_scores", None)
-                if callable(_bound):
-                    _v2_module.compute_topk_scores = _make_clamped_v2_topk(_bound)
-            except Exception as exc:
-                logger.debug(
-                    "vllm_gr: Could not patch %s.compute_topk_scores: %s",
-                    _v2_module_name,
-                    exc,
+                v2_logprob.compute_topk_scores = _make_clamped_v2_topk(
+                    v2_logprob.compute_topk_scores
                 )
+            except Exception as exc:
+                logger.debug("vllm_gr: Could not patch V2 compute_topk_scores: %s", exc)
+
+            for _v2_module_name in (
+                "vllm.v1.worker.gpu.sample.sampler",
+                "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+            ):
+                try:
+                    import importlib
+
+                    _v2_module = importlib.import_module(_v2_module_name)
+                    _bound = getattr(_v2_module, "compute_topk_scores", None)
+                    if callable(_bound):
+                        _v2_module.compute_topk_scores = _make_clamped_v2_topk(_bound)
+                except Exception as exc:
+                    logger.debug(
+                        "vllm_gr: Could not patch %s.compute_topk_scores: %s",
+                        _v2_module_name,
+                        exc,
+                    )
 
         _SLICED_LOGITS_PATCHED = True
         logger.info("vllm_gr: Patched LogitsProcessor._get_logits for sliced vocabulary projection")

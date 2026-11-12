@@ -13,6 +13,8 @@ from importlib import import_module
 from importlib.metadata import version
 from typing import Any, cast
 
+from vllm_gr.patch_report import observed_installation
+
 logger = logging.getLogger(__name__)
 _MARKER = "_vllm_gr_contiguous_prefix_kv_policy"
 _ORIGINAL = "_vllm_gr_contiguous_prefix_kv_original"
@@ -20,6 +22,7 @@ _HELPER = "requires_contiguous_pa_kv_cache"
 _UTILS = "vllm_ascend.attention.utils"
 _RUNNER = "vllm_ascend.worker.model_runner_v1"
 _MISSING = object()
+_SUPPORTED_ASCEND_VERSION = "0.30.0rc2"
 _ASCEND_COMPILATION_DEFAULTS = {
     "enable_npugraph_ex": False,
     "enable_static_kernel": False,
@@ -46,6 +49,27 @@ def _supported_signature(function: Any) -> bool:
         parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
         and parameter.default is inspect.Parameter.empty
         for parameter in parameters
+    )
+
+
+def _compatible_policy_pair(utility_policy: Any, runner_policy: Any) -> bool:
+    """Recognize only the native pair or aliases of one known wrapper."""
+    wrapped = [
+        function
+        for function in (utility_policy, runner_policy)
+        if getattr(function, _MARKER, False)
+    ]
+    if not wrapped:
+        return utility_policy is runner_policy and _supported_signature(utility_policy)
+    wrapper = wrapped[0]
+    original = getattr(wrapper, _ORIGINAL, None)
+    return (
+        _supported_signature(original)
+        and all(function is wrapper for function in wrapped)
+        and all(
+            function is original or function is wrapper
+            for function in (utility_policy, runner_policy)
+        )
     )
 
 
@@ -194,38 +218,26 @@ def _wrap_policy(original: NativePolicy) -> NativePolicy:
     return policy
 
 
+@observed_installation
 def apply_npu_contiguous_kv_cache_patch() -> int:
     """Patch both known 0.30 aliases before native KV allocation, or do nothing."""
     try:
         if import_module("vllm.platforms").current_platform.device_type != "npu":
             return 0
-        if version("vllm-ascend") != "0.30.0rc2":
+        if version("vllm-ascend") != _SUPPORTED_ASCEND_VERSION:
             return 0
         utils = import_module(_UTILS)
         runner = import_module(_RUNNER)
         utility_policy = getattr(utils, _HELPER, None)
         runner_policy = getattr(runner, _HELPER, None)
+        if not _compatible_policy_pair(utility_policy, runner_policy):
+            return 0
         wrapped = [
             function
             for function in (utility_policy, runner_policy)
             if getattr(function, _MARKER, False)
         ]
-        if wrapped:
-            wrapper = wrapped[0]
-            original = getattr(wrapper, _ORIGINAL, None)
-            if (
-                not _supported_signature(original)
-                or any(function is not wrapper for function in wrapped)
-                or any(
-                    function is not original and function is not wrapper
-                    for function in (utility_policy, runner_policy)
-                )
-            ):
-                return 0
-        else:
-            if utility_policy is not runner_policy or not _supported_signature(utility_policy):
-                return 0
-            wrapper = _wrap_policy(cast(NativePolicy, utility_policy))
+        wrapper = wrapped[0] if wrapped else _wrap_policy(cast(NativePolicy, utility_policy))
         changed = utility_policy is not wrapper or runner_policy is not wrapper
         setattr(utils, _HELPER, wrapper)
         setattr(runner, _HELPER, wrapper)

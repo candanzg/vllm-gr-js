@@ -14,6 +14,8 @@ import numpy as np
 from vllm.logger import init_logger
 from vllm.utils.hashing import sha256 as _vllm_sha256
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
+from vllm_gr.patch_report import observed_installation
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
 logger = init_logger(__name__)
@@ -96,7 +98,7 @@ def make_patched_handle_client_request(original):
 
     @wraps(original)
     def patched_handle_client_request(self, request_type, request, *args, **kwargs):
-        from vllm.v1.engine import EngineCoreRequestType
+        EngineCoreRequestType = resolve_symbol("EngineCoreRequestType")
 
         from vllm_gr.v1.engine.core import (
             dispatch_gr_engine_core_input,
@@ -154,9 +156,12 @@ def make_patched_handle_client_request(original):
 # ---------------------------------------------------------------------------
 
 
+@observed_installation
 def apply_engine_core_request_patches() -> None:
     """Install V1 session admission and native request dispatch."""
-    from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
+    DPEngineCoreProc = resolve_symbol("DPEngineCoreProc")
+    EngineCore = resolve_symbol("EngineCore")
+    EngineCoreProc = resolve_symbol("EngineCoreProc")
 
     from vllm_gr.v1.engine.core import (
         _handle_submit_gr_session,
@@ -251,7 +256,7 @@ def run_engine_core(
             "Check that patch_batch_and_fork() is only called once."
         )
 
-    from vllm.v1.engine.core import EngineCoreProc
+    EngineCoreProc = resolve_symbol("EngineCoreProc")
 
     # Guard against recursion: if vllm_gr/init.py was auto-imported in
     # the child process, run_patch() will have replaced
@@ -404,9 +409,10 @@ def _patch_scheduler_reset_prefix_cache(scheduler_cls) -> None:
     scheduler_cls.reset_prefix_cache = patched_reset_prefix_cache
 
 
+@observed_installation
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule to propagate custom attributes via SchedulerOutput."""
-    from vllm.v1.core.sched.scheduler import Scheduler
+    Scheduler = resolve_symbol("Scheduler")
 
     from vllm_gr.v1.engine.gr_async_scheduler import (
         GR_STAGE_OUTPUT_ATTR,
@@ -925,6 +931,7 @@ def _hash_block_bytes(block, parent_hash, extra_keys) -> bytes:
     return digest.digest()
 
 
+@observed_installation
 def apply_kv_hash_memo_patch() -> None:
     """Memoize vLLM's per-block prefix-cache hashing (EngineCore process).
 
@@ -950,6 +957,7 @@ def apply_kv_hash_memo_patch() -> None:
     from vllm.v1.core import kv_cache_utils
 
     if getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
+        _apply_block_hash_chain_memo_patch(kv_cache_utils)
         return
 
     _CHAIN_FALLBACK_ACTIVE = False
@@ -1032,6 +1040,11 @@ def _apply_block_hash_chain_memo_patch(kv_cache_utils) -> None:
     """
     global _CHAIN_FALLBACK_ACTIVE
     if getattr(kv_cache_utils.get_request_block_hasher, "_gr_chain_memo", False):
+        import sys
+
+        core = sys.modules.get("vllm.v1.engine.core")
+        if core is not None:
+            core.get_request_block_hasher = kv_cache_utils.get_request_block_hasher
         return
 
     original_factory = kv_cache_utils.get_request_block_hasher

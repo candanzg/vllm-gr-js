@@ -14,9 +14,13 @@ sliced vocabulary projection, Ascend integration, and Pangu weight loading.
 
 import logging
 
+from vllm_gr.patch_report import observed_installation, reported_phase
+
 logger = logging.getLogger("vllm_gr.plugin")
 
 
+@reported_phase("runtime", expected=("runtime_activation",))
+@observed_installation
 def initialize_runtime() -> dict[str, object]:
     """Initialize the current process for vllm-gr runtime usage.
 

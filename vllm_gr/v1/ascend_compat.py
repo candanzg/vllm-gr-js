@@ -9,7 +9,9 @@ from typing import Any, cast
 
 import torch
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
 from vllm_gr.config import GRAttentionBackend, GRConfig
+from vllm_gr.patch_report import observed_installation, reported_phase
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ def _get_custom_beam_backend() -> type:
     return cast(type[Any], BeamAttentionBackend)
 
 
+@observed_installation
 def apply_ascend_attention_backend_patch(force: bool = False) -> int:
     """Preserve explicit and marker-restored CUSTOM backend selection."""
     global _ASCEND_ATTN_BACKEND_PATCH_APPLIED
@@ -56,7 +59,7 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
         return 0
 
     try:
-        import vllm.v1.attention.selector as selector_mod
+        selector_mod = resolve_symbol("selector")
     except ImportError:
         return 0
 
@@ -84,20 +87,22 @@ def apply_ascend_attention_backend_patch(force: bool = False) -> int:
             num_heads=num_heads,
         )
 
+    setattr(_patched_cached_get_attn_backend, "_gr_attention_selector", True)
     selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
     _ASCEND_ATTN_BACKEND_PATCH_APPLIED = True
     return 1
 
 
+@observed_installation
 def patch_npu_worker_init_device() -> int:
     """Run vllm-gr patch installation before NPUWorker device initialization."""
     global _NPU_WORKER_PATCH_APPLIED
 
-    if not is_npu_platform() or _NPU_WORKER_PATCH_APPLIED:
+    if not is_npu_platform():
         return 0
 
     try:
-        from vllm_ascend.worker.worker import NPUWorker
+        NPUWorker = resolve_symbol("NPUWorker")
     except ImportError:
         logger.warning(
             "Failed to import NPUWorker from "
@@ -109,9 +114,12 @@ def patch_npu_worker_init_device() -> int:
     # Spawned workers load plugins before constructing NPUWorker, whose
     # __init__ validates Ascend config before init_device can run. Install
     # the filter here too; a fresh worker cannot inherit EngineCore's patch.
-    _install_init_ascend_config_sanitizer()
     original_init_device = NPUWorker.init_device
+    if getattr(original_init_device, "_gr_npu_worker_init", False):
+        return 0
+    _install_init_ascend_config_sanitizer()
 
+    @reported_phase("worker_init")
     def _patched_init_device(self: Any) -> Any:
         from vllm_gr.patch import re_apply_patches
 
@@ -140,11 +148,13 @@ def patch_npu_worker_init_device() -> int:
         load_constraint_tables_on_worker(self)
         return result
 
+    setattr(_patched_init_device, "_gr_npu_worker_init", True)
     NPUWorker.init_device = _patched_init_device
     _NPU_WORKER_PATCH_APPLIED = True
     return 1
 
 
+@observed_installation
 def apply_penalties_warmup_oom_guard() -> int:
     """Skip the Ascend penalties Triton warmup when its dummies cannot fit.
 
@@ -158,8 +168,6 @@ def apply_penalties_warmup_oom_guard() -> int:
     so an OOM there skips the warmup instead of failing the engine.
     """
     global _PENALTY_WARMUP_GUARD_APPLIED
-    if _PENALTY_WARMUP_GUARD_APPLIED:
-        return 0
     import sys
 
     try:
@@ -201,6 +209,7 @@ def apply_penalties_warmup_oom_guard() -> int:
     return 1
 
 
+@observed_installation
 def _install_init_ascend_config_sanitizer() -> None:
     """Filter GR keys only during native Ascend configuration validation.
 
@@ -211,7 +220,7 @@ def _install_init_ascend_config_sanitizer() -> None:
     """
     import sys
 
-    import vllm_ascend.ascend_config as ascend_config_mod
+    ascend_config_mod = resolve_symbol("ascend_config")
 
     from vllm_gr.config.parser import GR_CONFIG_KEY, GR_CONFIG_KEY_PREFIX
 
@@ -266,7 +275,10 @@ def _sanitize_engine_core_entry(
     target. Delegate to the native Ascend entrypoint with the original
     config; only its validation call sees the filtered mapping.
     """
-    _install_init_ascend_config_sanitizer()
+    from vllm_gr.patch_report import patch_phase
+
+    with patch_phase("configuration", expected=("ascend_config_filter",)):
+        _install_init_ascend_config_sanitizer()
 
     from vllm_ascend.patch.platform.patch_engine_core import (
         _run_engine_core_patch_func as ascend_entry,
@@ -275,6 +287,8 @@ def _sanitize_engine_core_entry(
     return ascend_entry(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
 
 
+@reported_phase("configuration", expected=("ascend_core_entrypoint",))
+@observed_installation
 def apply_engine_core_config_sanitizer(engine_core_proc_cls: type) -> int:
     """Wrap the EngineCore entrypoint to strip GR keys before Ascend init.
 

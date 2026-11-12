@@ -614,6 +614,23 @@ jobs:
       - name: Run L2 resource probe if isolated
         run: bash tools/ci/run_resource_level.sh
 
+      - name: Verify runtime patch installation for both CUDA runners
+        run: |
+          for runner in 0 1; do
+            for phase in runtime engine_core; do
+              VLLM_USE_V2_MODEL_RUNNER="$runner" python tools/check_patch_runtime.py \
+                --phase "$phase" --output "$RUNNER_TEMP/patch-reports/$phase-$runner.json"
+            done
+          done
+
+      - name: Upload runtime patch reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-patch-reports
+          path: ${{ runner.temp }}/patch-reports/*.json
+          if-no-files-found: ignore
+
       - name: Check clear device
         if: always() && steps.cuda-mapping.outcome == 'success'
         run: bash ./scripts/check_vllm_on_device.sh

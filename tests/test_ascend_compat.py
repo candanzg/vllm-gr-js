@@ -197,7 +197,11 @@ def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
+    import vllm_gr.patch_report as patch_report
     from vllm_gr.v1 import npu_kv_layout
+
+    # Device operations and installers below are mocked to check lifecycle order.
+    monkeypatch.setattr(patch_report, "verify_installation", lambda item: None)
 
     monkeypatch.setattr(ascend_compat, "_NPU_WORKER_PATCH_APPLIED", False)
     install_filter = mock.Mock()

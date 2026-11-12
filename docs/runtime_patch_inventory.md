@@ -37,33 +37,71 @@ coverage and still requires NPU startup and inference revalidation.
 | Medium | Localized override that remains coupled to upstream implementation details |
 | Low | Narrow auxiliary behavior with a limited failure scope |
 
+## Installation Contracts and Reports
+
+`vllm_gr/patch_registry.py` declares ownership and concrete bindings.
+`compat/runtime_v0_30.py` resolves symbols lazily and checks native method
+signatures and descriptors before installation. Runtime startup reads Python
+contracts only; installed wheels do not need this document or the YAML file.
+Run `python tools/check_patch_inventory.py` to check declarations, installer
+observation points, test references, and the generated overview below.
+
+`vllm_gr.patch_report.get_runtime_patch_report()` returns a JSON-safe snapshot
+containing the process ID, installed distribution versions, and observations
+by `runtime`, `frontend`, `engine_core`, `configuration`, `registration`, and
+`worker_init` phase. Each responsibility includes its stable ID, platform,
+process role, concrete targets, status, and failure reason. Initialization logs
+use the `GR_PATCH_REPORT` prefix. Reports are local to the current process;
+forked children discard inherited results and spawned processes start empty.
+The existing `BeamPatchReport`, `patch_count`, and `patches` return values retain
+their original meanings. Plugin calls alone do not identify a process role, so
+those observations use `unknown` rather than infer that they ran in a worker.
+
+| Status | Meaning |
+| --- | --- |
+| `applied` | Observed installation changed a binding and passed postconditions. |
+| `already_applied` | Actual bindings were checked again and passed. |
+| `not_applicable` | An explicit platform or supported-interface condition is false. |
+| `deferred` | A later lifecycle boundary has not run yet. |
+| `failed` | A required structural or installation contract failed; startup stops. |
+| `blocked` | Earlier failure prevented the responsibility from being reached. |
+
+Worker-only NPU hooks are deferred during general initialization. Their worker
+phase records the final outcome when `init_device` runs. Unsupported vendor KV
+interfaces keep native allocation policy and report `not_applicable`. An
+applicable missing target or incomplete wrapper is a failure. Host contract tests
+exercise these distinctions without claiming accelerator inference validation.
+
 ## Runtime Patch Inventory
 
 The machine-readable counterpart is `docs/patch_inventory.yaml`. Owner,
 installer, activation, validation, and process-role entries below must remain
 aligned with it.
 
-| ID | Owner | Installer | Activation | Validator or test | Process role |
-| --- | --- | --- | --- | --- | --- |
-| GR-PATCH-000 | `vllm_gr/plugin.py` | `vllm_gr.plugin.register` | vLLM general-plugin loading | `test_plugin_exposes_simple_per_patch_status` | main, EngineCore, worker |
-| GR-PATCH-001 | `vllm_gr/v1/ascend_compat.py` | `apply_ascend_attention_backend_patch` | vLLM attention selector is importable and unwrapped | `_validate` behavior in `test_ascend_compat.py`; Ascend integration test | EngineCore, worker |
-| GR-PATCH-002 | `vllm_gr/v1/ascend_compat.py` | `patch_npu_worker_init_device` | active NPU platform, first installation | `test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract` | worker |
-| GR-PATCH-003 | `vllm_gr/logprobs.py` | `logprobs_patch.patch_flat_logprobs` | required frontend plan finds the method absent | `_validate_flat_logprobs_patch`; patch initialization tests | offline frontend, API server |
-| GR-PATCH-004 | `entrypoints/openai/serving_engine.py`, `protocol.py` | `beam_search_patch.patch_beam_search`, `patch_sampling` | required frontend plan finds either method absent | `_validate_openai_beam_search_patch`, `_validate_chat_sampling_patch`; serving dispatch, online entry, and OneRec HTTP tests | API server |
-| GR-PATCH-005 | `vllm_gr/engine/arg_utils_gr.py` | `patch_add_cli_args` | required frontend plan finds GR EngineArgs methods absent | `_validate_engine_args_patch`; attention backend configuration tests | main, API server |
-| GR-PATCH-007 | `v1/engine/core_client.py`, `core_client_patch.py`, `async_llm.py` | `beam_search_patch.patch_batch_and_fork` | required frontend plan finds V1 client/lifecycle methods incomplete | `_validate_batch_and_fork_patch`; V1 request, admission, rejection, and online lifecycle tests | API server |
-| GR-PATCH-008 | `vllm_gr/v1/engine/wire.py` | `register_engine_core_request_types` | frontend and EngineCore require GR wire values | `_validate_request_types_patch`; EngineCore protocol contracts | API server, EngineCore |
-| GR-PATCH-009 | `v1/engine/core.py`, `engine_core_patch.py` | `apply_engine_core_request_patches` | EngineCore plan finds request dispatch incomplete | `_validate_engine_core_request_group`, `_validate_engine_core_entrypoint_patch`; V1 request and admission tests | EngineCore |
-| GR-PATCH-010 | `v1/engine/engine_core_patch.py`, `gr_async_scheduler.py` | `apply_scheduler_patch` | EngineCore plan finds metadata propagation absent | `_validate_scheduler_patch`; EngineCore protocol contracts | EngineCore |
-| GR-PATCH-011 | `v1/worker/gpu_model_runner_patch.py`, `gpu_model_runner_v2_patch.py` | `model_runner_patch.apply_worker_patches` | selected CUDA V1/V2 runner hooks are incomplete | `_validate_model_runner_patch`; V1/V2 GPU, dispatcher, and stage-parity tests | GPU worker |
-| GR-PATCH-012 | `v1/worker/npu_model_runner_patch.py` | `model_runner_patch.apply_worker_patches` | active NPU runner hooks are incomplete | `_validate_model_runner_patch`; NPU and dispatcher tests | NPU worker |
-| GR-PATCH-013 | `v1/attention/backends/beam_attn.py` | `register_backend` decorator | facade import and CUSTOM selection | Beam Attention platform, metadata, and configuration tests | EngineCore, worker |
-| GR-PATCH-015 | `vllm_gr/ops/sliced_logits.py` | `sliced_logits_patch.apply_sliced_logits_patch` | hooks install at startup; valid slice enables execution | installer result; sliced-logits and optional patch-count tests | worker |
-| GR-PATCH-016 | `vllm_gr/npu_spawn_patch.py` | `vllm_gr.npu_spawn_patch.apply_npu_spawn_patch` | engine config loading via the vllm.general_plugins entry point | installer result; spawn patch tests | main, EngineCore |
-| GR-PATCH-018 | `vllm_gr/v1/ascend_compat.py` | `apply_penalties_warmup_oom_guard` | NPUWorker `init_device` runs and the native penalties warmup is present | installer result; NPU startup at `--max_num_seqs 2048` | NPU worker |
-| GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer`, `patch_npu_worker_init_device` | NPU engine configuration and worker plugin initialization | Ascend config preservation and initialization tests; NPU startup | main, EngineCore, worker |
-| GR-PATCH-020 | `vllm_gr/pangu_compat.py` | `apply_pangu_tied_embeddings_patch` | runtime initialization; tied Pangu models only | Pangu compatibility and patch initialization tests | main, EngineCore, worker |
-| GR-PATCH-021 | `vllm_gr/v1/npu_kv_layout.py` | `apply_npu_contiguous_kv_cache_patch` | known Ascend 0.30.0rc2 policy, before native KV allocation | NPU KV layout, worker lifecycle and row-view tests | NPU worker |
+<!-- patch-contract-table:start -->
+| ID | Installation responsibilities | Phases | Condition |
+| --- | --- | --- | --- |
+| GR-PATCH-000 | `runtime_activation` | runtime | always |
+| GR-PATCH-001 | `attention_selector` | runtime, worker_init | always |
+| GR-PATCH-002 | `npu_worker_init`, `npu_worker_utilities`, `npu_weight_update_hooks` | runtime, worker_init | npu, npu_weight_update_api |
+| GR-PATCH-003 | `flat_logprobs` | runtime, frontend, worker_init | always |
+| GR-PATCH-004 | `openai_beam_search`, `chat_sampling_conversion` | runtime, frontend, worker_init | always |
+| GR-PATCH-005 | `engine_args` | runtime, frontend, worker_init | always |
+| GR-PATCH-007 | `engine_clients`, `frontend_lifecycle` | runtime, frontend, worker_init | always |
+| GR-PATCH-008 | `request_types` | runtime, frontend, worker_init, engine_core | always |
+| GR-PATCH-009 | `engine_core_requests`, `engine_core_entrypoint` | runtime, frontend, worker_init, engine_core | always |
+| GR-PATCH-010 | `scheduler` | runtime, frontend, worker_init, engine_core | always |
+| GR-PATCH-011 | `cuda_model_runner` | runtime, frontend, worker_init, engine_core | cuda |
+| GR-PATCH-012 | `npu_model_runner` | runtime, frontend, worker_init, engine_core | npu |
+| GR-PATCH-013 | `attention_registration` | registration | always |
+| GR-PATCH-015 | `sliced_logits`, `sliced_scoring_aliases` | runtime, worker_init | always, cuda |
+| GR-PATCH-016 | `npu_spawn` | runtime, worker_init | always |
+| GR-PATCH-018 | `penalties_warmup` | worker_init | npu |
+| GR-PATCH-019 | `ascend_config_filter`, `ascend_core_entrypoint` | runtime, worker_init, configuration | npu |
+| GR-PATCH-020 | `pangu_tied_embeddings` | runtime, worker_init | always |
+| GR-PATCH-021 | `npu_kv_layout` | worker_init | supported_npu_kv |
+| GR-PATCH-022 | `kv_hash_memo` | runtime, frontend, worker_init, engine_core | always |
+<!-- patch-contract-table:end -->
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -437,6 +475,18 @@ aligned with it.
   xllm eager/FULL replay checks in `tests/test_npu_beam_row_views.py`.
 - Removal condition: a native backend contiguous-KV capability covers GR xllm
   without this version-specific policy bridge.
+
+### GR-PATCH-022 - Bounded Prefix Hash Memos
+
+- Owner: `vllm_gr/v1/engine/engine_core_patch.py`.
+- Installer: `apply_kv_hash_memo_patch` in frontend and EngineCore initialization.
+- Targets: `hash_block_tokens`, `get_request_block_hasher`, and the EngineCore
+  module's imported factory binding. Both block and whole-chain caches remain
+  bounded; ordinary and ineligible requests retain native hashing behavior.
+- Validation: `_validate_kv_hash_memo_patch`, hash equivalence/capacity tests in
+  `tests/test_patch_initialization.py`, and partial-binding repair tests.
+- Removal: equivalent bounded reuse must preserve hash values, incremental
+  requests, embedding prompts, and cache limits before these wrappers retire.
 
 ## Benchmark-only Runtime Mutations
 

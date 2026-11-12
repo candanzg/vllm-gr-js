@@ -12,6 +12,7 @@ from typing import Any, cast
 from vllm.logger import init_logger
 
 from vllm_gr.config import ConstraintTableBackendEnum
+from vllm_gr.patch_report import observed_installation
 from vllm_gr.v1.worker.model_runner_common import (
     _CONSTRAINT_LOAD_PATCH_MARKER,
     _CONSTRAINT_SHUTDOWN_PATCH_MARKER,
@@ -281,6 +282,7 @@ def discover_active_worker_runners() -> tuple[tuple[str, type], ...]:
     return _get_active_platform_module().discover_worker_runners()
 
 
+@observed_installation
 def install_worker_utility_hooks(worker_cls: type) -> None:
     """Install named utility RPCs shared by CUDA and NPU Worker classes."""
     from vllm_gr.constraints.worker_inject import install_worker_resource_hook
@@ -321,6 +323,7 @@ def _install_numpy_token_staging() -> None:
     install_numpy_staging()
 
 
+@observed_installation
 def apply_worker_patches() -> None:
     """Install grouped-Beam hooks on active-platform ModelRunner targets."""
     from vllm_gr.v1.worker.gr_async_output import install_async_output_guard

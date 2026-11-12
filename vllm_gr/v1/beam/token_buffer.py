@@ -102,7 +102,7 @@ def install_numpy_request_factory() -> None:
 
     from vllm_gr.v1.beam.batch_contracts import BeamEngineCoreRequest
 
-    if hasattr(Request, "_gr_numpy_original"):
+    if getattr(Request.from_engine_core_request, "_gr_numpy_tokens", False):
         return
     original = Request.from_engine_core_request.__func__
     setattr(Request, "_gr_numpy_original", original)
@@ -112,6 +112,7 @@ def install_numpy_request_factory() -> None:
             return initialize_numpy_request(request, block_hasher)
         return original(cls, request, block_hasher)
 
+    setattr(from_engine_core_request, "_gr_numpy_tokens", True)
     Request.from_engine_core_request = classmethod(  # type: ignore[method-assign,assignment]
         from_engine_core_request
     )

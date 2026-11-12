@@ -8,6 +8,8 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+from vllm_gr.compat.runtime_v0_30 import resolve_symbol
+from vllm_gr.patch_report import observed_installation
 from vllm_gr.v1.engine.async_llm import make_patched_process_outputs
 from vllm_gr.v1.engine.core_client import submit_gr_session_async
 
@@ -16,7 +18,7 @@ _INPROC_NATIVE: dict[str, Callable[..., Any]] = {}
 
 
 def sync_mp_submit_gr_session(self, batch_request):
-    from vllm.v1.engine import EngineCoreRequestType
+    EngineCoreRequestType = resolve_symbol("EngineCoreRequestType")
 
     requests = tuple(item.request for item in batch_request.items)
     if not requests:
@@ -110,9 +112,12 @@ def apply_request_type_patches() -> None:
     register_engine_core_request_types()
 
 
+@observed_installation
 def apply_engine_client_patches() -> None:
     """Install V1 submission on every supported EngineCore transport."""
-    from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
+    AsyncMPClient = resolve_symbol("AsyncMPClient")
+    InprocClient = resolve_symbol("InprocClient")
+    SyncMPClient = resolve_symbol("SyncMPClient")
 
     AsyncMPClient.submit_gr_session_async = submit_gr_session_async
     SyncMPClient.submit_gr_session = sync_mp_submit_gr_session
@@ -172,10 +177,11 @@ async def async_llm_add_request(self: Any, request: Any, *args: Any, **kwargs: A
         raise
 
 
+@observed_installation
 def apply_async_llm_patches() -> None:
-    from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.llm_engine import LLMEngine
-    from vllm.v1.engine.output_processor import OutputProcessor
+    AsyncLLM = resolve_symbol("AsyncLLM")
+    LLMEngine = resolve_symbol("LLMEngine")
+    OutputProcessor = resolve_symbol("OutputProcessor")
 
     from vllm_gr.v1.engine.gr_session_client import install_gr_frontend_methods
 

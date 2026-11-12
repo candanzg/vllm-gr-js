@@ -45,6 +45,10 @@ def test_runtime_patch_order_preserves_ascend_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm_gr.patch as runtime_patch
+    import vllm_gr.patch_report as patch_report
+
+    # This test supplies fake installers to isolate ordering and legacy counts.
+    monkeypatch.setattr(patch_report, "verify_installation", lambda item: None)
 
     call_order: list[str] = []
 
@@ -132,8 +136,8 @@ def test_initialization_applies_required_patch_once(
     )
     monkeypatch.setattr(runtime_patch, "_required_beam_patches", lambda: (patch,))
 
-    first = runtime_patch.initialize_required_beam_patches()
-    second = runtime_patch.initialize_required_beam_patches()
+    first = runtime_patch._initialize_beam_patch_plan((patch,))
+    second = runtime_patch._initialize_beam_patch_plan((patch,))
 
     apply.assert_called_once_with()
     assert state["installed"] is True
