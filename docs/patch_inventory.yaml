@@ -53,6 +53,7 @@ patches:
     removal_condition: stable NPU worker initialization installs compatibility before ModelRunner construction
 
   - id: GR-PATCH-003
+    plan_name: flat_logprobs
     owner: vllm_gr/logprobs.py
     installer: vllm_gr.logprobs_patch.patch_flat_logprobs
     activation: the required frontend patch plan detects the method is not installed
@@ -66,6 +67,8 @@ patches:
     removal_condition: the GR implementation is no longer needed or is available upstream
 
   - id: GR-PATCH-004
+    plan_name: openai_beam_search
+    plan_name_extra: [chat_sampling_conversion]
     owner: vllm_gr/entrypoints/openai/serving_engine.py and protocol.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_beam_search and patch_sampling
     activation: the required frontend patch plan detects either method is not installed
@@ -82,6 +85,7 @@ patches:
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
 
   - id: GR-PATCH-005
+    plan_name: engine_args
     owner: vllm_gr/engine/arg_utils_gr.py
     installer: vllm_gr.engine.arg_utils_gr.patch_add_cli_args
     activation: the required frontend patch plan detects GR EngineArgs methods are not installed
@@ -95,6 +99,7 @@ patches:
     removal_condition: vLLM configuration hooks cover every active GR option
 
   - id: GR-PATCH-007
+    plan_name: batch_and_fork
     owner: vllm_gr/v1/engine/core_client.py, core_client_patch.py, and async_llm.py
     installer: vllm_gr.entrypoints.openai.beam_search_patch.patch_batch_and_fork
     activation: the required frontend patch plan detects grouped Beam client methods are incomplete
@@ -124,6 +129,7 @@ patches:
     removal_condition: stable upstream messages carry grouped Beam operations without Enum mutation
 
   - id: GR-PATCH-009
+    plan_name: engine_core_requests
     owner: vllm_gr/v1/engine/core.py, engine_core_patch.py, and hot_update.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_engine_core_request_patches
     activation: the shared EngineCore plan, including the sanitized NPU child entrypoint, detects incomplete request dispatch or Trie-capacity initialization; the same installer mounts hot-update utilities independently of the optional management listener
@@ -142,6 +148,7 @@ patches:
     removal_condition: vLLM exposes stable control-message, request-dispatch, and named management utility extension points
 
   - id: GR-PATCH-010
+    plan_name: scheduler
     owner: vllm_gr/v1/engine/engine_core_patch.py and gr_async_scheduler.py
     installer: vllm_gr.v1.engine.engine_core_patch.apply_scheduler_patch
     activation: the EngineCore patch plan detects scheduler metadata propagation is absent
@@ -155,6 +162,7 @@ patches:
     removal_condition: explicit upstream scheduler metadata hooks carry grouped Beam state
 
   - id: GR-PATCH-011
+    plan_name: model_runner
     owner: vllm_gr/v1/worker/gpu_model_runner_patch.py and gpu_model_runner_v2_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/gpu_prefill_requests_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/gpu_stage_hooks.py, vllm_gr/v1/worker/gpu_beam_stage_runner.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
@@ -181,6 +189,7 @@ patches:
     removal_condition: stable upstream grouped input/output, Worker utility, and constraint-backend lifecycle hooks replace private runner mutation
 
   - id: GR-PATCH-012
+    plan_name: model_runner
     owner: vllm_gr/v1/worker/npu_model_runner_patch.py
     shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/ascend_compat.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
@@ -310,6 +319,20 @@ patches:
     risk: high
     contract: npu-contiguous-prefix-kv-allocation
     removal_condition: Ascend exposes a backend contiguous-KV capability covering GR xllm without a native policy bridge
+
+  - id: GR-PATCH-022
+    plan_name: kv_hash_memo
+    owner: vllm_gr/v1/engine/engine_core_patch.py
+    installer: vllm_gr.v1.engine.engine_core_patch.apply_kv_hash_memo_patch
+    activation: the EngineCore patch plan detects hash_block_tokens without the GR memo wrapper
+    validator_or_test:
+      - vllm_gr.patch._validate_kv_hash_memo_patch
+      - tests/test_patch_initialization.py::test_kv_hash_memo_patch_equivalence_and_hits
+    process_roles: [engine_core]
+    target: vllm.v1.core.kv_cache_utils.hash_block_tokens
+    risk: medium
+    contract: kv-hash-memo
+    removal_condition: vLLM caches prefix-cache block hashes itself or exposes a hashing hook
 
 # IDs are retained here when the installer and its legacy surface have been removed.
 retired_patches:

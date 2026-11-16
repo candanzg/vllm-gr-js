@@ -28,6 +28,16 @@ tags, build overrides, and dependency constraints.
 
 The current implementation targets inference scenarios and does not aim for full training-phase feature coverage.
 
+## Runtime Patch Roadmap
+
+vLLM-GR extends an installed vLLM through runtime patches listed in
+[`docs/patch_inventory.yaml`](docs/patch_inventory.yaml). That layer is a
+compatibility bridge, not a permanent design. The most reusable pieces, the
+Beam Search dispatch and the flat-logprobs fast path, are candidates for
+upstreaming into vLLM; as upstream absorbs them the patch count should shrink.
+Upstream symbol locations for the supported runtime live in
+`vllm_gr/compat/upstream_v0_30.py`, so a version upgrade updates one file.
+
 ## Repository Contents
 
 - `vllm_gr/` — GRLLM (offline beam search), beam-search/catalog patches, NPU runtime utils, ops

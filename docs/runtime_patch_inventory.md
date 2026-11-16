@@ -64,6 +64,7 @@ aligned with it.
 | GR-PATCH-019 | `vllm_gr/v1/ascend_compat.py` | `apply_engine_core_config_sanitizer`, `patch_npu_worker_init_device` | NPU engine configuration and worker plugin initialization | Ascend config preservation and initialization tests; NPU startup | main, EngineCore, worker |
 | GR-PATCH-020 | `vllm_gr/pangu_compat.py` | `apply_pangu_tied_embeddings_patch` | runtime initialization; tied Pangu models only | Pangu compatibility and patch initialization tests | main, EngineCore, worker |
 | GR-PATCH-021 | `vllm_gr/v1/npu_kv_layout.py` | `apply_npu_contiguous_kv_cache_patch` | known Ascend 0.30.0rc2 policy, before native KV allocation | NPU KV layout, worker lifecycle and row-view tests | NPU worker |
+| GR-PATCH-022 | `vllm_gr/v1/engine/engine_core_patch.py` | `apply_kv_hash_memo_patch` | EngineCore plan finds `hash_block_tokens` without the GR memo wrapper | `_validate_kv_hash_memo_patch`; kv-hash memo equivalence tests | EngineCore |
 
 ### GR-PATCH-000 — Runtime Plugin Activation
 
@@ -603,3 +604,20 @@ lifecycle contract remains covered by
 `tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`.
 The ID is retained in the YAML `retired_patches` section and must not be
 counted as an active installer.
+
+### GR-PATCH-022 — Prefix-Cache Block Hash Memo
+
+- Source / Installer: `vllm_gr/v1/engine/engine_core_patch.py::apply_kv_hash_memo_patch`
+- Orchestration: the EngineCore patch plan, after request dispatch.
+- Target: `vllm.v1.core.kv_cache_utils.hash_block_tokens`.
+- Process roles: EngineCore; risk: Medium.
+- Behavior: wraps the pure block-hash function with a bounded FIFO memo so
+  repeated blocks reuse an earlier `BlockHash` instead of re-hashing. Keys are
+  immutable byte snapshots of the token view, and only the module-level SHA-256
+  hasher takes the accelerated path; other hash functions keep the native call.
+- Guards: the wrapper is idempotent, marks itself with `_gr_hash_memo`, and
+  bypasses the memo entirely while a whole-chain miss is in progress.
+- Validation: `_validate_kv_hash_memo_patch` and the equivalence tests in
+  `tests/test_patch_initialization.py`.
+- Removal condition: vLLM caches prefix-cache block hashes itself or exposes a
+  hashing hook.

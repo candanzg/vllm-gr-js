@@ -146,3 +146,21 @@ def test_gpu_model_runner_private_method_contracts() -> None:
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_runtime_patch_plans_are_registered_in_the_inventory() -> None:
+    """Every installed plan step is inventoried, and every name refers to one."""
+    from vllm_gr.patch import _engine_core_beam_patches, _required_beam_patches
+
+    patched = {patch.name for patch in _required_beam_patches() + _engine_core_beam_patches()}
+
+    inventory = yaml.safe_load(Path("docs/patch_inventory.yaml").read_text(encoding="utf-8"))
+    declared: set[str] = set()
+    for patch in inventory["patches"]:
+        if "plan_name" in patch:
+            declared.add(patch["plan_name"])
+        declared.update(patch.get("plan_name_extra", ()))
+
+    assert patched - declared == set(), "installed plan steps missing from the inventory"
+    assert declared - patched == set(), "inventory plan_name values with no installer"

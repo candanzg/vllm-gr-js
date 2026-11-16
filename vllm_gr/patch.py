@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from vllm_gr import npu_spawn_patch, pangu_compat
+from vllm_gr.compat.upstream_v0_30 import resolve
 from vllm_gr.ops import sliced_logits_patch
 from vllm_gr.v1 import ascend_compat
 
@@ -78,37 +79,31 @@ def _verified(condition: bool, detail: str) -> str | None:
 
 
 def _validate_flat_logprobs_patch() -> str | None:
-    from vllm.logprobs import FlatLogprobs
-
     from vllm_gr.logprobs import append_fast
 
     return _verified(
-        FlatLogprobs.append_fast is append_fast,
+        resolve("FlatLogprobs").append_fast is append_fast,
         "FlatLogprobs.append_fast does not reference the GR implementation",
     )
 
 
 def _validate_beam_search_dispatch_patch() -> str | None:
-    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
-
     from vllm_gr.entrypoints.openai.beam_search_patch import beam_search_dispatch
 
     return _verified(
-        GenerateBaseServing.beam_search is beam_search_dispatch,
+        resolve("GenerateBaseServing").beam_search is beam_search_dispatch,
         "GenerateBaseServing.beam_search does not reference the GR dispatcher",
     )
 
 
 def _validate_admission_rejection_patch() -> str | None:
-    from vllm.entrypoints.generate.base.serving import GenerateBaseServing
-
     from vllm_gr.entrypoints.openai.beam_search_patch import (
         _ADMISSION_REJECTION_PATCH_MARKER,
     )
 
     return _verified(
         getattr(
-            getattr(GenerateBaseServing, "_raise_if_error", None),
+            getattr(resolve("GenerateBaseServing"), "_raise_if_error", None),
             _ADMISSION_REJECTION_PATCH_MARKER,
             False,
         ),
@@ -119,9 +114,6 @@ def _validate_admission_rejection_patch() -> str | None:
 def _validate_client_request_id_patch() -> str | None:
     """Verify the two sites that pair a caller's name with the engine's."""
 
-    from vllm.entrypoints.serve.engine.serving import BaseServing
-    from vllm.v1.engine.output_processor import OutputProcessor
-
     from vllm_gr.entrypoints.openai.beam_search_patch import (
         _CLIENT_REQUEST_ID_PATCH_MARKER,
         _SUBMIT_REQUEST_ID_PATCH_MARKER,
@@ -129,14 +121,14 @@ def _validate_client_request_id_patch() -> str | None:
 
     return _verified(
         getattr(
-            getattr(BaseServing, "_base_request_id", None),
+            getattr(resolve("BaseServing"), "_base_request_id", None),
             _CLIENT_REQUEST_ID_PATCH_MARKER,
             False,
         ),
         "BaseServing._base_request_id does not reference the GR client-request-id wrapper",
     ) or _verified(
         getattr(
-            getattr(OutputProcessor, "add_request", None),
+            getattr(resolve("OutputProcessor"), "add_request", None),
             _SUBMIT_REQUEST_ID_PATCH_MARKER,
             False,
         ),
@@ -176,19 +168,15 @@ def _validate_completion_batch_patch() -> str | None:
 
 
 def _validate_chat_sampling_patch() -> str | None:
-    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-
     from vllm_gr.entrypoints.openai.protocol import to_beam_search_params
 
     return _verified(
-        ChatCompletionRequest.to_beam_search_params is to_beam_search_params,
+        resolve("ChatCompletionRequest").to_beam_search_params is to_beam_search_params,
         "ChatCompletionRequest.to_beam_search_params is not installed",
     )
 
 
 def _validate_engine_args_patch() -> str | None:
-    from vllm.engine.arg_utils import EngineArgs
-
     from vllm_gr.engine.arg_utils_gr import (
         _init_engine_args,
         add_cli_args,
@@ -196,27 +184,23 @@ def _validate_engine_args_patch() -> str | None:
         from_cli_args,
     )
 
+    engine_args = resolve("EngineArgs")
     return _verified(
-        EngineArgs.add_cli_args is add_cli_args
-        and EngineArgs.create_engine_config is create_engine_config
-        and EngineArgs.from_cli_args.__func__ is from_cli_args
-        and EngineArgs.__init__ is _init_engine_args,
+        engine_args.add_cli_args is add_cli_args
+        and engine_args.create_engine_config is create_engine_config
+        and engine_args.from_cli_args.__func__ is from_cli_args
+        and engine_args.__init__ is _init_engine_args,
         "EngineArgs GR integration is incomplete",
     )
 
 
 def _validate_request_types_patch() -> str | None:
-    from vllm.v1.engine import EngineCoreRequestType
-
-    valid = (
-        getattr(getattr(EngineCoreRequestType, "SUBMIT_GR_SESSION", None), "value", None) == b"\x0a"
-    )
+    request_type = resolve("EngineCoreRequestType")
+    valid = getattr(getattr(request_type, "SUBMIT_GR_SESSION", None), "value", None) == b"\x0a"
     return _verified(valid, "GR EngineCore request types are missing or use wrong wire values")
 
 
 def _validate_engine_clients_patch() -> str | None:
-    from vllm.v1.engine.core_client import AsyncMPClient, InprocClient, SyncMPClient
-
     from vllm_gr.v1.engine.core_client import submit_gr_session_async
     from vllm_gr.v1.engine.core_client_patch import (
         inproc_abort_requests,
@@ -227,23 +211,22 @@ def _validate_engine_clients_patch() -> str | None:
         sync_mp_submit_gr_session,
     )
 
+    async_mp = resolve("AsyncMPClient")
+    sync_mp = resolve("SyncMPClient")
+    inproc = resolve("InprocClient")
     valid = (
-        getattr(AsyncMPClient, "submit_gr_session_async", None) is submit_gr_session_async
-        and getattr(SyncMPClient, "submit_gr_session", None) is sync_mp_submit_gr_session
-        and getattr(InprocClient, "submit_gr_session", None) is inproc_submit_gr_session
-        and getattr(InprocClient, "get_output", None) is inproc_get_output
-        and getattr(InprocClient, "add_request", None) is inproc_add_request
-        and getattr(InprocClient, "abort_requests", None) is inproc_abort_requests
-        and getattr(InprocClient, "shutdown", None) is inproc_shutdown
+        getattr(async_mp, "submit_gr_session_async", None) is submit_gr_session_async
+        and getattr(sync_mp, "submit_gr_session", None) is sync_mp_submit_gr_session
+        and getattr(inproc, "submit_gr_session", None) is inproc_submit_gr_session
+        and getattr(inproc, "get_output", None) is inproc_get_output
+        and getattr(inproc, "add_request", None) is inproc_add_request
+        and getattr(inproc, "abort_requests", None) is inproc_abort_requests
+        and getattr(inproc, "shutdown", None) is inproc_shutdown
     )
     return _verified(valid, "EngineCore client methods are not fully installed")
 
 
 def _validate_async_llm_patch() -> str | None:
-    from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.engine.llm_engine import LLMEngine
-    from vllm.v1.engine.output_processor import OutputProcessor
-
     from vllm_gr.v1.engine import gr_session_client
     from vllm_gr.v1.engine.async_llm import _PROCESS_OUTPUTS_PATCH_MARKER
     from vllm_gr.v1.engine.core_client_patch import (
@@ -251,12 +234,15 @@ def _validate_async_llm_patch() -> str | None:
         llm_engine_add_request,
     )
 
+    output_processor = resolve("OutputProcessor")
+    llm_engine = resolve("LLMEngine")
+    async_llm = resolve("AsyncLLM")
     valid = (
-        bool(getattr(OutputProcessor.process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False))
-        and getattr(LLMEngine, "add_request", None) is llm_engine_add_request
-        and getattr(AsyncLLM, "_add_request", None) is async_llm_add_request
+        bool(getattr(output_processor.process_outputs, _PROCESS_OUTPUTS_PATCH_MARKER, False))
+        and getattr(llm_engine, "add_request", None) is llm_engine_add_request
+        and getattr(async_llm, "_add_request", None) is async_llm_add_request
     )
-    for cls, suffix in ((LLMEngine, "sync"), (AsyncLLM, "async")):
+    for cls, suffix in ((llm_engine, "sync"), (async_llm, "async")):
         for operation in ("submit", "wait", "abort", "release"):
             name = f"{operation}_gr_session"
             valid = valid and getattr(cls, name, None) is getattr(
@@ -266,19 +252,15 @@ def _validate_async_llm_patch() -> str | None:
 
 
 def _validate_engine_core_entrypoint_patch() -> str | None:
-    from vllm.v1.engine.core import EngineCoreProc
-
     from vllm_gr.v1.engine.engine_core_patch import run_engine_core
 
     return _verified(
-        EngineCoreProc.run_engine_core is run_engine_core,
+        resolve("EngineCoreProc").run_engine_core is run_engine_core,
         "EngineCore process entrypoint wrapper is not installed",
     )
 
 
 def _validate_engine_core_request_patch() -> str | None:
-    from vllm.v1.engine.core import EngineCore, EngineCoreProc
-
     from vllm_gr.v1.engine.core import (
         _handle_submit_gr_session,
         is_gr_session_retired,
@@ -290,26 +272,27 @@ def _validate_engine_core_request_patch() -> str | None:
         _PIS_PATCH_MARKER,
     )
 
+    engine_core = resolve("EngineCore")
+    engine_core_proc = resolve("EngineCoreProc")
     valid = (
-        getattr(EngineCore, "_handle_submit_gr_session", None) is _handle_submit_gr_session
-        and getattr(EngineCore.__init__, "_gr_trie_capacity_patch", False)
-        and getattr(EngineCoreProc, "_handle_submit_gr_session", None) is _handle_submit_gr_session
-        and getattr(EngineCore, "is_gr_session_retired", None) is is_gr_session_retired
-        and getattr(EngineCoreProc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
-        and getattr(EngineCoreProc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
-        and EngineCoreProc.process_input_sockets is process_input_sockets
-        and getattr(EngineCoreProc.process_input_sockets, _PIS_PATCH_MARKER, False)
+        getattr(engine_core, "_handle_submit_gr_session", None) is _handle_submit_gr_session
+        and getattr(engine_core.__init__, "_gr_trie_capacity_patch", False)
+        and getattr(engine_core_proc, "_handle_submit_gr_session", None)
+        is _handle_submit_gr_session
+        and getattr(engine_core, "is_gr_session_retired", None) is is_gr_session_retired
+        and getattr(engine_core_proc._process_engine_step, _ENGINE_STEP_PATCH_MARKER, False)
+        and getattr(engine_core_proc._handle_client_request, _CLIENT_REQUEST_PATCH_MARKER, False)
+        and engine_core_proc.process_input_sockets is process_input_sockets
+        and getattr(engine_core_proc.process_input_sockets, _PIS_PATCH_MARKER, False)
     )
     return _verified(valid, "EngineCore GR session dispatch is not fully installed")
 
 
 def _validate_scheduler_patch() -> str | None:
-    from vllm.v1.core.sched.scheduler import Scheduler
-
     from vllm_gr.v1.engine.engine_core_patch import _SCHEDULER_PATCH_MARKER
 
     return _verified(
-        bool(getattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, False)),
+        bool(getattr(resolve("Scheduler").schedule, _SCHEDULER_PATCH_MARKER, False)),
         "Scheduler beam metadata propagation is not installed",
     )
 
@@ -334,9 +317,7 @@ def _validate_model_runner_patch() -> str | None:
 
 def _validate_kv_hash_memo_patch() -> str | None:
     """Verify the bounded memo wrapper on hash_block_tokens."""
-    from vllm.v1.core import kv_cache_utils
-
-    if not getattr(kv_cache_utils.hash_block_tokens, "_gr_hash_memo", False):
+    if not getattr(resolve("kv_cache_utils").hash_block_tokens, "_gr_hash_memo", False):
         return "hash_block_tokens memo wrapper not installed"
     return None
 
