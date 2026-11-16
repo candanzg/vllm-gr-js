@@ -64,6 +64,24 @@ The public Beam API is `beam_search_v1()`; retained internal compatibility
 helpers do not restore the retired `GRLLM.beam_search()` or catalog flags.
 Preserve ordinary non-GR requests when changing shared transport or patches.
 
+### Configuration field maintenance
+
+Declare each configuration field in `vllm_gr/config/models.py` with a dataclass
+default, an attribute docstring, and `ConfigFieldSpec` in `field(metadata=...)`.
+The specification binds its validator, canonical path, legacy key, required
+input policy, and serialization policy. Parsers and writers consume these
+declarations; add domain validation in `validation.py` and keep cross-field
+constraints in the model. Input-specific path handling stays in `parser.py`.
+
+Preserve the distinction between missing, null, and explicit false inputs.
+Canonical inputs require `schema_version` even though direct construction has a
+default. `ConstraintTableConfig.max_top_k` remains a required constructor
+argument with no default and an explicit `required=True` declaration. The
+`validate-config` hook checks defaults and docstrings for both configuration
+classes, with that one required-field exception. See the
+[standalone configuration tests](tools/README.md#targeted-tests-and-dependencies)
+and extend the existing configuration round-trip tests for behavior changes.
+
 ## ModelRunner and graph boundaries
 
 `beam.execution_mode="v1"` names the Beam protocol, independently of native

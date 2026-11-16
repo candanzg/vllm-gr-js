@@ -614,6 +614,63 @@ def test_engine_creation_serializes_cuda_decision_defaults(
     assert parse_gr_config(vllm_config).beam_engine_driven is None
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("value", [None, "true", "false", 0, 1])  # type: ignore[misc]
+def test_canonical_graph_flag_rejects_legacy_coercions(value: object) -> None:
+    with pytest.raises(ValueError, match="beam.graph_enabled must be a boolean"):
+        gr_config_from_mapping(
+            {
+                "schema_version": 1,
+                "constraint_table": {"max_top_k": 32},
+                "beam": {"graph_enabled": value},
+            }
+        )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_canonical_requires_schema_version_despite_constructor_default() -> None:
+    assert GRConfig().schema_version == 1
+    with pytest.raises(ValueError, match="requires schema_version"):
+        gr_config_from_mapping({"constraint_table": {"max_top_k": 32}})
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_minimal_canonical_wire_defaults_and_explicit_opt_outs() -> None:
+    raw = {"schema_version": 1, "constraint_table": {"max_top_k": 32}}
+    config = gr_config_from_mapping(raw)
+    expected: dict[str, object] = {
+        "schema_version": 1,
+        "beam": {"graph_enabled": True, "max_width": None, "max_decode_steps": 3},
+        "constraint_table": {
+            "enabled": False,
+            "backend": "cuda",
+            "path": None,
+            "format": "constraint_table_v1",
+            "artifact_digest": None,
+            "tokenizer_digest": None,
+            "max_top_k": 32,
+        },
+        "attention_backend": None,
+    }
+    assert gr_config_to_mapping(config) == expected
+    explicit = replace(
+        config,
+        beam_worker_decision=False,
+        constrained_generation=False,
+        prefill_flash_attn_version=None,
+    )
+    expected["beam"] = {
+        "graph_enabled": True,
+        "max_width": None,
+        "max_decode_steps": 3,
+        "worker_decision": False,
+        "prefill_flash_attn_version": None,
+    }
+    expected["constrained_generation"] = False
+    assert gr_config_to_mapping(explicit) == expected
+    assert gr_config_from_mapping(json.loads(json.dumps(expected))) == explicit
+
+
 pytestmark = pytest.mark.cpu_test
 
 
@@ -632,10 +689,34 @@ def test_adapter_cache_switch_round_trip(enabled: bool, tmp_path: Path) -> None:
     legacy = GRConfig(beam_adapter_cache_enabled=enabled)
     legacy.write_to_vllm_config(host)
     assert GRConfig.from_vllm_config(host).beam_adapter_cache_enabled is enabled
+    assert ("vllm_gr_beam_adapter_cache_enabled" in host.additional_config) is enabled
+    # Resetting the opt-in must remove a previously serialized legacy value.
+    GRConfig().write_to_vllm_config(host)
+    assert "vllm_gr_beam_adapter_cache_enabled" not in host.additional_config
+    beam["adapter_cache_enabled"] = enabled
+    explicit = gr_config_from_mapping(raw)
+    assert explicit.beam_adapter_cache_enabled is enabled
+    if not enabled:
+        beam.pop("adapter_cache_enabled")
+    assert gr_config_to_mapping(explicit) == raw
 
 
 @pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize("source", ["python", "legacy", "canonical"])  # type: ignore[misc]
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])  # type: ignore[misc]
-def test_adapter_cache_switch_requires_boolean(value: object) -> None:
+def test_adapter_cache_switch_requires_boolean(value: object, source: str) -> None:
     with pytest.raises(ValueError, match="adapter_cache_enabled must be a boolean"):
-        GRConfig(beam_adapter_cache_enabled=value)
+        if source == "python":
+            GRConfig(beam_adapter_cache_enabled=value)
+        elif source == "legacy":
+            GRConfig.from_vllm_config(
+                SimpleNamespace(additional_config={"vllm_gr_beam_adapter_cache_enabled": value})
+            )
+        else:
+            gr_config_from_mapping(
+                {
+                    "schema_version": 1,
+                    "beam": {"adapter_cache_enabled": value},
+                    "constraint_table": {"max_top_k": 32},
+                }
+            )

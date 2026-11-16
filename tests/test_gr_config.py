@@ -1143,4 +1143,31 @@ def test_engine_config_merge_keeps_npu_execution_choice(execution: NPUDecodeExec
     assert result.beam_max_width == 32
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("value", "expected"), [(None, True), ("true", True), ("false", False)]
+)
+def test_legacy_null_defaults_and_graph_flag_coercion(value: object, expected: bool) -> None:
+    config = GRConfig.from_vllm_config(
+        _vllm_config(
+            {
+                "vllm_gr_beam_graph_enabled": value,
+                "vllm_gr_beam_max_decode_steps": None,
+                "vllm_gr_prefill_flash_attn_version": None,
+                "vllm_gr_beam_worker_decision": False,
+            }
+        )
+    )
+    assert config.beam_graph_enabled is expected
+    assert config.beam_max_decode_steps == 3
+    host = _vllm_config({"unrelated": 7})
+    config.write_to_vllm_config(host)
+    assert host.additional_config == {
+        "unrelated": 7,
+        "vllm_gr_prefill_flash_attn_version": None,
+        "vllm_gr_beam_worker_decision": False,
+        **({} if expected else {"vllm_gr_beam_graph_enabled": False}),
+    }
+
+
 pytestmark = pytest.mark.cpu_test
