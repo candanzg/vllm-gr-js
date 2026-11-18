@@ -31,9 +31,10 @@ from unittest import mock
 import pytest
 import requests
 
+from tests.helpers.paths import REPO_ROOT
 from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = REPO_ROOT
 DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
 PANGU_EXAMPLE_DIR = ROOT / "examples" / "offline_inference" / "pangu1b"
 DEFAULT_SERVE_TIMEOUT = int(os.environ.get("PANGU1B_SERVE_TIMEOUT", "600"))

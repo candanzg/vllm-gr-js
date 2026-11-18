@@ -119,7 +119,7 @@ update.
 ## Validation without accelerator inference
 
 ```bash
-python -m pytest -q tests/test_benchmark_branch_policy.py
+python -m pytest -q tests/ci/test_benchmark_branch_policy.py
 python tools/ci/resolve_benchmark_policy.py \
   --policy-file .github/benchmark-gate.yaml --validate-only
 ```

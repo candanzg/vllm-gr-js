@@ -37,6 +37,7 @@ except (ImportError, RuntimeError) as exc:
 if not hasattr(torch, "npu") or not torch.npu.is_available():
     pytest.skip("Ascend NPU is unavailable", allow_module_level=True)
 
+from tests.helpers.paths import REPO_ROOT, TESTS_DIR
 from vllm_gr.ops.npu import beam_ops
 
 if not beam_ops.is_available():
@@ -53,7 +54,7 @@ _END_TOKEN = "<|sid_end|>"
 
 
 def _prompt_tokens(tokenizer: Any, length: int) -> list[int]:
-    source_path = Path(__file__).parents[1] / "resources/single_one_rec_prompt.txt"
+    source_path = TESTS_DIR / "resources/single_one_rec_prompt.txt"
     source = tokenizer.encode(source_path.read_text(), add_special_tokens=False)
     newline = tokenizer.encode("\n", add_special_tokens=False)
     assert len(newline) == 1
@@ -648,7 +649,7 @@ def _run_subprocess(tmp_path: Path, *, graph: bool = False) -> None:
         command.append("--graph")
     with subprocess.Popen(
         command,
-        cwd=Path(__file__).parents[2],
+        cwd=REPO_ROOT,
         env=env,
         start_new_session=True,
     ) as process:

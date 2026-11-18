@@ -93,8 +93,8 @@ the same target selection and version constraints; see the
 
 ## Packaging validation
 
-Run the isolated packaging tests with pip, pytest, setuptools, setuptools-scm,
-packaging, and Git installed:
+Run the isolated packaging tests with pip, pytest, pytest-timeout, setuptools,
+setuptools-scm, packaging, and Git installed:
 
 ```bash
 python -m pytest --confcutdir=tests/packaging -q tests/packaging/test_install_metadata.py

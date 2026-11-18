@@ -342,10 +342,10 @@ def test_input_socket_control_and_error_routes(monkeypatch, implementation, coor
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_gr_socket_queues_whole_batch_with_tensor_frames(monkeypatch, batch_size):
-    from tests.test_gr_async_scheduler import _batch_request
+    from tests.helpers.beam_requests import make_batch_request
     from vllm_gr.v1.beam.batch_contracts import BeamBatchItem, BeamBatchRequest
 
-    source = _batch_request()
+    source = make_batch_request()
     embeds = torch.arange(256, dtype=torch.float32).reshape(2, 128)
     items = tuple(
         BeamBatchItem(

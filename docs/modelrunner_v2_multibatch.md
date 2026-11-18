@@ -310,7 +310,7 @@ State and operations at the native-output boundary have these owners:
 | Model/head, configuration and attention/KV metadata reads | Shared stage and head helpers |
 | Input buffers, graph/cache handles, workspace, context and sessions | Worker/stage resource owners retain allocation and invalidation responsibility; output completion does not release these resources |
 
-Host tests in `tests/test_cuda_native_output.py` cover the completion and failure
+Host tests in `tests/v1/worker/test_cuda_native_output.py` cover the completion and failure
 ordering. `tests/kernels/test_gpu_beam_stage_lifecycle.py` exercises real CUDA
 output consumption for both hook implementations, including cancellation and
 terminal output. The ABC rejects missing completion implementations at
@@ -405,17 +405,17 @@ state and actual CUDA replay check request order and storage reuse.
 
 | Contract | Tests |
 | --- | --- |
-| V1/V2 startup selection, lazy capture, per-B fallback and cleanup failure | `tests/test_gr_startup.py` |
-| Native token budget and `(B,T)` admission, V1 grid isolation | `tests/test_gpu_prefill_graph_runner_v2.py` |
-| Logical member order, retirement and Backend capacity policy | `tests/test_v2_multibatch.py` |
+| V1/V2 startup selection, lazy capture, per-B fallback and cleanup failure | `tests/v1/worker/test_gr_startup.py` |
+| Native token budget and `(B,T)` admission, V1 grid isolation | `tests/v1/worker/test_gpu_prefill_graph_runner_v2.py` |
+| Logical member order, retirement and Backend capacity policy | `tests/v1/worker/test_v2_multibatch.py` |
 | Native row/slot reuse and unchanged request state | `tests/kernels/test_gpu_beam_stage_v2_state.py` |
 | Batched registration and fused input parity, cached offsets, token-block boundaries, padding and atomic fallback | `tests/kernels/test_gr_prefill_v2.py` |
 | SID-stage capacity, exact outputs and changing device step under replay | `tests/kernels/test_stage_topk_v2.py` |
 | B-switch replay, fixed storage, configured B=3/7 and 6/8, per-shape fallback | `tests/kernels/test_v2_multibatch_graphs.py` |
-| Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
-| Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
+| Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/v1/worker/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
+| Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/v1/worker/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
 | Existing public protocol, generation steps and scheduler integration | `tests/st/test_onerec_v1_scheduler_st.py`, `tests/st/test_modelrunner_v2_stage_parity_st.py` |
-| Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
+| Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/entrypoints/gr/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
 | Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
 | Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
 
@@ -463,7 +463,7 @@ configured `max_top_k` capacity. Run its six isolated engine configurations:
 ```bash
 CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
 python -m pytest --run-slow -q \
-  tests/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1
+  tests/entrypoints/gr/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1
 ```
 
 The matrix covers V1/V2 with Eager, default Graph and an explicit FULL Prefill

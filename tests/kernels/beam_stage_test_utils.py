@@ -12,7 +12,7 @@ import msgspec
 import torch
 
 from tests.constraints.test_table import make_table
-from tests.test_gr_async_scheduler import _batch_request
+from tests.helpers.beam_requests import make_batch_request
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES, BeamExecutionMode
 from vllm_gr.constraints.loader import _upload_cuda_backend
 from vllm_gr.constraints.versioned_table import VersionedConstraintTable
@@ -49,7 +49,7 @@ def metadata(
     n: int = 3,
     candidate_width: int | None = None,
 ) -> GRStageMetadata:
-    request = _batch_request(n)
+    request = make_batch_request(n)
     return GRStageMetadata(
         session_id=request.batch_id,
         dispatch_id=stage if dispatch is None else dispatch,

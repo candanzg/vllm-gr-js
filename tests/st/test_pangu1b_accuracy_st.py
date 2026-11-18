@@ -26,9 +26,10 @@ from unittest import mock
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT
 from tests.st.pangu1b_st_common import get_model_path, require_pangu_st_runtime
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = REPO_ROOT
 DEFAULT_DATASET = ROOT / "tests" / "resources" / "pangu1b" / "gsm8k_mini.json"
 DEFAULT_MIN_ACCURACY = os.environ.get(
     "PANGU1B_OFFLINE_ACCURACY_THRESHOLD",

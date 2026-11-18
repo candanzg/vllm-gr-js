@@ -136,11 +136,15 @@ rg --files tests -g '*graph*' -g '*model_runner*'
 
 | Boundary | Coverage location |
 | --- | --- |
-| Public API, configuration, scheduling, lifecycle, CI policy | Relevant `tests/test_*.py`; locate by symbol or behavior |
+| Public API and entrypoints | `tests/entrypoints/` |
+| Configuration and engine mode | `tests/engine/` |
+| Scheduling, admission, and session lifecycle | `tests/v1/engine/` |
+| CI policy and test levels | `tests/ci/` |
+| Example scripts and benchmark helpers | `tests/examples/`, `tests/benchmarks/` |
 | Protocol and upstream patch compatibility | `tests/contract/` |
 | Provider registration and import isolation | `tests/platforms/` |
 | Artifact, scoring, and backend behavior | `tests/constraints/`, `tests/tools/` |
-| Worker and kernels | `tests/v1/worker/`, `tests/kernels/`, `tests/integration/` |
+| Worker, attention backends, and kernels | `tests/v1/worker/`, `tests/v1/attention/`, `tests/kernels/`, `tests/integration/` |
 | OneRec/model integration and acceptance scripts | `tests/st/`, `tests/system/` |
 | Wheel metadata and installation | `tests/packaging/` |
 

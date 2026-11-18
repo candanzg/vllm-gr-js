@@ -37,8 +37,8 @@ their separate checks.
 ```bash
 python tools/ci/resolve_benchmark_policy.py \
   --policy-file .github/benchmark-gate.yaml --validate-only
-python -m pytest -q tests/test_benchmark_policy_ci.py \
-  tests/test_benchmark_branch_policy.py tests/test_ready_label_ci.py
+python -m pytest -q tests/ci/test_benchmark_policy_ci.py \
+  tests/ci/test_benchmark_branch_policy.py tests/ci/test_ready_label_ci.py
 ```
 
 The resolver also accepts `--github-env` for shell consumers and

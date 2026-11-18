@@ -101,8 +101,8 @@ the allocating API after a possible partial output write.
 
 ```bash
 VLLM_GR_TARGET_DEVICE=npu python -m pytest \
-  tests/test_npu_xattention_out.py \
-  tests/test_npu_xattention_out_binding.py -q
+  tests/ops/npu/test_npu_xattention_out.py \
+  tests/ops/npu/test_npu_xattention_out_binding.py -q
 VLLM_GR_TARGET_DEVICE=npu VLLM_GR_TEST_XATTENTION_OUT_REQUIRED=1 \
   python -m pytest tests/kernels/test_x_attention_out_npu.py -q
 ```

@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT, TESTS_DIR
+
 pytestmark = pytest.mark.gpu_test
 
 _MODULE_READY = time.monotonic()
@@ -417,7 +419,7 @@ def _inputs(work_dir: Path) -> tuple[Any, ...]:
             "tokenizer_digest": tokenizer_digest,
         },
     }
-    prompt_text = (Path(__file__).parents[1] / "resources/single_one_rec_prompt.txt").read_text()
+    prompt_text = (TESTS_DIR / "resources/single_one_rec_prompt.txt").read_text()
     source = tokenizer.encode(prompt_text, add_special_tokens=False)
     newline = tokenizer.encode("\n", add_special_tokens=False)
     assert len(newline) == 1
@@ -1219,9 +1221,7 @@ def test_onerec_v1_completion_batch_online(
             str(tmp_path),
             mode,
         ]
-        with subprocess.Popen(
-            command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-        ) as process:
+        with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
             try:
                 assert process.wait(timeout=550) == 0, f"OneRec {mode} subprocess failed"
             finally:
@@ -1262,9 +1262,7 @@ def test_onerec_v1_async_scheduling(tmp_path: Path, online: bool, runner: str) -
     if online:
         command.append("--online")
     process_started = time.monotonic()
-    with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-    ) as process:
+    with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
         try:
             assert process.wait(timeout=600) == 0, "OneRec V1 scheduling subprocess failed"
         finally:

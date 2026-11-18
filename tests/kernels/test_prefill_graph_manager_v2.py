@@ -239,7 +239,7 @@ def test_capacity_boundary_capture_replays_real_prefill_attention() -> None:
     from vllm.v1.worker.gpu.block_table import BlockTables
     from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
-    from tests.test_beam_attention_metadata import _make_builder
+    from tests.v1.attention.test_beam_attention_metadata import _make_builder
     from vllm_gr.v1.attention.backends import beam_attn_gpu
 
     if not beam_attn_gpu.is_available():

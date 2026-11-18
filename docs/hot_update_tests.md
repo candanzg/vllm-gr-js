@@ -31,14 +31,14 @@ replays. Static pre-commit hooks passed; the full accuracy/performance/HDFS gate
 were not rerun for these fixes.
 
 Async-pause response fix (2026-11-10): **473 passed** across `tests/sidecar`,
-`tests/test_grpc_entry.py`, and `tests/test_gr_async_scheduler.py`. The production
+`tests/entrypoints/grpc/test_grpc_entry.py`, and `tests/v1/engine/test_gr_async_scheduler.py`. The production
 service case below also passed. This is focused coverage for the HTTP response
 contract, not a new compile/Graph or performance acceptance run.
 
 Output-head identification fix: the original `lm_head` cases passed before the
 fix, while all eight `output`/alias combinations reproduced stale caches. After
 type-based detection, **75 selected CPU cases passed** in
-`tests/sidecar/test_worker_update.py` and `tests/test_sliced_logits.py`
+`tests/sidecar/test_worker_update.py` and `tests/ops/test_sliced_logits.py`
 (`-k "not cuda"`; 34 cases deselected). Fixtures use native `ParallelLMHead`
 with TP disabled and the native layerwise reload API; no full-model or new
 Graph/performance run was added.
@@ -56,8 +56,8 @@ Sidecar owner; stop or relocate instances before removing them from configuratio
 This limit does not alter Trie file retention.
 
 Combined affected-scope regression after all three fixes: **720 passed** in
-`tests/sidecar`, `tests/test_grpc_entry.py`, `tests/test_gr_async_scheduler.py`,
-`tests/test_sliced_logits.py`, the V1/V2 ModelRunner patch suites, patch
+`tests/sidecar`, `tests/entrypoints/grpc/test_grpc_entry.py`, `tests/v1/engine/test_gr_async_scheduler.py`,
+`tests/ops/test_sliced_logits.py`, the V1/V2 ModelRunner patch suites, patch
 initialization, and constraint lifecycle. The real in-flight Sidecar drain case
 also passed again. This is targeted regression, not a new full CI, accuracy or
 performance gate result.
@@ -92,7 +92,7 @@ use a fake CLI subprocess. They do not substitute for real HDFS/GPU validation.
 | Trie access and expiry | Valid + invalid | 1. Default to the latest table<br>2. Verify old/new candidate sets during retention<br>3. Release expired tables on API calls without a timer thread<br>4. Reject access to expired versions<br>5. Reject different contents under the same version ID. | `test_management.py::test_versioned_table_lazy_expiry_and_default_access`; `test_expired_table_is_released_by_api_without_session_notifications`; `test_worker_update.py::test_reload_trie_switches_then_releases_old_table_on_expiry` |
 | Sliced cache and native weight reload | Valid | 1. Refresh sliced weights through native post-load processing<br>2. Reload three times for bias/no bias and inference/ordinary cache creation<br>3. Verify aligned logits<br>4. Preserve cache addresses<br>5. Exclude derived caches from checkpoint parameters. | `test_worker_update.py::test_head_refreshes_its_own_slice_during_native_weight_processing`; `test_sliced_cache_survives_native_layerwise_reload` (lm_head/output/alias × bias/no bias × inference/ordinary cache creation, three reloads each) |
 | Sliced cache window changes | Valid | 1. Reuse the proxy for repeated projections<br>2. Do not rewrap the reload hook after window changes<br>3. Refresh the current window on reload<br>4. Preserve cache addresses with and without bias. | `test_worker_update.py::test_sliced_reload_hook_tracks_window_changes_without_rewrapping` (bias/no bias; 2 cases) |
-| Prefix-cache clearing after drain | Valid | 1. Allow forced prefix-cache clearing after drain<br>2. Preserve unstarted queued GR requests. | `tests/test_gr_async_scheduler.py::test_prefix_reset_after_drain_preserves_waiting_gr_sessions` |
+| Prefix-cache clearing after drain | Valid | 1. Allow forced prefix-cache clearing after drain<br>2. Preserve unstarted queued GR requests. | `tests/v1/engine/test_gr_async_scheduler.py::test_prefix_reset_after_drain_preserves_waiting_gr_sessions` |
 | Reload safety and manual recovery | Invalid state + cancellation | 1. Reproduce partial failure with the native layerwise loader<br>2. Keep old version but mark weights invalid<br>3. Reject resume and concurrent reload<br>4. A fresh Sidecar cannot resume invalid weights after version withdrawal<br>5. Reject checkpoint reload while running. | `test_management.py::test_partial_native_reload_remains_invalid_after_sidecar_restart_and_withdrawal`; `test_reload_in_progress_rejects_resume_and_concurrent_reload`; `test_running_service_cannot_reload_checkpoint` |
 | Tied LM-head cache refresh | Valid | 1. Load through embedding or head using the native loader<br>2. Refresh sliced and GPU transposed caches across three reloads<br>3. Preserve cache storage and tied weights<br>4. Register hooks once at model load. | `test_worker_update.py::test_tied_head_caches_follow_native_layerwise_reload` |
 
@@ -153,10 +153,10 @@ The current branch has not completed all CI/performance/accuracy gates.
 
 | Regression item / scenario | Corresponding suite / command | Recorded result and scope |
 | --- | --- | --- |
-| Native/GR scheduling, admission, dispatch/receipts, cancellation, cleanup, pause and prefix-cache rules | `tests/test_gr_async_scheduler.py` | Passed in the complete CI selection; includes the new queued-session reset case |
-| Sliced projection, cropping/alignment, bias, TP/gather, quantized fallback and native dtype behavior | `tests/test_sliced_logits.py`; `tests/sidecar/test_worker_update.py` | Passed in the complete CI selection: 89 existing projection cases and 8 Worker update cases |
+| Native/GR scheduling, admission, dispatch/receipts, cancellation, cleanup, pause and prefix-cache rules | `tests/v1/engine/test_gr_async_scheduler.py` | Passed in the complete CI selection; includes the new queued-session reset case |
+| Sliced projection, cropping/alignment, bias, TP/gather, quantized fallback and native dtype behavior | `tests/ops/test_sliced_logits.py`; `tests/sidecar/test_worker_update.py` | Passed in the complete CI selection: 89 existing projection cases and 8 Worker update cases |
 | Constraint loading/publication, failure/shutdown cleanup, memory accounting and projection windows | `tests/v1/worker/test_constraint_lifecycle.py` | Passed in the complete CI selection; fixtures follow the wrapper contract |
-| Real-model V1/V2 parity, completion batching, async scheduling and offline/serving lifecycle | `tests/st/test_modelrunner_v2_stage_parity_st.py`; `tests/st/test_onerec_v1_scheduler_st.py`; `tests/test_offline_beam_search.py`; `tests/test_serving_beam_search.py` | Passed with slow tests enabled; covers eager/graph, custom batches, unconstrained generation, fallback and actual graph replay |
+| Real-model V1/V2 parity, completion batching, async scheduling and offline/serving lifecycle | `tests/st/test_modelrunner_v2_stage_parity_st.py`; `tests/st/test_onerec_v1_scheduler_st.py`; `tests/entrypoints/gr/test_offline_beam_search.py`; `tests/entrypoints/openai/test_serving_beam_search.py` | Passed with slow tests enabled; covers eager/graph, custom batches, unconstrained generation, fallback and actual graph replay |
 | Existing GPU and simulated NPU lifecycle fixtures adapted to VersionedConstraintTable | `tests/kernels/test_multi_trie_beam.py`; `tests/kernels/test_v2_multibatch_graphs.py`; `tests/v1/worker/test_npu_stage_projection_lifecycle.py` | GPU files: 19 passed; CPU-based NPU lifecycle file: 11 passed. Only test setup/identity assertions changed; no NPU hardware validation |
 | Formatting and static checks: SPDX, isort, Ruff, typos, Markdown, workflow/shell and mypy 3.11/3.12/3.13 | `pre-commit run --all-files --show-diff-on-failure` | All applicable static hooks passed; run-tests executed separately. External local configuration selects system Node |
 | Wheel build/install smoke: Python 3.11/3.12/3.13, CPU and CUDA | `tools/run_wheel_smoke_test.sh` | All six variants passed in this run |

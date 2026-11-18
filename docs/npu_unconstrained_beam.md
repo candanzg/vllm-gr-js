@@ -221,14 +221,14 @@ they do not imply bitwise parity across different model kernels or devices.
 Run the focused regressions in the complete Ascend environment:
 
 ```bash
-python -m pytest tests/test_npu_unconstrained_beam.py \
-  tests/test_npu_unconstrained_runner_config.py \
-  tests/test_npu_sid_stage_vocab.py \
-  tests/test_npu_sid_stage_config.py \
-  tests/test_npu_sid_stage_loading.py \
-  tests/test_npu_stage_logits.py \
-  tests/test_beam_search_v1_input_processor.py \
-  tests/test_npu_model_runner_patch.py \
+python -m pytest tests/v1/engine/test_npu_unconstrained_beam.py \
+  tests/v1/engine/test_npu_unconstrained_runner_config.py \
+  tests/ops/npu/test_npu_sid_stage_vocab.py \
+  tests/engine/test_npu_sid_stage_config.py \
+  tests/v1/worker/test_npu_sid_stage_loading.py \
+  tests/ops/test_npu_stage_logits.py \
+  tests/entrypoints/beam_search_v1/test_beam_search_v1_input_processor.py \
+  tests/v1/worker/test_npu_model_runner_patch.py \
   tests/kernels/test_unconstrained_topk_npu.py \
   tests/kernels/test_sid_stage_topk_npu.py
 ```

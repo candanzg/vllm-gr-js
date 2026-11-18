@@ -63,7 +63,7 @@ On `main` and `decode_graph`, NPU runs use the Video-100 benchmark.
 ## Local validation
 
 ```bash
-python -m pytest -q tests/test_v1_recall_summary.py
+python -m pytest -q tests/ci/test_v1_recall_summary.py
 SKIP=run-tests pre-commit run --all-files
 ```
 

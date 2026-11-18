@@ -62,7 +62,7 @@ def _replace_model(runner: Any, value: float) -> None:
     head.quant_method = UnquantizedEmbeddingMethod()
     head.tp_size = 1
     # vLLM 0.30 CustomOps read the current config at construction time (same
-    # pattern as tests/test_sliced_logits.py::_native_processor).
+    # pattern as tests/ops/test_sliced_logits.py::_native_processor).
     with set_current_vllm_config(VllmConfig()):
         processor = LogitsProcessor(384, scale=0.7, soft_cap=13.0)
     processor._gather_logits = lambda logits: logits

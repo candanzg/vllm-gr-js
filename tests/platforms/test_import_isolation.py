@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT
+
 
 def test_platform_package_and_builtins_do_not_load_hardware_modules() -> None:
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = REPO_ROOT
     code = """
 import sys
 
@@ -60,7 +61,7 @@ for module_name in (
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_cuda_plugin_initialization_does_not_import_ascend() -> None:
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = REPO_ROOT
     code = """
 import sys
 
@@ -119,7 +120,7 @@ assert not any(name in sys.modules for name in blocked)
     ],
 )
 def test_shared_workspace_and_v2_do_not_import_v1_integration(module_name: str) -> None:
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = REPO_ROOT
     code = """
 import importlib
 import importlib.abc
@@ -196,7 +197,7 @@ for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
 """
     subprocess.run(
         [sys.executable, "-c", code],
-        cwd=Path(__file__).resolve().parents[2],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,

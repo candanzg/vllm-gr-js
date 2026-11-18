@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
 
 _SESSIONS = ((1024, 3), (900, 3), (900, 3), (1024, 3))
@@ -289,9 +290,7 @@ def test_modelrunner_v2_stage_parity(tmp_path: Path) -> None:
             str(work_dir),
             arm,
         ]
-        with subprocess.Popen(
-            command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-        ) as process:
+        with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
             try:
                 assert process.wait(timeout=900) == 0, f"V2 {arm} arm failed"
             finally:

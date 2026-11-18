@@ -48,6 +48,6 @@ Reset and KV slot release follow the drain of outstanding dispatches and
 final consumers. A device error does not roll back KV writes already issued
 by the current model Forward.
 
-Focused coverage lives in [the state tests](../tests/test_beam_state.py),
+Focused coverage lives in [the state tests](../tests/v1/beam/test_beam_state.py),
 [the CUDA runner tests](../tests/kernels/test_beam_search_runner_cuda.py) and
 [the Worker lifecycle tests](../tests/kernels/test_gpu_beam_stage_lifecycle.py).

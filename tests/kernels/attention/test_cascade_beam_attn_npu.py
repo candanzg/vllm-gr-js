@@ -75,7 +75,7 @@ except (ImportError, RuntimeError) as _npu_import_error:
 
 
 try:
-    from cascade_beam_attn_utils import (
+    from tests.kernels.attention.cascade_beam_attn_utils import (
         NPU_CASES,
         NUM_HEADS,
         BeamAttnInputs,

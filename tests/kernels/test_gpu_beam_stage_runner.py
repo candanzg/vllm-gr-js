@@ -9,7 +9,6 @@ import subprocess
 import sys
 from abc import abstractmethod
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,6 +18,8 @@ import pytest
 import torch
 from torch.cuda.streams import Event as CUDAEvent
 
+from tests.helpers.beam_requests import make_batch_request
+from tests.helpers.paths import REPO_ROOT
 from tests.kernels.beam_stage_test_utils import (
     admission_worker,
     dispatch,
@@ -26,7 +27,6 @@ from tests.kernels.beam_stage_test_utils import (
     prepare_binding,
     runtime,
 )
-from tests.test_gr_async_scheduler import _batch_request
 from vllm_gr.config import SUPPORTED_BEAM_BATCH_SIZES
 from vllm_gr.v1.attention.backends.beam_graph_kernels import (
     cache_unshared_kv_graph,
@@ -387,7 +387,7 @@ def test_native_identity_and_extent_rejected_before_admission():
 def test_session_init_binding_rejected_before_writes(fault):
     owner = runtime()
     m = metadata()
-    request = _batch_request()
+    request = make_batch_request()
     request.items[0].request.prompt_token_ids = np.full(m.num_prompt_tokens, 1, dtype=np.int64)
     request = msgspec.structs.replace(request, beam_params=m.beam_params)
     if fault == "protocol":
@@ -885,7 +885,7 @@ def test_sliced_head_non_divisible_vocab_peak_allocation():
     )
     result = subprocess.run(
         [sys.executable, "-c", command],
-        cwd=Path(__file__).resolve().parents[2],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         timeout=120,

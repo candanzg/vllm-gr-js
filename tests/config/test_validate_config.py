@@ -11,8 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.paths import REPO_ROOT
+
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
-HOOK = Path(__file__).resolve().parents[2] / "tools/pre_commit/validate_config.py"
+HOOK = REPO_ROOT / "tools/pre_commit/validate_config.py"
 
 
 def _check(tmp_path: Path, source: str, *, name: str = "vllm_gr/config/models.py") -> str:

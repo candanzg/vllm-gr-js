@@ -129,14 +129,14 @@ Run the kernel tests and relevant regression tests:
 ```bash
 .venv/bin/pytest -q -s \
   tests/kernels/attention/test_beam_short_suffix.py \
-  tests/test_short_suffix_config.py \
-  tests/test_gr_config.py \
-  tests/test_gr_config_v1.py \
-  tests/test_beam_attention_platform_execution.py \
-  tests/test_beam_decode_graph.py \
-  tests/test_beam_attention_pool.py \
-  tests/test_beam_attention_metadata.py \
-  tests/test_incremental_beam_attention.py
+  tests/v1/attention/test_short_suffix_config.py \
+  tests/engine/test_gr_config.py \
+  tests/engine/test_gr_config_v1.py \
+  tests/v1/attention/test_beam_attention_platform_execution.py \
+  tests/v1/worker/test_beam_decode_graph.py \
+  tests/v1/beam/test_beam_attention_pool.py \
+  tests/v1/attention/test_beam_attention_metadata.py \
+  tests/v1/beam/test_incremental_beam_attention.py
 ```
 
 On the validation machine, the regular FP32 matrix had maximum absolute

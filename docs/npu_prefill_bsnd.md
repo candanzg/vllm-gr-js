@@ -64,24 +64,24 @@ submission overhead does not guarantee lower latency for every length distributi
 
 ## Validation
 
-Dependency-free host tests:
+Dependency-free host tests, run from the repository root:
 
 ```bash
-python tests/test_npu_prefill_bsnd.py
+python -m tests.v1.worker.test_npu_prefill_bsnd
 ```
 
 In the supported vLLM/Ascend environment:
 
 ```bash
-python -m pytest -q tests/test_beam_attention_platform_execution.py \
-  tests/test_prefill_graph_runner.py tests/test_npu_model_runner_patch.py \
-  tests/test_npu_prefill_bsnd.py
+python -m pytest -q tests/v1/attention/test_beam_attention_platform_execution.py \
+  tests/v1/worker/test_prefill_graph_runner.py tests/v1/worker/test_npu_model_runner_patch.py \
+  tests/v1/worker/test_npu_prefill_bsnd.py
 python -m ruff check vllm_gr/v1/worker/npu/npu_prefill_graph_runner.py \
   vllm_gr/v1/worker/npu/npu_model_runner_patch.py \
   vllm_gr/v1/attention/backends/beam_attn_metadata.py \
   vllm_gr/v1/attention/backends/beam_attn.py \
   vllm_gr/v1/attention/backends/beam_attn_npu.py \
-  tests/test_npu_prefill_bsnd.py tests/test_prefill_graph_runner.py
+  tests/v1/worker/test_npu_prefill_bsnd.py tests/v1/worker/test_prefill_graph_runner.py
 ```
 
 Run `ruff format --check` on the same files. The generic Prefill unit tests
@@ -91,7 +91,7 @@ explicitly set their own specs. Production bucket validation remains strict.
 Run the repository strict type-check wrapper on the host regressions:
 
 ```bash
-python tools/pre_commit/mypy.py 1 3.12 tests/test_npu_prefill_bsnd.py
+python tools/pre_commit/mypy.py 1 3.12 tests/v1/worker/test_npu_prefill_bsnd.py
 ```
 
 When collecting replay evidence, ensure the EngineCore logging configuration

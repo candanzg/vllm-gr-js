@@ -102,7 +102,7 @@ include = ["vllm_gr*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v"
+addopts = "-v --strict-markers --strict-config"
 # Default guard; the long system tests carry their own @pytest.mark.timeout.
 timeout = 250
 # Mirrors the upstream vLLM convention: markers describe which execution
@@ -116,6 +116,13 @@ markers = [
     "npu_test: mark test as requiring an Ascend NPU runtime",
     "model_test: mark test as requiring model weights",
     "network: mark test as requiring network access",
+    # Also registered by tests/level_plugin.py. Listed here so entry points that
+    # skip tests/conftest.py (--confcutdir) still pass --strict-markers.
+    "l1: vllm-gr L1 CI test level",
+    "l2: vllm-gr L2 CI test level",
+    "l3: vllm-gr L3 CI test level",
+    "l4: vllm-gr L4 CI test level",
+    "l5: vllm-gr L5 CI test level",
 ]
 
 [tool.ruff]

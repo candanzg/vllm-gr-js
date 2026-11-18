@@ -273,7 +273,7 @@ installers run or their ordering.
   checks named installation, native pause/resume preservation, drain-Future
   forwarding and repeat installation. `tests/sidecar/test_management.py`
   covers status, RPC failures, execution guards and listener/client integration.
-  `tests/test_gr_async_scheduler.py::test_prefix_reset_after_drain_preserves_waiting_gr_sessions`
+  `tests/v1/engine/test_gr_async_scheduler.py::test_prefix_reset_after_drain_preserves_waiting_gr_sessions`
   covers the drained-reset boundary without discarding queued GR sessions.
 - Removal condition: vLLM exposes stable control-message, request-dispatch and
   named management utility extension points.
@@ -316,8 +316,8 @@ and Decode capture policy remain active when this cache is disabled.
   V1 fallback; graph policies remain version-specific. NPU retains its own
   adapter and lazy imports. `CudaStageHooks` is an abstract base class, so an
   incomplete implementation fails at construction on any device. Binding and
-  startup regressions live in `tests/test_model_runner_stage_binding.py` and
-  `tests/test_gr_startup.py`; `tests/tools/test_cuda_stage_typing.py` pins the
+  startup regressions live in `tests/v1/worker/test_model_runner_stage_binding.py` and
+  `tests/v1/worker/test_gr_startup.py`; `tests/tools/test_cuda_stage_typing.py` pins the
   abstract method set and both subclasses.
 - Common support ownership: `model_runner_common.py` contains bounded V1
   adaptation only. V2 owns its execute wrapper; `gr_execution.py` owns control
@@ -328,8 +328,8 @@ and Decode capture policy remain active when this cache is disabled.
   The public installer selects V1 before importing its wrapper and installs
   NumPy staging once for either CUDA version. Public RPC names, async sampling
   context lifetime, freeze policy and cleanup ordering retain existing behavior.
-  Coverage: `tests/test_model_runner_common.py`,
-  `tests/test_model_runner_stage_binding.py`, `tests/test_model_runner_patch.py`,
+  Coverage: `tests/v1/worker/test_model_runner_common.py`,
+  `tests/v1/worker/test_model_runner_stage_binding.py`, `tests/v1/worker/test_model_runner_patch.py`,
   `tests/platforms/test_import_isolation.py`, and the existing CUDA lifecycle cases.
 - V2 runtime ownership: `cuda/v2/gpu_model_runner_v2_resources.py` owns one
   `V2RuntimeState` per Worker generation, containing fixed inputs and capture
@@ -348,7 +348,7 @@ and Decode capture policy remain active when this cache is disabled.
   resets, including cancelled dispatches. Earlier failures retain their existing
   failure state. V2 Prefill consumption and token updates remain in Prefill.
   No dispatch/output-consumer drain or GR resource release occurs in this hook.
-  Coverage: `tests/test_cuda_native_output.py`, `tests/test_v2_multibatch.py`,
+  Coverage: `tests/v1/worker/test_cuda_native_output.py`, `tests/v1/worker/test_v2_multibatch.py`,
   `tests/kernels/test_gpu_beam_stage_lifecycle.py`, and
   `tests/kernels/test_gpu_beam_stage_v2_state.py`.
 - ModelRunner V1 targets:
@@ -386,7 +386,7 @@ and Decode capture policy remain active when this cache is disabled.
   V2 hooks binding through `gr_startup.py`. The native Prefill manager remains
   separate. Profiling teardown, capture-state restoration, shape-local fallback,
   memory accounting and GC-freeze ordering retain their existing execution points.
-  Coverage: `tests/test_gpu_model_runner_v2_patch.py`, `tests/test_gr_startup.py`,
+  Coverage: `tests/v1/worker/test_gpu_model_runner_v2_patch.py`, `tests/v1/worker/test_gr_startup.py`,
   `tests/kernels/test_v2_multibatch_graphs.py`, and
   `tests/kernels/test_beam_pool_recapture.py`.
 - ModelRunner V2 dependencies:
@@ -417,11 +417,11 @@ and Decode capture policy remain active when this cache is disabled.
   marker and load-time device-memory accounting shared by CUDA V1/V2. V1 input
   preparation remains in `cuda/v1/gpu_prefill_inputs.py`; V2 does not import the V1
   integration module.
-- Shared workspace coverage: `tests/test_gpu_postprocess_workspace.py` checks
+- Shared workspace coverage: `tests/v1/worker/test_gpu_postprocess_workspace.py` checks
   load ordering, failure propagation, fixed-storage reuse and memory accounting.
   `tests/platforms/test_import_isolation.py` rejects V1/NPU implementation
   imports while loading shared workspace support and V2 integration.
-- Hot-update coverage: `tests/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract`
+- Hot-update coverage: `tests/v1/worker/test_model_runner_patch.py::test_active_cuda_worker_hot_update_utility_contract`
   checks active Worker installation, RPC dispatch, repeat installation and
   preservation of the native weight loader. `tests/sidecar/test_worker_update.py`
   covers table replacement/expiry and native cache reloads;
@@ -456,7 +456,7 @@ and Decode capture policy remain active when this cache is disabled.
     - the 3-item `_prepare_inputs` result (`logits_indices`, speculative-decode metadata, total scheduled tokens);
     - the 8-item `_bookkeeping_sync` result, including async NaN counts and request-index snapshots;
     - speculative decoding and token-compression state.
-- Hot-update coverage: `tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`
+- Hot-update coverage: `tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`
   checks delayed installation on a simulated NPU Worker;
   `tests/sidecar/test_management.py::test_trie_rejects_unsupported_execution_before_worker_rpc`
   checks NPU rejection, and shared table/cache behavior is covered by
@@ -468,8 +468,8 @@ and Decode capture policy remain active when this cache is disabled.
   complete prompts without history when `VLLM_GR_NPU_PREFILL_BSND_CAPTURE_SPECS`
   is configured. Other requests retain TND/native fallback. Graph metadata owns
   scratch buffers; device capture errors propagate when this mode is enabled.
-- Validation: `tests/test_npu_prefill_bsnd.py` and the explicitly scoped BSND
-  constructor cases in `tests/test_prefill_graph_runner.py`.
+- Validation: `tests/v1/worker/test_npu_prefill_bsnd.py` and the explicitly scoped BSND
+  constructor cases in `tests/v1/worker/test_prefill_graph_runner.py`.
 - Configuration and limitations: [NPU BSND Prefill](npu_prefill_bsnd.md).
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration
@@ -605,7 +605,7 @@ The CUDA plugin subprocess test and sliced-logits proxy tests cover this boundar
   Aliases restored to the native validator are rebound to the existing filter;
   unrelated overrides are preserved. Repeated checks reuse both the filter and
   the device wrapper. The rebinding and override-preservation regressions live
-  in `tests/test_ascend_compat.py`.
+  in `tests/v1/test_ascend_compat.py`.
 - Removal condition: vllm-ascend's `AscendConfig` accepts unknown
   `additional_config` keys, or vllm-gr stops carrying its configuration there.
 
@@ -652,9 +652,9 @@ The CUDA plugin subprocess test and sliced-logits proxy tests cover this boundar
   The ordinary native `FullAttentionSpec` has no `cache_dtype_str` field;
   the cache-config dtype and actual spec dtype remain mandatory guards.
   Eligibility is evaluated per engine/layer; no engine configuration is cached.
-- Validation: policy controls in `tests/test_npu_kv_layout.py`, installation
-  order in `tests/test_ascend_compat.py`, and direct/fallback routing plus native
-  xllm eager/FULL replay checks in `tests/test_npu_beam_row_views.py`.
+- Validation: policy controls in `tests/v1/test_npu_kv_layout.py`, installation
+  order in `tests/v1/test_ascend_compat.py`, and direct/fallback routing plus native
+  xllm eager/FULL replay checks in `tests/ops/npu/test_npu_beam_row_views.py`.
 - Removal condition: a native backend contiguous-KV capability covers GR xllm
   without this version-specific policy bridge.
 
@@ -716,7 +716,7 @@ When an active runtime patch changes:
 Catalog serving installer, validator, and legacy tests have been removed. The
 canonical V1 constraint artifact loads in the worker, covered by
 `test_canonical_worker_enables_vocab_slice_before_first_forward` and
-`tests/test_gr_config_v1.py`. The ID is retained in the YAML `retired_patches`
+`tests/engine/test_gr_config_v1.py`. The ID is retained in the YAML `retired_patches`
 section and must not be counted as an active installer.
 
 **GR-PATCH-014 — LMCache Integration Override** is retired. The experimental
@@ -731,6 +731,6 @@ allocator counters directly instead of flattening a full statistics snapshot,
 and the installer found no native method to wrap on that runtime. The
 installer, its module, and its dedicated tests were removed; the NPU worker
 lifecycle contract remains covered by
-`tests/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`.
+`tests/v1/test_ascend_compat.py::test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract`.
 The ID is retained in the YAML `retired_patches` section and must not be
 counted as an active installer.

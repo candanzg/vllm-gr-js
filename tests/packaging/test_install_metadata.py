@@ -21,9 +21,9 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.version import Version
 
+from tests.helpers.paths import REPO_ROOT
 from tools.ci.resolve_runtime import check_versions, package_version
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 COMMON_FILE = REPO_ROOT / "requirements" / "common.txt"
 
 

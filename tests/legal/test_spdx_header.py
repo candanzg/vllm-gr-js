@@ -15,7 +15,9 @@ from typing import Any, Protocol, cast
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "tools/pre_commit/check_spdx_header.py"
+from tests.helpers.paths import REPO_ROOT
+
+SCRIPT = REPO_ROOT / "tools/pre_commit/check_spdx_header.py"
 LICENSE = "# SPDX-License-Identifier: Apache-2.0\n"
 PROJECT = "# SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project\n"
 UPSTREAM = "# SPDX-FileCopyrightText: Copyright 2025 The xLLM Authors. All Rights Reserved.\n"

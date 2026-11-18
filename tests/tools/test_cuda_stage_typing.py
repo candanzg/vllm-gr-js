@@ -132,9 +132,9 @@ def test_implementations_subclass_the_contract() -> None:
 )
 def test_mypy_checks_complete_boundary(changed_file: str) -> None:
     """Changing any boundary member checks its peers and negative cases too."""
-    groups = mypy_hook.group_files([changed_file, "tests/test_gr_startup.py"])
+    groups = mypy_hook.group_files([changed_file, "tests/v1/worker/test_gr_startup.py"])
     assert groups.pop(mypy_hook.CUDA_STAGE_GROUP) == mypy_hook.CUDA_STAGE_FILES
-    assert groups.pop("tests") == ["tests/test_gr_startup.py"]
+    assert groups.pop("tests") == ["tests/v1/worker/test_gr_startup.py"]
     assert not any(groups.values())
 
 

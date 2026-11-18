@@ -37,7 +37,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    for level in sorted(LEVELS):
+    registered = {str(line).split(":", 1)[0].strip() for line in config.getini("markers")}
+    for level in sorted(LEVELS - registered):
         config.addinivalue_line("markers", f"{level}: vllm-gr {level.upper()} CI test level")
 
 

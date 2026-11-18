@@ -32,6 +32,7 @@ from vllm_gr.ops.npu import beam_ops
 
 assert beam_ops.is_available(), f"NPU Beam operators are required: {beam_ops.unavailable_reason()}"
 
+from tests.helpers.paths import REPO_ROOT  # noqa: E402
 from tests.st.test_onerec_v1_npu_e2e import (  # noqa: E402
     _BEGIN_TOKEN,
     _END_TOKEN,
@@ -399,9 +400,7 @@ def test_npu_dynamic_beam_full_model_eager_graph(tmp_path: Path) -> None:
         VLLM_ENABLE_PREFILL_CUDAGRAPH="0",
     )
     command = [sys.executable, "-m", "tests.st.test_npu_dynamic_beam_st", str(tmp_path)]
-    with subprocess.Popen(
-        command, cwd=Path(__file__).parents[2], env=env, start_new_session=True
-    ) as process:
+    with subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True) as process:
         try:
             assert process.wait(timeout=900) == 0, "NPU dynamic Beam E2E subprocess failed"
         finally:

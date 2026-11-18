@@ -23,12 +23,12 @@ pytest 数量包含参数化用例；独立服务测试脚本单独记录。
 人工重启服务后输出与新加载的服务一致。每组记录到 5 次 prefill 和 10 次 decode graph replay。
 静态 pre-commit 检查通过；本轮未重跑完整精度、性能及 HDFS 门禁。
 
-2026-11-10 异步 pause 响应修复：`tests/sidecar`、`tests/test_grpc_entry.py` 和
-`tests/test_gr_async_scheduler.py` 共 **473 项通过**，下表中的真实服务用例也通过。
+2026-11-10 异步 pause 响应修复：`tests/sidecar`、`tests/entrypoints/grpc/test_grpc_entry.py` 和
+`tests/v1/engine/test_gr_async_scheduler.py` 共 **473 项通过**，下表中的真实服务用例也通过。
 本轮只验证 HTTP 响应契约，不作为新增 compile/Graph 或性能门禁的验收。
 
 输出头识别修复：修改前原 `lm_head` 用例通过，`output`/别名的八种组合均复现旧缓存问题。
-改为按类型识别后，`tests/sidecar/test_worker_update.py` 和 `tests/test_sliced_logits.py`
+改为按类型识别后，`tests/sidecar/test_worker_update.py` 和 `tests/ops/test_sliced_logits.py`
 的 **75 项 CPU 用例通过**（`-k "not cuda"`，34 项未选择）。夹具使用关闭 TP 的原生
 `ParallelLMHead` 和原生逐层 reload API；未新增完整模型、Graph 或性能回归。
 
@@ -73,7 +73,7 @@ Sidecar 排空用例也再次通过。本次是定向回归，不代表重跑了
 | Trie：版本访问和过期释放 | 合法 + 非法 | 1. 默认访问最新表<br>2. 保留期内新旧表各自返回预期候选<br>3. API 调用触发过期旧表释放，无计时线程<br>4. 过期版本不可再访问<br>5. 同一版本号对应不同内容时拒绝更新。 | `test_management.py::test_versioned_table_lazy_expiry_and_default_access`; `test_expired_table_is_released_by_api_without_session_notifications`; `test_worker_update.py::test_reload_trie_switches_then_releases_old_table_on_expiry` |
 | 切片缓存：原生权重 reload | 合法 | 1. 原生 post-load 刷新切片权重<br>2. bias/无 bias、inference/普通模式四种组合各 reload 三次<br>3. 对齐后的 logits 正确<br>4. 缓存地址不变<br>5. 派生缓存不进入 checkpoint 参数树。 | `test_worker_update.py::test_head_refreshes_its_own_slice_during_native_weight_processing`; `test_sliced_cache_survives_native_layerwise_reload` (lm_head/output/alias × bias/no bias × inference/ordinary cache creation, three reloads each) |
 | 切片缓存：窗口切换 | 合法 | 1. 重复计算复用 proxy<br>2. 切换窗口后不重复注册 reload hook<br>3. reload 刷新当前窗口<br>4. 有/无 bias 两种情况均保持缓存地址。 | `test_worker_update.py::test_sliced_reload_hook_tracks_window_changes_without_rewrapping` (bias/no bias; 2 cases) |
-| prefix cache：排空后的清理 | 合法 | 1. 排空后允许强制清理 prefix cache<br>2. 尚未执行的排队 GR 请求保留。 | `tests/test_gr_async_scheduler.py::test_prefix_reset_after_drain_preserves_waiting_gr_sessions` |
+| prefix cache：排空后的清理 | 合法 | 1. 排空后允许强制清理 prefix cache<br>2. 尚未执行的排队 GR 请求保留。 | `tests/v1/engine/test_gr_async_scheduler.py::test_prefix_reset_after_drain_preserves_waiting_gr_sessions` |
 | reload 安全与人工恢复 | 非法状态 + 取消 | 1. 原生逐层加载器复现部分加载失败<br>2. 保留旧版本但标记权重无效<br>3. 拒绝 resume 和并发 reload<br>4. 新 Sidecar 在版本撤回后也不能恢复无效权重<br>5. running 时拒绝 checkpoint reload。 | `test_management.py::test_partial_native_reload_remains_invalid_after_sidecar_restart_and_withdrawal`; `test_reload_in_progress_rejects_resume_and_concurrent_reload`; `test_running_service_cannot_reload_checkpoint` |
 | tied LM-head 缓存刷新 | 合法 | 1. 原生加载器通过 embedding 或 head 加载<br>2. 连续三次更新切片及 GPU 转置缓存<br>3. 缓存地址和共享权重保持不变<br>4. 模型加载后仅注册一次钩子。 | `test_worker_update.py::test_tied_head_caches_follow_native_layerwise_reload` |
 
@@ -129,10 +129,10 @@ HDFS 脚本还要求 `--hdfs-root <writable-test-root>`。
 
 | 回归项 / 场景 | 对应测试集 / 命令 | 已记录结果及范围 |
 | --- | --- | --- |
-| Native/GR 调度、准入、派发与回执、取消、清理、pause 和 prefix cache 规则 | `tests/test_gr_async_scheduler.py` | 完整 CI 选择中通过，包含新增排队请求 reset 用例 |
-| 切片投影、裁剪与对齐、bias、TP/gather、量化回退和原生 dtype 行为 | `tests/test_sliced_logits.py`; `tests/sidecar/test_worker_update.py` | 完整 CI 选择中通过：89 项已有投影用例和 8 项 Worker 更新用例 |
+| Native/GR 调度、准入、派发与回执、取消、清理、pause 和 prefix cache 规则 | `tests/v1/engine/test_gr_async_scheduler.py` | 完整 CI 选择中通过，包含新增排队请求 reset 用例 |
+| 切片投影、裁剪与对齐、bias、TP/gather、量化回退和原生 dtype 行为 | `tests/ops/test_sliced_logits.py`; `tests/sidecar/test_worker_update.py` | 完整 CI 选择中通过：89 项已有投影用例和 8 项 Worker 更新用例 |
 | constraint 加载和发布、失败及退出清理、显存统计和投影窗口 | `tests/v1/worker/test_constraint_lifecycle.py` | 完整 CI 选择中通过，fixture 遵循 wrapper 契约 |
-| 真模型 V1/V2 对齐、completion batch、异步调度及离线/服务生命周期 | `tests/st/test_modelrunner_v2_stage_parity_st.py`; `tests/st/test_onerec_v1_scheduler_st.py`; `tests/test_offline_beam_search.py`; `tests/test_serving_beam_search.py` | 开启 slow tests 后通过；覆盖 eager/graph、自定义 batch、无约束生成、回退和实际 graph replay |
+| 真模型 V1/V2 对齐、completion batch、异步调度及离线/服务生命周期 | `tests/st/test_modelrunner_v2_stage_parity_st.py`; `tests/st/test_onerec_v1_scheduler_st.py`; `tests/entrypoints/gr/test_offline_beam_search.py`; `tests/entrypoints/openai/test_serving_beam_search.py` | 开启 slow tests 后通过；覆盖 eager/graph、自定义 batch、无约束生成、回退和实际 graph replay |
 | 已有 GPU 和模拟 NPU 生命周期 fixture 适配 VersionedConstraintTable | `tests/kernels/test_multi_trie_beam.py`; `tests/kernels/test_v2_multibatch_graphs.py`; `tests/v1/worker/test_npu_stage_projection_lifecycle.py` | 两个 GPU 文件 19 项通过；CPU 模拟 NPU 生命周期文件 11 项通过。仅修改测试构造或对象身份断言，不代表 NPU 硬件验证 |
 | 格式与静态检查：SPDX、isort、Ruff、typos、Markdown、workflow/shell 和 mypy 3.11/3.12/3.13 | `pre-commit run --all-files --show-diff-on-failure` | 全部适用静态 hook 通过；run-tests 单独执行。仓库外的本地配置选择系统 Node |
 | Python 3.11/3.12/3.13 × CPU/CUDA 的 wheel 构建和安装 | `tools/run_wheel_smoke_test.sh` | 本轮六种组合全部通过 |
