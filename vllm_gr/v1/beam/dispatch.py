@@ -42,7 +42,7 @@ def validate_dispatch_request(request: BeamBatchRequest, *, trie_count: int | No
         raise ValueError("trie_id is outside the loaded constraint table")
     if len(request.items) not in SUPPORTED_BEAM_BATCH_SIZES:
         raise ValueError(
-            "beam_search_v1 supports batch sizes "
+            "beam_search supports batch sizes "
             f"{SUPPORTED_BEAM_BATCH_SIZES}, got {len(request.items)}"
         )
     if request.items[0].request.request_id != request.batch_id:
@@ -55,11 +55,11 @@ def validate_dispatch_request(request: BeamBatchRequest, *, trie_count: int | No
             or native.prompt_token_ids is None
             or len(native.prompt_token_ids) == 0
         ):
-            raise ValueError("beam_search_v1 requires a nonempty token prompt")
+            raise ValueError("beam_search requires a nonempty token prompt")
         if native.mm_features or native.lora_request is not None:
-            raise ValueError("beam_search_v1 does not support multimodal inputs or LoRA")
+            raise ValueError("beam_search does not support multimodal inputs or LoRA")
         if params is None or params.ignore_eos is not True:
-            raise ValueError("beam_search_v1 requires ignore_eos=True")
+            raise ValueError("beam_search requires ignore_eos=True")
         if params.max_tokens != request.beam_params.max_tokens or params.n != 1:
             raise ValueError("native and Beam generation budgets must match and n must be 1")
     _validate_gr_generation_params(request.beam_params)
@@ -73,7 +73,7 @@ class GRStageKind(str, Enum):
 def _validate_gr_generation_params(params: BeamBatchParams) -> None:
     """Validate V1 generation semantics without constructing physical capacity."""
     if params.ignore_stop_tokens is not True:
-        raise ValueError("beam_search_v1 requires ignore_eos=True")
+        raise ValueError("beam_search requires ignore_eos=True")
     if params.catalog_strategy is not None:
         raise ValueError("Constraint Table does not support catalog_strategy")
     if (

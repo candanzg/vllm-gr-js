@@ -85,7 +85,7 @@ trap stop_server EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "Running offline GRLLM.beam_search_v1 batch performance"
+echo "Running offline GRLLM.beam_search batch performance"
 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
   python "$driver" offline "${args[@]}"
 

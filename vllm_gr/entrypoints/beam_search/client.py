@@ -14,12 +14,12 @@ from typing import Any
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_gr.entrypoints.beam_search_v1.exceptions import failure_exception
-from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
-from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+from vllm_gr.entrypoints.beam_search.exceptions import failure_exception
+from vllm_gr.entrypoints.beam_search.input_processor import BeamSearchInputProcessor
+from vllm_gr.entrypoints.beam_search.output_processor import (
     BeamSearchOutputProcessor,
 )
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.protocol import (
     BeamSearchSession,
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
@@ -326,7 +326,7 @@ class AsyncBeamSearchClient:
         tokenizer = self.serving.input_processor.tokenizer
         if tokenizer is None:
             raise VLLMValidationError(
-                "beam_search_v1 requires tokenizer initialization",
+                "beam_search requires tokenizer initialization",
                 parameter="skip_tokenizer_init",
                 value=True,
             )

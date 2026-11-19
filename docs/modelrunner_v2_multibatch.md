@@ -368,7 +368,7 @@ code zero; inference success alone does not establish clean shutdown.
 Use the Beam configuration and Constraint Table artifact described in the
 [asynchronous quickstart](onerec_v1_async_quickstart.md). Set
 `VLLM_USE_V2_MODEL_RUNNER=1` before importing vLLM, and submit the complete
-batch through `GRLLM.beam_search_v1()`. `beam_search_v1` uses the
+batch through `GRLLM.beam_search()`. `beam_search` uses the
 Beam protocol; it does not select ModelRunner V1.
 
 The default `gr.beam_batch_sizes` is `[1, 2, 4]`. With `[1, 3, 7]`, a single Beam completion can submit 3 or 7 prompts together, and CUDA plans Prefill and Decode graphs for the same sizes. Set `max_num_seqs` to at least 7 to use B=7.
@@ -411,7 +411,7 @@ state and actual CUDA replay check request order and storage reuse.
 | Captured model/storage binding; reload/shutdown cleanup opt-in | `tests/v1/worker/test_beam_decode_graph.py`, `tests/v1/worker/test_constraint_lifecycle.py` |
 | Prefill reload/shutdown invalidation, recapture with new model/output storage | `tests/v1/worker/test_gpu_prefill_graph_runner_v2.py`, `tests/kernels/test_prefill_graph_manager_v2.py` |
 | Existing public protocol, generation steps and scheduler integration | `tests/st/test_onerec_v1_scheduler_st.py`, `tests/st/test_modelrunner_v2_stage_parity_st.py` |
-| Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/entrypoints/gr/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1` |
+| Unconstrained B=1/4, V1/V2 Eager, default Graph and explicit FULL Prefill | `tests/entrypoints/gr/test_offline_beam_search.py::test_offline_unconstrained_beam_search` |
 | Real-model multi-batch execution and V1 baseline comparison | `tests/st/model_runner_policy_isolation.py` (manual CLI) |
 | Real video business accuracy and cross-B comparison | `tests/st/onerec_multibatch_accuracy.py` (manual CLI) |
 
@@ -459,7 +459,7 @@ configured `max_top_k` capacity. Run its six isolated engine configurations:
 ```bash
 CUDA_VISIBLE_DEVICES=0 USE_TF=0 \
 python -m pytest --run-slow -q \
-  tests/entrypoints/gr/test_offline_beam_search.py::test_offline_unconstrained_beam_search_v1
+  tests/entrypoints/gr/test_offline_beam_search.py::test_offline_unconstrained_beam_search
 ```
 
 The matrix covers V1/V2 with Eager, default Graph and an explicit FULL Prefill
@@ -503,7 +503,7 @@ cross-batch comparisons separately.
 
 The shared `tests/st/test_onerec_v1_scheduler_st.py` suite explicitly
 parameterizes ModelRunner V1 and V2. The V1 in its filename and public
-`beam_search_v1` API names denotes the GR protocol, not a runner override.
+`beam_search` API names denotes the GR protocol, not a runner override.
 Select `test_onerec_v1_completion_batch_online` with `-k v2` to exercise
 independent offline and real HTTP engines at B=1/2/4 and B=1/3/7.
 The paired engines use the same fixed KV capacity.

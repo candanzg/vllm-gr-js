@@ -4,7 +4,7 @@ This directory contains the Qwen benchmark runner, workload generator, shell
 entry point and usage guide. Model selection is configurable; Qwen3-0.6B
 is the verified example below.
 
-This benchmark runs the offline `GRLLM.beam_search_v1` API directly from a
+This benchmark runs the offline `GRLLM.beam_search` API directly from a
 vllm-gr checkout. It does not depend on gr-inference or an API server.
 
 ## Quick start
@@ -15,7 +15,7 @@ TOKEN_ID_START=1000 TOKEN_ID_END=2000 WORKLOAD_SEED=0 \
 CUDA_VISIBLE_DEVICES=0 \
 CONTEXT_LEN=128 BEAM_WIDTH=128 BEAM_STEPS=3 \
 REQUESTS=1 WARMUP_RUNS=1 REPEAT=5 \
-benchmarks/qwen/run_beam_search_v1_benchmark.sh
+benchmarks/qwen/run_beam_search_benchmark.sh
 ```
 
 The first invocation creates or reuses `.venv` and installs the current
@@ -26,7 +26,7 @@ prepared environment or `INSTALL_MODE=always` to reinstall it.
 first Beam result and two Decode stages produce the next two results.
 `DECODE_STEPS` is accepted by the shell wrapper as a compatibility alias.
 
-Results are written under `results/beam_search_v1/`, which is ignored by git.
+Results are written under `results/beam_search/`, which is ignored by git.
 The result JSON includes per-run wall latency, request latency, QPS, generated
 tokens/s, Beam candidates/s, output token IDs/scores, runtime versions, and
 the exact vllm-gr commit.
@@ -40,11 +40,11 @@ in Perfetto:
 MODEL=/path/to/Qwen3-0.6B \
 TOKEN_ID_START=1000 TOKEN_ID_END=2000 WORKLOAD_SEED=0 \
 REPEAT=5 TIMELINE=1 \
-benchmarks/qwen/run_beam_search_v1_benchmark.sh
+benchmarks/qwen/run_beam_search_benchmark.sh
 ```
 
 By default, `TIMELINE_REPEAT` follows `REPEAT`, so the trace above contains
-five complete `beam_search_v1` runs. The profile runs execute after ordinary
+five complete `beam_search` runs. The profile runs execute after ordinary
 measurement and are excluded from the reported latency/QPS samples. Useful
 optional settings are:
 
@@ -70,7 +70,7 @@ vllm-gr constraint tooling:
 MODEL=/path/to/model \
 TOKEN_ID_START=1000 TOKEN_ID_END=2000 \
 CONSTRAINT_TRIPLES=/path/to/constraint_triples.json \
-benchmarks/qwen/run_beam_search_v1_benchmark.sh
+benchmarks/qwen/run_beam_search_benchmark.sh
 ```
 
 When `CONSTRAINT_TRIPLES` is omitted, the benchmark creates a synthetic
@@ -94,7 +94,7 @@ multiple benchmark invocations:
   --context-len 128 \
   --requests 1 \
   --token-id-start 1000 --token-id-end 2000 --seed 0 \
-  --output-jsonl results/beam_search_v1/workload.jsonl
+  --output-jsonl results/beam_search/workload.jsonl
 ```
 
 Then pass that exact JSONL file to the benchmark:
@@ -102,8 +102,8 @@ Then pass that exact JSONL file to the benchmark:
 ```bash
 .venv/bin/python benchmarks/qwen/benchmark_v1.py \
   --model /path/to/Qwen3-0.6B \
-  --output-json results/beam_search_v1/manual.json \
-  --workload-jsonl results/beam_search_v1/workload.jsonl \
+  --output-json results/beam_search/manual.json \
+  --workload-jsonl results/beam_search/workload.jsonl \
   --token-id-start 1000 --token-id-end 2000 \
   --context-len 128 \
   --beam-width 128 \

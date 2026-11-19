@@ -413,7 +413,7 @@ def validate_beam_engine_driven(value: object) -> bool | None:
     if not value:
         raise ValueError(
             "beam_engine_driven=False is retired: the frontend step loop was removed; "
-            "omit this option and use beam_search_v1()"
+            "omit this option and use beam_search()"
         )
     warnings.warn(
         "beam_engine_driven=True is retired and ignored; Beam V1 owns scheduling. "

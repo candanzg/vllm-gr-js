@@ -241,7 +241,7 @@ def execute_beam_batch(
     llm: Any, args: argparse.Namespace, prompts: list[Any], params: Any
 ) -> list[Any]:
     if not getattr(args, "cot", False):
-        return cast(list[Any], llm.beam_search_v1(prompts, params, output_mode="full"))
+        return cast(list[Any], llm.beam_search(prompts, params, output_mode="full"))
 
     from vllm import SamplingParams
 
@@ -318,7 +318,7 @@ def execute_beam_batch(
             }
         )
     started = perf_counter()
-    outputs: list[Any] = llm.beam_search_v1(beam_prompts, params, output_mode="full")
+    outputs: list[Any] = llm.beam_search(beam_prompts, params, output_mode="full")
     if len(outputs) != len(prompts):
         raise RuntimeError("Beam returned a different request count after CoT")
     args.cot_last_report = {
@@ -374,7 +374,7 @@ def benchmark_beam_search(
         "warmup_runs": args.warmup_runs,
         "repeat": args.repeat,
         "prefix_caching": "enabled; isolated salt per row and run (cold Prefill)",
-        "timing_scope": "beam_search_v1 API call until output objects return; excludes engine startup, "
+        "timing_scope": "beam_search API call until output objects return; excludes engine startup, "
         "warmup, pre-call prompt preparation and post-call result inspection/printing",
         "batch_latency_ms": {
             "mean": mean(latencies_ms),
@@ -402,7 +402,7 @@ def benchmark_beam_search(
             cot_input_tokens=len(prompts[0]["prompt_token_ids"]),
             cot_max_tokens=args.cot_max_tokens,
             cot_on_limit=args.cot_on_limit,
-            timing_scope="CoT generation, token handoff and beam_search_v1 until outputs return; "
+            timing_scope="CoT generation, token handoff and beam_search until outputs return; "
             "excludes startup, warmup and printing",
         )
     return outputs, report
@@ -476,7 +476,7 @@ def make_prompt(tokenizer: Any, path: Path | None, input_len: int | None) -> lis
     if input_len is None:
         return [int(token) for token in source]
 
-    # input_len includes the begin token appended by beam_search_v1.
+    # input_len includes the begin token appended by beam_search.
     submitted_len = input_len - 1
     if submitted_len <= 0:
         raise ValueError("--input-len must be at least 2")

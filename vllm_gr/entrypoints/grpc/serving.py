@@ -16,8 +16,8 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_gr.config import GRConfig
 from vllm_gr.config.models import configured_candidate_width
-from vllm_gr.entrypoints.beam_search_v1.client import AsyncBeamSearchClient
-from vllm_gr.entrypoints.beam_search_v1.input_processor import (
+from vllm_gr.entrypoints.beam_search.client import AsyncBeamSearchClient
+from vllm_gr.entrypoints.beam_search.input_processor import (
     apply_beam_request_defaults,
 )
 from vllm_gr.sampling_params import BeamSearchParams
@@ -31,7 +31,7 @@ from vllm_gr.v1.beam.batch_contracts import (
     BeamOutputOptions,
     BeamSequenceColumns,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.engine.beam_search import (
     validate_gr_generation_budget,
     validate_gr_request,
 )

@@ -131,12 +131,12 @@ def test_synthetic_constraint_document_has_one_path_per_beam(
     assert len(set(flattened)) == 12
 
 
-def test_run_once_calls_beam_search_v1_and_reports_metrics() -> None:
+def test_run_once_calls_beam_search_and_reports_metrics() -> None:
     class FakeLLM:
         def __init__(self) -> None:
             self.calls: list[tuple[list[dict[str, list[int]]], object, dict[str, Any]]] = []
 
-        def beam_search_v1(
+        def beam_search(
             self, prompts: list[dict[str, list[int]]], params: object, **kwargs: Any
         ) -> list[SimpleNamespace]:
             self.calls.append((prompts, params, kwargs))
@@ -242,7 +242,7 @@ def test_timeline_profiles_repeat_runs_and_moves_gzip_trace(tmp_path: Path) -> N
             with gzip.open(path, "wt", encoding="utf-8") as output:
                 json.dump({"traceEvents": [{"name": "prepare_decode"}]}, output)
 
-        def beam_search_v1(
+        def beam_search(
             self, prompts: list[dict[str, list[int]]], params: object, **kwargs: Any
         ) -> list[SimpleNamespace]:
             prompt = prompts[0]["prompt_token_ids"]
@@ -424,9 +424,7 @@ def test_report_input_lengths_come_from_consumed_jsonl_rows(
         def __exit__(self, *exc: object) -> None:
             pass
 
-        def beam_search_v1(
-            self, prompts: list[dict[str, list[int]]], *_: Any, **kw: Any
-        ) -> list[Any]:
+        def beam_search(self, prompts: list[dict[str, list[int]]], *_: Any, **kw: Any) -> list[Any]:
             ids = prompts[0]["prompt_token_ids"]
             inputs.append(len(ids))
             beam = SimpleNamespace(tokens=[*ids, 101, 102, 103], cum_logprob=-1.0)

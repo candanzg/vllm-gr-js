@@ -54,11 +54,11 @@ def test_probe_separates_capture_policy_from_backend_capacity(
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("length,steps", _SESSIONS)  # type: ignore[misc]
 def test_v2_parity_sessions_pass_constrained_request_validation(length: int, steps: int) -> None:
-    from tests.entrypoints.beam_search_v1.test_beam_search_v1_input_processor import (
+    from tests.entrypoints.beam_search.test_beam_search_input_processor import (
         _make_engine,
     )
     from tests.st.test_onerec_v1_scheduler_st import _params
-    from vllm_gr.entrypoints.beam_search_v1.input_processor import (
+    from vllm_gr.entrypoints.beam_search.input_processor import (
         _create_request_params,
     )
 

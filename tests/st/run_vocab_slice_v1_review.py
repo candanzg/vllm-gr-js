@@ -39,11 +39,11 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     from benchmarks.open_one_rec.open_one_rec_dataset import OneRecDataset
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
+    from examples.offline_inference.beam_search.offline_beam_search import (
         build_artifact,
     )
     from tools.AB_Tests.run_offline_benchmark import distribution_ms
-    from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+    from vllm_gr.entrypoints.beam_search.output_processor import (
         BeamSearchOutputProcessor,
     )
     from vllm_gr.entrypoints.gr import GRLLM
@@ -105,7 +105,7 @@ def main() -> None:
     def request(llm: Any, index: int) -> dict[str, Any]:
         assert llm.reset_prefix_cache()
         start = time.perf_counter_ns()
-        outputs = llm.beam_search_v1([{"prompt": prompts[index]}], params, output_mode="full")
+        outputs = llm.beam_search([{"prompt": prompts[index]}], params, output_mode="full")
         for s in outputs[0].sequences:
             _ = s.text
         elapsed = (time.perf_counter_ns() - start) / 1e6

@@ -266,7 +266,7 @@ def create_engine_config(self, usage_context=None, headless=False):
         and effective_gr_config.beam_max_width is not None
         and _is_npu_platform()
     ):
-        from vllm_gr.v1.engine.beam_search_v1 import validate_npu_unconstrained_runner
+        from vllm_gr.v1.engine.beam_search import validate_npu_unconstrained_runner
 
         validate_npu_unconstrained_runner(config)
 
@@ -290,7 +290,7 @@ def create_engine_config(self, usage_context=None, headless=False):
 
             attention_config.backend = AttentionBackendEnum.CUSTOM
     if effective_gr_config.beam_max_width is not None:
-        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_execution_config
+        from vllm_gr.v1.engine.beam_search import validate_gr_execution_config
 
         validate_gr_execution_config(config)
         compilation = getattr(config, "compilation_config", None)

@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from examples.offline_inference.beam_search import offline_beam_search_v1 as example
+from examples.offline_inference.beam_search import offline_beam_search as example
 from tests.helpers.paths import TESTS_DIR
 
 
@@ -85,7 +85,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch, completions: list[list[int]]) -> An
         return [SimpleNamespace(sequences=[]) for _ in prompts]
 
     state.llm = SimpleNamespace(
-        generate=generate, beam_search_v1=beam, get_tokenizer=lambda: state.tokenizer
+        generate=generate, beam_search=beam, get_tokenizer=lambda: state.tokenizer
     )
     return state
 
@@ -181,7 +181,7 @@ def test_missing_beam_results_are_not_reported_as_a_complete_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = runtime(monkeypatch, [[300, 11]] * 4)
-    state.llm.beam_search_v1 = lambda *args, **kwargs: []
+    state.llm.beam_search = lambda *args, **kwargs: []
     with pytest.raises(RuntimeError, match="Beam returned a different request count"):
         example.execute_beam_batch(state.llm, args(), [{"prompt_token_ids": [100]}] * 4, object())
 
@@ -554,7 +554,7 @@ def test_cot_benchmark_repeats_both_stages(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "CoT generation" in report["timing_scope"]
 
 
-@pytest.mark.parametrize("failed_stage", ["generate", "beam_search_v1"])  # type: ignore[misc]
+@pytest.mark.parametrize("failed_stage", ["generate", "beam_search"])  # type: ignore[misc]
 def test_profile_stops_after_either_stage_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failed_stage: str
 ) -> None:

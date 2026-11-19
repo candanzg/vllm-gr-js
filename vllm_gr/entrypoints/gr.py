@@ -6,7 +6,7 @@
 import gc
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Union, cast, overload
 
 from vllm.entrypoints.generate.beam_search.utils import (
     BeamSearchOutput,
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import BeamSearchParams
 
-    from vllm_gr.entrypoints.beam_search_v1.protocol import BeamSearchFrontend
+    from vllm_gr.entrypoints.beam_search.protocol import BeamSearchFrontend
     from vllm_gr.outputs import CompactBeamSearchOutput
 
 logger = init_logger(__name__)
@@ -69,7 +69,7 @@ def _install_renderer_eos_token_id_cache() -> None:
 
 
 class GRLLM(LLM):
-    """LLM subclass exposing persistent Beam Search through beam_search_v1."""
+    """LLM subclass exposing persistent Beam Search through beam_search."""
 
     def __init__(
         self,
@@ -85,7 +85,7 @@ class GRLLM(LLM):
 
         # Apply the vllm-gr ModelRunner policy before LLM.__init__ constructs
         # VllmConfig. This keeps V1 as the default and preserves an explicit
-        # V2 opt-in for the adapted beam_search_v1 path.
+        # V2 opt-in for the adapted beam_search path.
         from vllm_gr._env_check import configure_model_runner_default
 
         configure_model_runner_default()
@@ -138,7 +138,7 @@ class GRLLM(LLM):
             self._frontend_gc_registered = True
 
     @overload
-    def beam_search_v1(
+    def beam_search(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
         params: "BeamSearchParams",
@@ -147,11 +147,11 @@ class GRLLM(LLM):
         concurrency_limit: int | None = None,
         trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
-        output_mode: Literal["full"],
+        output_mode: Literal["full"] = "full",
     ) -> list["BeamSearchOutput"]: ...
 
     @overload
-    def beam_search_v1(
+    def beam_search(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
         params: "BeamSearchParams",
@@ -160,10 +160,10 @@ class GRLLM(LLM):
         concurrency_limit: int | None = None,
         trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
-        output_mode: Literal["compact"] = "compact",
+        output_mode: Literal["compact"],
     ) -> list["CompactBeamSearchOutput"]: ...
 
-    def beam_search_v1(
+    def beam_search(
         self,
         prompts: list[Union["TokensPrompt", "TextPrompt"]],
         params: "BeamSearchParams",
@@ -172,21 +172,23 @@ class GRLLM(LLM):
         concurrency_limit: int | None = None,
         trie_ids: list[int] | tuple[int, ...] | None = None,
         *,
-        output_mode: Literal["full", "compact"] = "compact",
+        output_mode: Literal["full", "compact"] = "full",
     ) -> list["BeamSearchOutput"] | list["CompactBeamSearchOutput"]:
-        """Run persistent Beam Search with eager generated-only output by default.
+        """Run persistent Beam Search, keeping upstream ``full`` output by default.
 
-        Explicit ``full`` preserves native lazy BeamSearchOutput objects. ``compact``
-        returns short token IDs, cumulative scores and stop metadata, with the
-        accepted original prompt stored once per request. It never constructs
-        full prompt-plus-tail tokens or text; callers decode the tail if needed.
-        Search, ranking and configured begin/end/stop boundaries are identical.
+        Omitting ``output_mode`` preserves the upstream vLLM contract: callers
+        receive native ``BeamSearchOutput`` objects whose sequences expose text
+        and prompt-plus-tail tokens. Explicit ``compact`` returns short token
+        IDs, cumulative scores and stop metadata, with the accepted original
+        prompt stored once per request. It never constructs full prompt-plus-tail
+        tokens or text; callers decode the tail if needed. Search, ranking and
+        configured begin/end/stop boundaries are identical.
         """
         from vllm_gr.config.execution import require_beam_config
 
         require_beam_config(getattr(self.llm_engine, "vllm_config", None))
-        from vllm_gr.entrypoints.beam_search_v1 import run_beam_search_v1
-        from vllm_gr.entrypoints.beam_search_v1.protocol import OfflineBeamSearchRequest
+        from vllm_gr.entrypoints.beam_search import run_beam_search
+        from vllm_gr.entrypoints.beam_search.protocol import OfflineBeamSearchRequest
 
         call = OfflineBeamSearchRequest(
             prompts=prompts,
@@ -199,24 +201,16 @@ class GRLLM(LLM):
         )
         return cast(
             list["BeamSearchOutput"] | list["CompactBeamSearchOutput"],
-            run_beam_search_v1(self._create_beam_search_v1_client(), call),
+            run_beam_search(self._create_beam_search_client(), call),
         )
 
-    def _create_beam_search_v1_client(self) -> "BeamSearchFrontend":
+    def _create_beam_search_client(self) -> "BeamSearchFrontend":
         """Create the offline A2 request/session adapter."""
-        from vllm_gr.entrypoints.beam_search_v1.client import (
+        from vllm_gr.entrypoints.beam_search.client import (
             BeamSearchClient,
         )
 
         return BeamSearchClient(self)
-
-    def beam_search(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject the retired API instead of inheriting vLLM's implementation."""
-        raise NotImplementedError(
-            "GRLLM.beam_search() has been removed. Use beam_search_v1() with "
-            "gr.beam_width and gr.constraint_table. "
-            "Legacy arguments and stopping rules are not translated automatically."
-        )
 
     def shutdown(self) -> None:
         if self._shutdown_complete:

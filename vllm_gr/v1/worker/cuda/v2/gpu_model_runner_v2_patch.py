@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""ModelRunner V2 GPU wrappers for beam_search_v1 (persistent GR stage path).
+"""ModelRunner V2 GPU wrappers for beam_search (persistent GR stage path).
 
 The V2 runner (``vllm.v1.worker.gpu.model_runner.GPUModelRunner``) replaces the
 V1 ``_prepare_inputs``/``_bookkeeping_sync``/``_sample`` trio with
 ``prepare_inputs``/``sample``/``sample_tokens`` and a mutable ``InputBatch``
-dataclass.  Under V2 the beam surface is the beam_search_v1 persistent GR
+dataclass.  Under V2 the beam surface is the beam_search persistent GR
 stage path; the LEGACY ``beam_data`` frame stack has
 been removed, so this module installs only the slim hook set:
 
@@ -100,7 +100,7 @@ def discover_worker_runners() -> tuple[tuple[str, type[Any]], ...]:
 def make_patched_execute_model_v2(
     _orig_execute_model: Callable[..., Any],
 ) -> Callable[..., Any]:
-    """Slim execute_model wrapper for the V2 ModelRunner (beam_search_v1 only).
+    """Slim execute_model wrapper for the V2 ModelRunner (beam_search only).
 
     Refactor design §4.2: under V2 the beam surface is the persistent GR
     stage path; the LEGACY ``beam_data`` frame stack (M1 remap / M2 inline
@@ -172,7 +172,7 @@ def make_patched_sample_tokens_v2(
 
     @wraps(_orig_sample_tokens)
     def patched_sample_tokens(self: Any, grammar_output: Any, *args: Any, **kwargs: Any) -> Any:
-        # Persistent GR stage execution (beam_search_v1 contract): the stage
+        # Persistent GR stage execution (beam_search contract): the stage
         # runner produced the dispatch's outputs on the compute stream and
         # owns the async D2H; bypass the native sampler entirely (V1 parity
         # with make_patched_sample_tokens_gpu).
@@ -286,7 +286,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
     @wraps(_orig_capture_model)
     def patched_capture_model(self: Any, *args: Any, **kwargs: Any) -> Any:
         profile_only = kwargs.get("profile_only", False)
-        # The Engine admits only beam_search_v1 for V2 Beam engines. The
+        # The Engine admits only beam_search for V2 Beam engines. The
         # execution layer checks whether Beam is enabled, not its protocol.
         if _get_gr_config(self).beam_max_width is not None:
             from vllm_gr.v1.worker.cuda.v2.gpu_prefill_graph_runner_v2 import (

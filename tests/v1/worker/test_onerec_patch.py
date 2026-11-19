@@ -639,7 +639,7 @@ class TestPatchTriggerContractWithStubVllm(unittest.TestCase):
             warmup_requests=2,
             constraint_triples="triples.json",
             output_json="result.json",
-            beam_search_v1=False,
+            beam_search=False,
         )
         transformers = sys.modules["transformers"]
         with (

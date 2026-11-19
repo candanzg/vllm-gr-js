@@ -56,10 +56,10 @@ def send_gr_rejection(engine: Any, engine_request: Any, message: str) -> None:
 def _handle_submit_gr_session(self, batch_request) -> None:
     """Keep a caller-formed batch atomic across the input-thread boundary."""
     if not batch_request.items:
-        logger.error("Rejecting an empty beam_search_v1 batch")
+        logger.error("Rejecting an empty beam_search batch")
         return
     try:
-        from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+        from vllm_gr.v1.engine.beam_search import validate_gr_request
 
         validate_gr_request(
             batch_request,
@@ -87,11 +87,11 @@ def _handle_submit_gr_session(self, batch_request) -> None:
 def _admit_gr_session(self, batch_request) -> None:
     """Preprocess and admit one complete GR session on the core thread."""
     if not batch_request.items:
-        logger.error("Rejecting an empty beam_search_v1 batch")
+        logger.error("Rejecting an empty beam_search batch")
         return
     engine_requests = tuple(item.request for item in batch_request.items)
     try:
-        from vllm_gr.v1.engine.beam_search_v1 import (
+        from vllm_gr.v1.engine.beam_search import (
             GRDeviceRequestError,
             validate_gr_device_config,
             validate_gr_execution_config,
@@ -124,7 +124,7 @@ def _admit_gr_session(self, batch_request) -> None:
         else:
             validate_gr_device_config(self.vllm_config)
         if self.batch_queue is None or self.batch_queue_size < 2:
-            raise RuntimeError("beam_search_v1 requires a non-blocking EngineCore batch queue")
+            raise RuntimeError("beam_search requires a non-blocking EngineCore batch queue")
         preprocessed_batch = []
         for engine_request in engine_requests:
             owned_request = copy(engine_request)

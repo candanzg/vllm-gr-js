@@ -142,7 +142,7 @@ def batch_ranges(count, batch_size, supported_sizes=(1, 2, 4)):
 
 def infer_batch(llm, tokenizer, token_rows, params, diagnostics=None):
     """Submit one native batch and decode only generated SID tokens."""
-    outputs = llm.beam_search_v1(
+    outputs = llm.beam_search(
         [{"prompt_token_ids": row} for row in token_rows], params, output_mode="full"
     )
     if len(outputs) != len(token_rows):
@@ -401,7 +401,7 @@ def main():
         print("Data, prompt lengths and batch plan validated; no GPU inference started.")
         return
 
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
+    from examples.offline_inference.beam_search.offline_beam_search import (
         build_artifact,
     )
     from vllm_gr.entrypoints.gr import GRLLM
@@ -529,7 +529,7 @@ def main():
                     source_sha256=sha256_file(item["parquet"]),
                     interactive_tailcut_count=item["tailcut_count"],
                     batch_counts=item["histogram"],
-                    api="GRLLM.beam_search_v1",
+                    api="GRLLM.beam_search",
                     commit=subprocess.check_output(
                         ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
                     ).strip(),

@@ -181,7 +181,7 @@ python tools/build_constraint_triples.py \
     --begin '<|sid_begin|>' \
     --end '<|sid_end|>'
 
-python examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python examples/offline_inference/beam_search/offline_beam_search.py \
     --model "$PANGU_SID_MODEL_PATH" \
     --catalog artifacts/pangu-public-sid/constraint_triples.json \
     --prompt artifacts/pangu-public-sid/prompt.txt \

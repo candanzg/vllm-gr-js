@@ -19,10 +19,10 @@ from vllm_gr.entrypoints.gr import GRLLM
 from vllm_gr.sampling_params import BeamSearchParams
 
 if not torch.cuda.is_available():
-    pytest.skip("beam_search_v1 requires CUDA", allow_module_level=True)
+    pytest.skip("beam_search requires CUDA", allow_module_level=True)
 
 
-def _run_offline_beam_search_v1(
+def _run_offline_beam_search(
     loops: int,
     model: str,
     config: dict[str, Any],
@@ -100,7 +100,7 @@ def _run_offline_beam_search_v1(
                 ]
                 if evidence is not None:
                     before = len(llm.collective_rpc("onerec_v1_st_events")[0])
-                outputs = llm.beam_search_v1(
+                outputs = llm.beam_search(
                     [{"prompt_token_ids": ids} for ids in prompt_ids], params, output_mode="full"
                 )
                 assert len(outputs) == batch_size
@@ -182,7 +182,7 @@ def _run_offline_beam_search_v1(
     print(f"Elapsed mean per B=1/B=4 pair: {(end - start) / max(1, loops):.4f}s")
 
 
-def _run_offline_gr_beam_search_v1_target(loops: int) -> None:
+def _run_offline_gr_beam_search_target(loops: int) -> None:
     from tests.st.test_onerec_v1_scheduler_st import _inputs
 
     # The memory-delta check below needs two engine lifecycles in one process.
@@ -192,8 +192,8 @@ def _run_offline_gr_beam_search_v1_target(loops: int) -> None:
         model, _, config, source, newline, _ = _inputs(work_dir)
         before_gpu = torch.accelerator.memory_allocated()
         before_host = psutil.Process().memory_info().rss
-        _run_offline_beam_search_v1(loops, model, config, source, newline)
-        _run_offline_beam_search_v1(loops, model, config, source, newline)
+        _run_offline_beam_search(loops, model, config, source, newline)
+        _run_offline_beam_search(loops, model, config, source, newline)
         torch.accelerator.synchronize()
         after_gpu = torch.accelerator.memory_allocated()
         after_host = psutil.Process().memory_info().rss
@@ -225,11 +225,11 @@ def _run_offline_gr_beam_search_v1_target(loops: int) -> None:
 
 @pytest.mark.slow  # type: ignore
 @pytest.mark.timeout(600)  # spawn subprocess compiles + loads engine twice
-def test_offline_gr_beam_search_v1(loops: int, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_offline_gr_beam_search(loops: int, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(
-        target=_run_offline_gr_beam_search_v1_target,
+        target=_run_offline_gr_beam_search_target,
         args=(loops,),
     )
     p.start()
@@ -245,7 +245,7 @@ def _run_unconstrained_target(work_dir: Path, full_prefill: bool = False) -> Non
     config["constraint_mode"] = "none"
     if full_prefill and os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "0":
         config["prefill_token_buckets"] = [1024, 4224]
-    _run_offline_beam_search_v1(
+    _run_offline_beam_search(
         1,
         model,
         config,
@@ -264,7 +264,7 @@ def _run_unconstrained_target(work_dir: Path, full_prefill: bool = False) -> Non
     [(True, False), (False, False), (False, True)],
     ids=["eager", "graph", "full-graph"],
 )
-def test_offline_unconstrained_beam_search_v1(
+def test_offline_unconstrained_beam_search(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str, eager: bool, full_prefill: bool
 ) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(runner == "v2")))

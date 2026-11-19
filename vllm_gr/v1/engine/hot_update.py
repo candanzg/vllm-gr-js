@@ -85,7 +85,7 @@ def _reload_trie(core: Any, path: str, version: str) -> dict[str, Any]:
     _validate_target(path, version)
     config = GRConfig.from_vllm_config(core.vllm_config)
     if config.beam_max_width is None:
-        raise ValueError("Online Trie reload requires beam_search_v1 execution")
+        raise ValueError("Online Trie reload requires beam_search execution")
     table = config.constraint_table
     if table is None or not table.enabled:
         raise ValueError("Online Trie reload requires an enabled canonical constraint table")

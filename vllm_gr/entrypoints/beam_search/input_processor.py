@@ -16,15 +16,15 @@ from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.config import GRConfig, resolve_candidate_width
 from vllm_gr.config.models import ConstraintTableBackendEnum, configured_candidate_width
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
+from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
-from vllm_gr.entrypoints.beam_search_v1.request_params import (
+from vllm_gr.entrypoints.beam_search.request_params import (
     apply_beam_request_defaults,
 )
-from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
+from vllm_gr.entrypoints.beam_search.token_utils import boundary_token_id
 from vllm_gr.v1.beam.batch_contracts import (
     BEAM_BATCH_PROTOCOL_VERSION,
     DEFAULT_CONSTRAINT_RESOURCE_ID,
@@ -61,7 +61,7 @@ def _resolve_candidate_width(vllm_config: Any, params: Any) -> int:
 
     config = GRConfig.from_vllm_config(vllm_config)
     if config.beam_max_width is None:
-        raise BeamSearchRequestError("beam_search_v1 requires beam.max_width to be configured")
+        raise BeamSearchRequestError("beam_search requires beam.max_width to be configured")
     candidate_width = resolve_candidate_width(config)
     max_logprobs = _effective_max_logprobs(vllm_config)
     if max_logprobs is not None and candidate_width > max_logprobs:
@@ -114,7 +114,7 @@ def _create_request_params(
     vllm_config: Any,
 ) -> tuple[SamplingParams, int | None, int | None]:
     if params.ignore_eos is not True:
-        raise BeamSearchRequestError("beam_search_v1 requires ignore_eos=True")
+        raise BeamSearchRequestError("beam_search requires ignore_eos=True")
     begin_token_id = _get_token_id(tokenizer, getattr(params, "begin_token", None), "begin_token")
     end_token_id = _get_token_id(tokenizer, getattr(params, "end_token", None), "end_token")
     reserved_tokens = int(begin_token_id is not None) + int(end_token_id is not None)
@@ -123,7 +123,7 @@ def _create_request_params(
         raise BeamSearchRequestError(
             "max_tokens must leave at least one Decode step after begin/end tokens"
         )
-    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_generation_budget
+    from vllm_gr.v1.engine.beam_search import validate_gr_generation_budget
 
     try:
         validate_gr_generation_budget(GRConfig.from_vllm_config(vllm_config), decode_steps)
@@ -153,7 +153,7 @@ def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> l
     # Mixed inputs also carry token IDs. Reject embeddings before changing IDs
     # so their per-position mask and embedding rows cannot become misaligned.
     if request.prompt_embeds is not None or request.prompt_token_ids is None:
-        raise BeamSearchRequestError("embedding prompts are not supported by beam_search_v1")
+        raise BeamSearchRequestError("embedding prompts are not supported by beam_search")
     original = request.prompt_token_ids
     if begin_token_id is None:
         # The batch contract normalizes the sequence exactly once; copying it
@@ -168,7 +168,7 @@ def _prepare_prompt(request: EngineCoreRequest, begin_token_id: int | None) -> l
 
 
 def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import (
+    from vllm_gr.v1.engine.beam_search import (
         validate_gr_device_config,
         validate_gr_execution_config,
         validate_gr_request,
@@ -190,7 +190,7 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     device = getattr(getattr(vllm_config, "device_config", None), "device", "cuda")
     device_type = str(device).split(":")[0]
     if unconstrained and device_type not in ("cuda", "npu"):
-        raise BeamSearchRequestError("unconstrained beam_search_v1 requires CUDA or NPU")
+        raise BeamSearchRequestError("unconstrained beam_search requires CUDA or NPU")
     required_backend = (
         ConstraintTableBackendEnum.NPU if device_type == "npu" else ConstraintTableBackendEnum.CUDA
     )
@@ -198,7 +198,7 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         table is None or not table.enabled or table.backend is not required_backend
     ):
         raise BeamSearchRequestError(
-            "beam_search_v1 requires an enabled canonical "
+            "beam_search requires an enabled canonical "
             f"{required_backend.value.upper()} constraint table"
         )
     if not unconstrained and request.beam_params.catalog_strategy is not None:
@@ -207,9 +207,7 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
         )
     max_width = gr_config.beam_max_width
     if max_width is None:
-        raise BeamSearchRequestError(
-            "beam_search_v1 requires vllm-gr beam_max_width to be configured"
-        )
+        raise BeamSearchRequestError("beam_search requires vllm-gr beam_max_width to be configured")
     if request.beam_params.beam_width != max_width:
         raise BeamSearchRequestError(
             f"Asynchronous scheduling beam_width must equal the fixed runtime width {max_width}"
@@ -231,7 +229,7 @@ def _validate_request(request: BeamBatchRequest, vllm_config: Any) -> None:
     for item in request.items:
         prompt_tokens = item.request.prompt_token_ids
         if prompt_tokens is None:
-            raise BeamSearchRequestError("embedding prompts are not supported by beam_search_v1")
+            raise BeamSearchRequestError("embedding prompts are not supported by beam_search")
         prompt_lengths.append(len(prompt_tokens))
         total_length = len(prompt_tokens) + request.beam_params.max_tokens
         if total_length > model_config.max_model_len:
@@ -273,7 +271,7 @@ def _create_batch_request(
     engine_request = engine_requests[0]
     sampling_params = engine_request.sampling_params
     if sampling_params is None or sampling_params.max_tokens is None:
-        raise BeamSearchRequestError("beam_search_v1 requires sampling parameters with max_tokens")
+        raise BeamSearchRequestError("beam_search requires sampling parameters with max_tokens")
     dynamic_widths = getattr(params, "dynamic_beam_widths", None)
     per_parent_beam_widths = getattr(params, "per_parent_beam_widths", None)
     result_width = getattr(params, "result_width", None)
@@ -282,7 +280,7 @@ def _create_batch_request(
         dynamic_widths is not None or result_width is not None
     ):
         raise BeamSearchRequestError(
-            "dynamic_beam_widths and result_width require CUDA or NPU beam_search_v1"
+            "dynamic_beam_widths and result_width require CUDA or NPU beam_search"
         )
     if dynamic_widths is not None and (
         not isinstance(dynamic_widths, list)
@@ -360,7 +358,7 @@ class BeamSearchInputProcessor:
 
     def process_offline_inputs(self, llm: Any, call: OfflineBeamSearchRequest) -> BeamBatchRequest:
         if not call.prompts:
-            raise BeamSearchRequestError("beam_search_v1 requires at least one prompt")
+            raise BeamSearchRequestError("beam_search requires at least one prompt")
         if call.concurrency_limit is not None and call.concurrency_limit <= 0:
             raise BeamSearchRequestError("concurrency_limit must be positive or None")
         tokenizer = llm.get_tokenizer()
@@ -408,12 +406,12 @@ class BeamSearchInputProcessor:
         tokenizer = serving.input_processor.tokenizer
         if tokenizer is None:
             raise VLLMValidationError(
-                "beam_search_v1 requires tokenizer initialization",
+                "beam_search requires tokenizer initialization",
                 parameter="skip_tokenizer_init",
                 value=True,
             )
         if not call.prompts:
-            raise VLLMValidationError("beam_search_v1 requires at least one prompt")
+            raise VLLMValidationError("beam_search requires at least one prompt")
         params = apply_beam_request_defaults(self.engine.vllm_config, call.params)
         sampling_params, begin_token_id, end_token_id = _create_request_params(
             params, tokenizer, vllm_config=self.engine.vllm_config

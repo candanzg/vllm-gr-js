@@ -225,7 +225,7 @@ def run(args: argparse.Namespace) -> None:
         return value
 
     def generate(ids_list: list[list[int]], steps: int) -> list[list[dict[str, Any]]]:
-        outputs = llm.beam_search_v1(
+        outputs = llm.beam_search(
             [{"prompt_token_ids": ids} for ids in ids_list],
             _params(steps),
             use_tqdm=False,

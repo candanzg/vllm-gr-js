@@ -22,7 +22,7 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageKind,
     GRStageMetadata,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.engine.beam_search import (
     validate_gr_device_config,
     validate_gr_execution_runtime,
 )

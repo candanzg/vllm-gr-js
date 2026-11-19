@@ -166,12 +166,12 @@ installers run or their ordering.
 
 - Scope: `core`; backend ID: `null`
 
-Upstream `beam_search` calls route exclusively to `beam_search_v1`; startup
+Upstream `beam_search` calls route exclusively to the GR implementation; startup
 requires `gr.beam_width`. There is no native Beam fallback. Ordinary sampling
 requests continue through their existing non-Beam entry points.
 
 - Targets:
-    - `GenerateBaseServing.beam_search` and `beam_search_v1`
+    - `GenerateBaseServing.beam_search`
     - `ChatCompletionRequest.to_beam_search_params` and `CompletionRequest.to_beam_search_params`
 - Mutation: existing method replacement
 - Process role: API server

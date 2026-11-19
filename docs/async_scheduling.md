@@ -24,10 +24,9 @@ For a runnable OneRec-1.7B setup before reading this execution contract, see
   native asynchronous scheduling and disable Chunked Prefill. Prefix Cache hits
   and misses are supported. Use `ignore_eos=True` for the Python V1 API.
 
-Public offline and online `beam_search_v1()` return complete sequences and
+Public offline and online `beam_search()` return complete sequences and
 cumulative scores only after matching resource-release confirmation.
-`GRLLM.beam_search()` raises a migration error; the legacy frontend step loop
-is retired.
+The legacy frontend step loop is retired.
 
 ## Native progress and execution ownership
 

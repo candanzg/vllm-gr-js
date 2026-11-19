@@ -21,9 +21,9 @@ from typing import Any
 import pytest
 
 import vllm_gr.config.execution as execution
-import vllm_gr.entrypoints.beam_search_v1 as beam_search_v1_package
+import vllm_gr.entrypoints.beam_search as beam_search_package
 import vllm_gr.entrypoints.openai.serving_engine as serving_engine
-from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
+from vllm_gr.entrypoints.openai.serving_engine import beam_search
 from vllm_gr.sampling_params import BeamSearchParams
 
 BEAM_WIDTH = 128
@@ -59,7 +59,7 @@ def _run(
 
     async def drain() -> None:
         serving = SimpleNamespace(engine_client=SimpleNamespace(vllm_config=object()))
-        async for _ in beam_search_v1(
+        async for _ in beam_search(
             serving,
             prompt=prompt,
             request_id="request-id",
@@ -74,9 +74,9 @@ def _run(
         monkeypatch.setattr(execution, "require_beam_config", lambda *a, **k: None)
         monkeypatch.setattr(serving_engine, "_next_data_parallel_rank", _rank)
         monkeypatch.setattr(
-            serving_engine, "create_online_beam_search_v1_client", lambda self: object()
+            serving_engine, "create_online_beam_search_client", lambda self: object()
         )
-        monkeypatch.setattr(beam_search_v1_package, "run_beam_search_v1_async", fake_run)
+        monkeypatch.setattr(beam_search_package, "run_beam_search_async", fake_run)
         # The real freeze collects and freezes this process's heap for the rest
         # of the run. That is a serving-boundary effect the entry point asks
         # for, not something an entry-point test should trigger.

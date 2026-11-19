@@ -65,7 +65,7 @@ validation path. See [Development utilities](docs/tools/README.md) for CUDA/NPU
 behavior, environment prerequisites, and model-cache options.
 
 Refer to [Run benchmarks](docs/benchmarks/README.md) for benchmark-related test cases.
-The standalone offline `beam_search_v1` performance and timeline benchmark is
+The standalone offline `beam_search` performance and timeline benchmark is
 documented in [benchmarks/qwen/README.md](benchmarks/qwen/README.md).
 
 Shared AI coding instructions are in [AGENTS.md](AGENTS.md), imported by

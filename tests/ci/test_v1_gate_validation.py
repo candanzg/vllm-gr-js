@@ -56,7 +56,7 @@ def test_recall_rejects_malformed_or_truncated_beam_after_rank_32() -> None:
     output = SimpleNamespace(
         sequences=[SimpleNamespace(tokens=[99, *range(1, 6)]) for _ in range(33)]
     )
-    llm = SimpleNamespace(beam_search_v1=lambda *_args, **_kwargs: [output])
+    llm = SimpleNamespace(beam_search=lambda *_args, **_kwargs: [output])
     params = SimpleNamespace(beam_width=33)
     assert len(infer_batch(llm, Tokenizer(), [[99]], params)[0]) == 33
     for suffix in ([1, 2, 3, 4], [1, 2, 4, 4, 5], [1, 2, 3, 4, 3]):
@@ -73,7 +73,7 @@ def test_recall_diagnostics_record_scores_without_changing_predictions() -> None
             SimpleNamespace(tokens=[99, *range(1, 6)], cum_logprob=-0.75),
         ]
     )
-    llm = SimpleNamespace(beam_search_v1=lambda *_args, **_kwargs: [output])
+    llm = SimpleNamespace(beam_search=lambda *_args, **_kwargs: [output])
     params = SimpleNamespace(beam_width=2)
     original = infer_batch(llm, Tokenizer(), [[99]], params)
     details: list[Any] = []

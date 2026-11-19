@@ -3,7 +3,7 @@
 For historical projection and numerical diagnostics, see the
 [vocabulary slicing validation](VOCAB_SLICE_REVIEW.md).
 
-The existing entry point supports V1 with `--beam-search-v1`:
+The existing entry point supports V1 with `--beam-search`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 USE_TF=0 \
@@ -12,7 +12,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --model /absolute/path/to/OneRec-1.7B \
   --dataset-name onerec --dataset-path /absolute/path/to/RecIF \
   --task-types video --custom-input-len 1023 --num-prompts 100 \
-  --n 128 --output-len 5 --beam-search-v1 --warmup-requests 10 \
+  --n 128 --output-len 5 --beam-search --warmup-requests 10 \
   --constraint-triples /absolute/path/to/video_constraint_triples.json \
   --max-model-len 8192 --max-num-batched-tokens 8192 \
   --output-json /absolute/path/to/result.json
@@ -30,7 +30,7 @@ same model tokenizer into a canonical CUDA artifact.
   single-request calls**. Samples are not silently duplicated if data is short.
 - Prefix caching stays enabled. Before every call, reset it and verify success
   **outside** the timer. Decode still reuses the current request's KV cache.
-- Timing starts before submitting the **text** prompt to `beam_search_v1()`
+- Timing starts before submitting the **text** prompt to `beam_search()`
   and ends after accessing **every beam's text**, forcing lazy output
   materialization. Input encoding and output decoding are included.
 - Dataset loading, chat-template construction/length normalization, artifact

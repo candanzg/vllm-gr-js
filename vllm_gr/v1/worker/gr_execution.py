@@ -114,7 +114,7 @@ def execute_gr_stage(
 
         stage_runner = get_npu_stage_runner(worker, local)
     else:
-        raise ValueError("beam_search_v1 has no execution adapter for this device")
+        raise ValueError("beam_search has no execution adapter for this device")
     try:
         return stage_runner.execute(local, original, *args, **kwargs)
     except Exception as error:
@@ -138,7 +138,7 @@ def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
 
         return execute_npu_gr_retirement(worker, local)
     else:
-        raise ValueError("beam_search_v1 has no retirement adapter for this device")
+        raise ValueError("beam_search has no retirement adapter for this device")
 
     return retire(worker, local)
 
@@ -164,7 +164,7 @@ def _dispatch_stage_frame(
     hooks_type: CudaStageHooksType | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Handle a persistent GR stage frame (beam_search_v1 execution).
+    """Handle a persistent GR stage frame (beam_search execution).
 
     Returns ``_NOT_A_STAGE_FRAME`` when ``scheduler_output`` is not a stage
     frame; otherwise the stage runner's execute() result.  On an execution

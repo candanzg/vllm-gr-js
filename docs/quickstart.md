@@ -83,10 +83,10 @@ python -c "import vllm_gr; print(vllm_gr.__version__)"
   `vllm serve MODEL --gr` with canonical configuration and send an OpenAI request.
   Apply the [CLI dispatch patch](cli.md) before using the GR command.
 - [OneRec V1 asynchronous scheduling tutorial](onerec_v1_async_quickstart.md)
-  covers the full dataset, artifact compilation, and `GRLLM.beam_search_v1()`.
+  covers the full dataset, artifact compilation, and `GRLLM.beam_search()`.
 - [Beam configuration reference](../examples/offline_inference/beam_search/README.md):
   device selection, graph policy, and generation limits.
 
 For catalog-constrained serving, use the same tokenizer snapshot for artifact
-compilation and serving. The retired `GRLLM.beam_search()` API and frontend
+compilation and serving. The retired legacy frontend Beam API and frontend
 catalog arguments are not valid substitutes for V1 configuration.

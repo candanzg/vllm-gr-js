@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.protocol import (
     AsyncBeamSearchFrontend,
     BeamSearchFrontend,
     OfflineBeamSearchRequest,
@@ -15,7 +15,7 @@ from vllm_gr.entrypoints.beam_search_v1.protocol import (
 )
 
 
-def run_beam_search_v1(
+def run_beam_search(
     frontend: BeamSearchFrontend,
     call: OfflineBeamSearchRequest,
 ) -> list[Any]:
@@ -29,7 +29,7 @@ def run_beam_search_v1(
         frontend.close(session)
 
 
-async def run_beam_search_v1_async(
+async def run_beam_search_async(
     frontend: AsyncBeamSearchFrontend,
     call: OnlineBeamSearchRequest,
 ) -> list[Any]:
@@ -43,4 +43,4 @@ async def run_beam_search_v1_async(
         await frontend.close(session)
 
 
-__all__ = ["run_beam_search_v1", "run_beam_search_v1_async"]
+__all__ = ["run_beam_search", "run_beam_search_async"]

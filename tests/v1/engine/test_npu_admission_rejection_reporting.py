@@ -40,9 +40,7 @@ from vllm_gr.v1.engine.core import (
 )
 from vllm_gr.v1.engine.wire import register_engine_core_request_types
 
-REASON = (
-    "NPU unconstrained beam_search_v1 requires candidate_width to match each stage's beam width"
-)
+REASON = "NPU unconstrained beam_search requires candidate_width to match each stage's beam width"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -362,7 +360,7 @@ def test_unrepresentable_npu_temperature_is_an_admission_rejection(
     core = _core(_config())
     request = _request(4, (4, 4, 4), temperature)
     reason = (
-        "NPU unconstrained beam_search_v1 requires positive temperature "
+        "NPU unconstrained beam_search requires positive temperature "
         "to be representable as a finite nonzero float32 value"
     )
     if path == "inproc":

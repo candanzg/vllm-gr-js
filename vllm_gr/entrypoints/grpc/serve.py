@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from google.protobuf import descriptor_pool
 
 from vllm_gr.config.models import deployment_for
-from vllm_gr.entrypoints.beam_search_v1.client import _ASYNC_CLEANUP_TASKS
+from vllm_gr.entrypoints.beam_search.client import _ASYNC_CLEANUP_TASKS
 
 from .generated import vllm_engine_pb2 as pb
 from .generated import vllm_engine_pb2_grpc as rpc

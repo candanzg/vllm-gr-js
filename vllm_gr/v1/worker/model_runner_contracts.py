@@ -37,7 +37,7 @@ def is_worker_runner_v2_patched(runner_class: Any) -> bool:
     ``sample_tokens`` instead of the V1 ``_bookkeeping_sync`` surface. The
     required V2 method set is the slim ``execute_model`` and ``sample_tokens``
     stage bypass plus the canonical Constraint Backend load/shutdown markers.
-    Native ``sample`` remains untouched: V2 supports only beam_search_v1,
+    Native ``sample`` remains untouched: V2 supports only beam_search,
     whose stage runner owns constrained sampling. The optional ``prepare_inputs``
     specialization preserves the native InputBatch contract. ``add_requests``
     optionally skips unused sampler state for admitted GR Prefill;

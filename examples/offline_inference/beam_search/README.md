@@ -1,7 +1,7 @@
 # Offline Beam Search Demo
 
 Run `quickstart.py` with a local OneRec model. The script calls
-`GRLLM.beam_search_v1` over the full vocabulary by default. Pass `--catalog`
+`GRLLM.beam_search` over the full vocabulary by default. Pass `--catalog`
 to compile a temporary Constraint Table that restricts generation to your
 catalog. The commands below run from the repository root in Bash.
 
@@ -91,14 +91,14 @@ scripts use the configurations below.
 
 ### Public entrypoint
 
-Set the `gr` Beam configuration and call `GRLLM.beam_search_v1()`.
-`GRLLM.beam_search()` raises a migration error. EngineCore now owns scheduling
-for the V1 session.
+Set the `gr` Beam configuration and call `GRLLM.beam_search()`.
+`GRLLM.beam_search()` requires V1 and never falls through to upstream vLLM's
+implementation. EngineCore owns scheduling for the V1 session.
 
 The V1 flow is:
 
 ```text
-beam_search_v1()
+beam_search()
   -> prepare and validate one request
   -> submit one EngineCore session
   -> keep Prefill, Decode, Beam state, and decisions on the Worker/GPU
@@ -170,7 +170,7 @@ gr:
 #### Beam configuration parameters
 
 These values describe the example's CUDA configuration. The CLI flags below
-belong to `offline_beam_search_v1.py`. Library defaults can differ.
+belong to `offline_beam_search.py`. Library defaults can differ.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
@@ -302,7 +302,7 @@ It does not accept a separate thinking prompt.
 Direct full-vocabulary Beam Search uses fixed-length input preparation.
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution eager \
   --batch-size "$BATCH_SIZE" --beam-width 128 \
@@ -315,7 +315,7 @@ opens the terminal thinking prefix as described below. `--max-tokens` limits the
 complete generated continuation, including any thinking and final answer:
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution eager \
   --batch-size "$BATCH_SIZE" --enable-thinking \
@@ -329,7 +329,7 @@ your own catalog using the [Constraint Table instructions](#constraint-table-art
 
 ```bash
 ONEREC_TRIPLES=/absolute/path/to/constraint_triples.json
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --catalog "$ONEREC_TRIPLES" --prompt "$PROMPT" \
   --constraint-backend npu --execution eager \
   --batch-size "$BATCH_SIZE" --beam-width 128 --generated-steps 3 \
@@ -474,7 +474,7 @@ The default regression exercises a different, exact 256-token batch.
 
 ### Measure latency without profiling
 
-Use `--input-len` with `offline_beam_search_v1.py` to set a fixed prompt length
+Use `--input-len` with `offline_beam_search.py` to set a fixed prompt length
 that includes the SID begin token. Its default is 1024 tokens.
 
 Use `--repeat 20 --warmup-runs 3` to time 20 complete API calls after three
@@ -486,7 +486,7 @@ The `beam_benchmark` JSON log reports batch latency in milliseconds (mean, P50,
 P95, min/max), requests per second, actual returned Beams per second, and every
 sample. Percentiles use linear interpolation. `--output-json` optionally saves
 the same data and test conditions to a file. Only the last batch's Beams are
-printed. The timer covers `beam_search_v1` until output objects return; engine
+printed. The timer covers `beam_search` until output objects return; engine
 startup, graph capture, warmup, pre-call prompt preparation, post-call result
 inspection, statistics collection and printing are excluded. Work performed
 inside the API is included. `--repeat` cannot be combined with `--profile-dir`.
@@ -501,7 +501,7 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 BENCH_RUN="$PWD/test-results/graph_latency_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BENCH_RUN"
 for B in 1 2 4; do
-  python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+  python -u examples/offline_inference/beam_search/offline_beam_search.py \
     --model /path/to/OneRec_Qwen3_1.7B \
     --prompt tests/resources/single_one_rec_prompt.txt \
     --constraint-backend npu --execution graph \
@@ -543,7 +543,7 @@ params = BeamSearchParams(
     include_stop_str_in_output=True,
     length_penalty=1.0,
 )
-outputs = llm.beam_search_v1(prompts, params)
+outputs = llm.beam_search(prompts, params)
 ```
 
 For CUDA and constrained NPU V1, K and W can be configured independently after
@@ -696,7 +696,7 @@ set -o pipefail
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 PROFILE_RUN="$PWD/test-results/bs2_bw128_profile_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$PROFILE_RUN/logs"
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model /path/to/OneRec_Qwen3_1.7B \
   --prompt tests/resources/single_one_rec_prompt.txt \
   --constraint-backend npu --execution graph \
@@ -771,7 +771,7 @@ so the NPU full-vocabulary selector uses each stage's beam width.
 B=1:
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 1 --beam-width 128 --input-len 128 --generated-steps 3 \
@@ -784,7 +784,7 @@ python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
 B=4:
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 4 --beam-width 128 --input-len 128 --generated-steps 3 \
@@ -812,7 +812,7 @@ unprofiled warmup, and print only the last batch's results.
 B=1:
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 1 --beam-width 128 --input-len 128 --generated-steps 3 \
@@ -825,7 +825,7 @@ python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
 B=4:
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution graph \
   --batch-size 4 --beam-width 128 --input-len 128 --generated-steps 3 \
@@ -847,7 +847,7 @@ it does not claim B=4 capacity-256 hardware coverage. Reuse the same path/device
 setup:
 
 ```bash
-python -u examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python -u examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$MODEL" --prompt "$PROMPT" \
   --constraint-backend npu --execution eager \
   --batch-size 1 --beam-width 256 --input-len 128 --generated-steps 3 \

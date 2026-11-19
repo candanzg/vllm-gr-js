@@ -74,8 +74,8 @@ validation, retirement, cancellation, and same-revision process requirements.
 
 Public configuration flows through `GRConfig` and
 `VllmConfig.additional_config`, including parser-cache invalidation on writes.
-The public Beam API is `beam_search_v1()`; retained internal compatibility
-helpers do not restore the retired `GRLLM.beam_search()` or catalog flags.
+The public Beam API is `beam_search()`; retained internal compatibility
+helpers do not restore the retired legacy frontend Beam loop or catalog flags.
 Preserve ordinary non-GR requests when changing shared transport or patches.
 
 ### Configuration field maintenance
@@ -97,7 +97,7 @@ and extend the existing configuration round-trip tests for behavior changes.
 
 ## ModelRunner and graph boundaries
 
-`beam_search_v1` is the only Beam protocol, independently of native
+`beam_search` is the only Beam protocol, independently of native
 ModelRunner V1/V2. The selection policy lives in `vllm_gr/_env_check.py`.
 
 CUDA V1, CUDA V2, and NPU have different capture and storage lifecycles. Read

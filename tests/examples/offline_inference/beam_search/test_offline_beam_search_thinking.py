@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from examples.offline_inference.beam_search import offline_beam_search_v1 as example
+from examples.offline_inference.beam_search import offline_beam_search as example
 
 
 def _args(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *options: str) -> Any:

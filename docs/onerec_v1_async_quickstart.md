@@ -1,6 +1,6 @@
 # OneRec-1.7B V1 asynchronous scheduling quickstart
 
-The offline `GRLLM.beam_search_v1()` request exercises EngineCore scheduling
+The offline `GRLLM.beam_search()` request exercises EngineCore scheduling
 with OneRec-1.7B, including Prefill, asynchronous Decode, and GPU Beam selection
 with a CUDA Constraint Table. For the V1 server command and configuration, see
 the [online serving example](../examples/online_serving/beam_search/README.md).
@@ -95,7 +95,7 @@ Save it as `$ONEREC_WORKDIR/prompt.txt`, then run:
 
 ```bash
 USE_TF=0 \
-python examples/offline_inference/beam_search/offline_beam_search_v1.py \
+python examples/offline_inference/beam_search/offline_beam_search.py \
   --model "$ONEREC_MODEL" \
   --catalog "$ONEREC_WORKDIR/video_constraint_triples.json" \
   --prompt "$ONEREC_WORKDIR/prompt.txt" \
@@ -176,7 +176,7 @@ begin token appended to every prompt. If configured, a smaller
 authoritative; the frontend check does not guarantee device capacity.
 
 V1 requires Chunked Prefill to be **off**. Enabling it is refused when the engine
-starts (`beam_search_v1 requires enable_chunked_prefill=False`), not split:
+starts (`beam_search requires enable_chunked_prefill=False`), not split:
 there is no partial Prefill on this path, and the complete prompt has to fit the
 token budget.
 
@@ -248,7 +248,7 @@ when comparing runs.
 | Width or generation-step error | Keep request width equal to `max_width`. With a constraint table, use exactly 3 effective steps and startup `max_decode_steps >= 3`; begin/end positions do not count toward these steps. Without constraints, use 1 through the configured `max_decode_steps`, subject to existing backend limits (NPU capacity remains at most 3). |
 | Constraint Table digest or tokenizer mismatch | Rebuild the artifact from the current model directory and triples document. |
 | CUDA graph or out-of-memory error | Start with width 128 and the default `--gpu-memory-utilization 0.5`; check for competing GPU processes. |
-| Online V1 validation is needed | The system test calls `OpenAIServing.beam_search_v1()` with a real asynchronous multiprocess engine. Legacy HTTP gates remain separate. |
+| Online V1 validation is needed | The system test calls `OpenAIServing.beam_search()` with a real asynchronous multiprocess engine. Legacy HTTP gates remain separate. |
 | EOS or Prefill admission error | Set `ignore_eos=True`, disable Chunked Prefill and allow the complete prompt in `max_num_batched_tokens`. |
 | A prompt list did not batch | Check `Beam batch declined`: the count must be in `gr.beam_batch_sizes`, and sequence capacity, the token budget and equal generation budgets must all allow it. |
 

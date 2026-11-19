@@ -1,6 +1,6 @@
 # Unconstrained Beam Search V1 on NPU
 
-NPU `GRLLM.beam_search_v1()` can select candidates from the model's full output
+NPU `GRLLM.beam_search()` can select candidates from the model's full output
 vocabulary without a catalog or a Constraint Table artifact. This is Beam Search,
 separate from ordinary `generate()` sampling. It does not constrain generated
 tokens to valid recommendation SIDs. An optional SID stage domain restricts the
@@ -65,7 +65,7 @@ def main() -> None:
             {"prompt_token_ids": tokenizer.encode("Recommend the next item.")}
             for _ in range(batch_size)
         ]
-        outputs = llm.beam_search_v1(
+        outputs = llm.beam_search(
             inputs,
             BeamSearchParams(beam_width=128, max_tokens=3, ignore_eos=True),
             output_mode="full",
@@ -90,8 +90,9 @@ The engine rejects an enabled Constraint Table or a vocabulary slice with
 `constrained_generation=False`. For the catalog-free [offline Beam example](../examples/offline_inference/beam_search/README.md#run-the-v1-example),
 pass `--constraint-backend npu` on Ascend.
 
-`output_mode="full"` returns the usual Beam sequence objects. Omitting the flag
-uses the existing compact output format. No new output type is introduced.
+`output_mode="full"` returns the usual Beam sequence objects, and is also the
+default to keep the upstream vLLM contract. Pass `output_mode="compact"` to
+request the compact output format. No new output type is introduced by default.
 
 ## Catalog-free SA/SB/SC generation
 
@@ -208,7 +209,7 @@ python -m pytest tests/v1/engine/test_npu_unconstrained_beam.py \
   tests/engine/test_npu_sid_stage_config.py \
   tests/v1/worker/test_npu_sid_stage_loading.py \
   tests/ops/test_npu_stage_logits.py \
-  tests/entrypoints/beam_search_v1/test_beam_search_v1_input_processor.py \
+  tests/entrypoints/beam_search/test_beam_search_input_processor.py \
   tests/v1/worker/test_npu_model_runner_patch.py \
   tests/kernels/test_unconstrained_topk_npu.py \
   tests/kernels/test_sid_stage_topk_npu.py

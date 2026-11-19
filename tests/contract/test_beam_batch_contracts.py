@@ -177,7 +177,7 @@ def test_request_uses_engine_request_identity_and_beam_params_authority() -> Non
 
 
 def test_request_rejects_embedding_only_prompt() -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+    from vllm_gr.v1.engine.beam_search import validate_gr_request
 
     engine_request = _engine_request("request-0", None)
     engine_request.prompt_embeds = torch.ones((2, 8), dtype=torch.float32)

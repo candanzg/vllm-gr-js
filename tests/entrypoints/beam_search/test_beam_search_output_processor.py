@@ -18,11 +18,11 @@ from vllm.lora.request import LoRARequest
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_gr.entrypoints.beam_output import _LazyMaterializedBeamSequence
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
-from vllm_gr.entrypoints.beam_search_v1.output_processor import (
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchEngineError
+from vllm_gr.entrypoints.beam_search.output_processor import (
     BeamSearchOutputProcessor,
 )
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )

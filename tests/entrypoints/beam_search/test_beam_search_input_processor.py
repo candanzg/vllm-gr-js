@@ -18,13 +18,13 @@ from vllm.renderers.params import TokenizeParams
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 
-from vllm_gr.entrypoints.beam_search_v1.client import (
+from vllm_gr.entrypoints.beam_search.client import (
     AsyncBeamSearchClient,
     BeamSearchClient,
 )
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
-from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
+from vllm_gr.entrypoints.beam_search.input_processor import BeamSearchInputProcessor
+from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
@@ -853,7 +853,7 @@ def test_constrained_length_is_checked_before_native_input_processing(
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("length", [1, 2, 4, 7])  # type: ignore[misc]
 def test_core_rechecks_constrained_length_without_frontend_validation(length: int) -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+    from vllm_gr.v1.engine.beam_search import validate_gr_request
 
     config = _canonical_gr_config()
     config["gr"]["max_decode_steps"] = 7
@@ -1132,7 +1132,7 @@ def test_embedding_inputs_are_rejected_before_prompt_mutation(
 
 @pytest.mark.parametrize("local_only,local_size", [(True, 2), (True, 1), (False, 2)])  # type: ignore[misc]
 def test_online_entrypoint_rejects_dp_before_submission(local_only: bool, local_size: int) -> None:
-    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+    from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
 
     engine = _make_engine(
         SimpleNamespace(
@@ -1170,7 +1170,7 @@ pytestmark = pytest.mark.cpu_test
 @pytest.mark.l1  # type: ignore[misc]
 def test_enginecore_rejects_unconstrained_candidate_width_below_stage_width() -> None:
     from vllm_gr.config import gr_config_from_mapping
-    from vllm_gr.v1.engine.beam_search_v1 import (
+    from vllm_gr.v1.engine.beam_search import (
         _reject_candidate_width_below_dynamic_schedule,
     )
 
@@ -1208,7 +1208,7 @@ def _request_defaults_host(**settings: Any) -> Any:
 def test_native_params_accept_engine_defaults_without_mutation() -> None:
     from vllm.sampling_params import BeamSearchParams
 
-    from vllm_gr.entrypoints.beam_search_v1.request_params import (
+    from vllm_gr.entrypoints.beam_search.request_params import (
         apply_beam_request_defaults,
     )
 
@@ -1225,7 +1225,7 @@ def test_native_params_accept_engine_defaults_without_mutation() -> None:
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_explicit_schedule_is_validated_after_defaults_are_merged() -> None:
-    from vllm_gr.entrypoints.beam_search_v1.request_params import (
+    from vllm_gr.entrypoints.beam_search.request_params import (
         apply_beam_request_defaults,
     )
     from vllm_gr.sampling_params import BeamSearchParams
@@ -1248,8 +1248,8 @@ def test_explicit_schedule_is_validated_after_defaults_are_merged() -> None:
 def test_capacity_does_not_extend_dynamic_default(steps: int) -> None:
     from vllm.sampling_params import BeamSearchParams
 
-    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
-    from vllm_gr.entrypoints.beam_search_v1.request_params import (
+    from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
+    from vllm_gr.entrypoints.beam_search.request_params import (
         apply_beam_request_defaults,
     )
 
@@ -1268,7 +1268,7 @@ def test_capacity_does_not_extend_dynamic_default(steps: int) -> None:
 
 @pytest.mark.l1  # type: ignore[misc]
 def test_reserved_tokens_independent_candidates_and_result_width() -> None:
-    from vllm_gr.entrypoints.beam_search_v1.request_params import (
+    from vllm_gr.entrypoints.beam_search.request_params import (
         apply_beam_request_defaults,
     )
     from vllm_gr.sampling_params import BeamSearchParams

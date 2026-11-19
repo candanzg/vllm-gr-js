@@ -9,7 +9,7 @@ transport contracts. Native `SchedulerOutput` carries scheduling data; there
 is no separately serialized Plan message.
 
 ```text
-GRLLM.beam_search_v1 / OpenAI Beam V1
+GRLLM.beam_search / OpenAI Beam V1
   -> input processing and request validation
   -> SUBMIT_GR_SESSION(BeamBatchRequest)
   -> EngineCore admission and native SchedulerOutput
@@ -325,7 +325,7 @@ stage's retained width.
 Unconstrained V1 generation has its own configuration and budget checks; it
 does not require a catalog artifact. NPU dynamic widths must satisfy their
 stage-specific capacity/parent bounds. These deployment checks are implemented
-in `vllm_gr/v1/engine/beam_search_v1.py`, not in a parallel Plan schema.
+in `vllm_gr/v1/engine/beam_search.py`, not in a parallel Plan schema.
 
 ## CPU candidate boundary
 

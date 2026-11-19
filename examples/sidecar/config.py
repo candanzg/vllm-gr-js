@@ -5,7 +5,7 @@
 Run: python -m vllm_gr.sidecar --config examples/sidecar/config.py
 gRPC servers: set gr.admin_port to the configured control port.
 Hot updates are not exposed by the HTTP inference server.
-Online Trie switching currently requires CUDA asynchronous beam_search_v1.
+Online Trie switching currently requires CUDA asynchronous beam_search.
 Checkpoint history defaults to two local copies, oldest downloads removed first.
 Referenced and updating versions are protected and may temporarily exceed the limit.
 Each Task cache directory must be owned by one Sidecar process.

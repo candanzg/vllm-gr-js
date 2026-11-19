@@ -90,11 +90,11 @@ def test_offline_releases_consumed_outputs_before_next_call(
         def get_tokenizer(self) -> Tokenizer:
             return Tokenizer()
 
-        def beam_search_v1(
+        def beam_search(
             self, prompts: list[dict[str, list[int]]], params: Any, **kwargs: Any
         ) -> list[Output]:
             events.append("infer")
-            assert "output_mode" not in kwargs
+            assert kwargs == {"use_tqdm": False, "output_mode": "compact"}
             # Include token buffers: deleting only the top-level outputs list
             # leaves loop variables retaining part of the previous batch.
             assert all(ref() is None for ref in previous)

@@ -14,11 +14,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from vllm_gr.entrypoints.beam_search_v1 import (
-    run_beam_search_v1,
-    run_beam_search_v1_async,
+from vllm_gr.entrypoints.beam_search import (
+    run_beam_search,
+    run_beam_search_async,
 )
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.protocol import (
     AsyncBeamSearchFrontend,
     BeamSearchSession,
     OfflineBeamSearchRequest,
@@ -69,7 +69,7 @@ def test_v1_flow_submits_once_waits_once_and_closes() -> None:
     frontend = _Frontend()
     call = OfflineBeamSearchRequest(prompts=[[1, 2]], params=object())
 
-    result = run_beam_search_v1(frontend, call)
+    result = run_beam_search(frontend, call)
 
     assert result[0] is call
     assert result[1] is frontend.request
@@ -81,7 +81,7 @@ def test_v1_flow_closes_after_execution_failure() -> None:
     call = OfflineBeamSearchRequest(prompts=[[1, 2]], params=object())
 
     with pytest.raises(RuntimeError, match="worker failed"):
-        run_beam_search_v1(frontend, call)
+        run_beam_search(frontend, call)
 
     assert frontend.events == ["prepare", "submit", "wait", "close"]
 
@@ -106,11 +106,11 @@ def test_grllm_v1_entry_uses_new_frontend(
     )
     monkeypatch.setattr(
         GRLLM,
-        "_create_beam_search_v1_client",
+        "_create_beam_search_client",
         lambda self: frontend,
     )
 
-    result = GRLLM.beam_search_v1(
+    result = GRLLM.beam_search(
         fake_llm,
         [[1, 2]],
         object(),
@@ -123,8 +123,43 @@ def test_grllm_v1_entry_uses_new_frontend(
     assert isinstance(result[0], OfflineBeamSearchRequest)
     assert result[0].use_tqdm is True
     assert result[0].concurrency_limit == 4
-    assert result[0].output_mode == (output_mode or "compact")
+    assert result[0].output_mode == (output_mode or "full")
     assert result[0].trie_ids == trie_ids
+
+
+def test_grllm_v1_default_output_mode_keeps_upstream_text_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting output_mode must return sequences with decoded text, as upstream does."""
+    from vllm_gr.entrypoints.gr import GRLLM
+
+    class _FullFrontend(_Frontend):
+        def build_output(
+            self,
+            call: OfflineBeamSearchRequest,
+            request: BeamBatchRequest,
+            result: BeamBatchResult,
+        ) -> list[Any]:
+            assert call.output_mode == "full"
+            return [SimpleNamespace(sequences=[SimpleNamespace(text="decoded")])]
+
+    fake_llm = object.__new__(GRLLM)
+    fake_llm.llm_engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={
+                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
+            }
+        )
+    )
+    monkeypatch.setattr(GRLLM, "_create_beam_search_client", lambda self: _FullFrontend())
+
+    result = GRLLM.beam_search(
+        fake_llm,
+        [{"prompt_token_ids": [1, 2]}],
+        object(),
+    )
+
+    assert result[0].sequences[0].text == "decoded"
 
 
 @pytest.mark.parametrize("fail_shutdown", [False, True])  # type: ignore[misc]
@@ -171,12 +206,12 @@ def test_v1_heap_is_prepared_before_serving_and_released_on_close(
     monkeypatch.setattr("vllm_gr.entrypoints.gr.release_accelerator_memory", lambda: None)
     monkeypatch.setattr("vllm_gr.entrypoints.gr.gc.collect", lambda: 0)
     frontend = _Frontend()
-    monkeypatch.setattr(GRLLM, "_create_beam_search_v1_client", lambda self: frontend)
+    monkeypatch.setattr(GRLLM, "_create_beam_search_client", lambda self: frontend)
 
     llm = GRLLM(model="/fake/v1")
     assert events == ["engine_ready", "freeze"]
-    llm.beam_search_v1([[1, 2]], object())
-    llm.beam_search_v1([[1, 2]], object())
+    llm.beam_search([[1, 2]], object())
+    llm.beam_search([[1, 2]], object())
     assert events == ["engine_ready", "freeze"]
     if fail_shutdown:
         with pytest.raises(RuntimeError, match="engine shutdown failed"):
@@ -245,7 +280,7 @@ def test_v1_async_flow_awaits_preparation_before_submitting_and_closes() -> None
     frontend.wait_final.return_value = result
     frontend.build_output.return_value = output
 
-    assert asyncio.run(run_beam_search_v1_async(frontend, call)) is output
+    assert asyncio.run(run_beam_search_async(frontend, call)) is output
 
     frontend.prepare_request.assert_awaited_once_with(call)
     frontend.submit_once.assert_awaited_once_with(request)
@@ -265,7 +300,7 @@ def test_v1_async_flow_closes_only_after_session_is_returned(failure_stage: str)
     getattr(frontend, failure_stage).side_effect = RuntimeError("frontend failed")
 
     with pytest.raises(RuntimeError, match="frontend failed"):
-        asyncio.run(run_beam_search_v1_async(frontend, call))
+        asyncio.run(run_beam_search_async(frontend, call))
 
     frontend.prepare_request.assert_awaited_once_with(call)
     if failure_stage == "submit_once":

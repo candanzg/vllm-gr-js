@@ -22,7 +22,7 @@ class _Engine:
     def get_tokenizer(self) -> Any:
         return SimpleNamespace(decode=lambda tokens, **kw: ":".join(map(str, tokens)))
 
-    def beam_search_v1(
+    def beam_search(
         self, prompts: list[dict[str, str]], params: Any, *, output_mode: str
     ) -> list[Any]:
         assert output_mode == "compact"
@@ -178,7 +178,7 @@ def test_e2e_includes_lazy_text_and_uses_only_v1(monkeypatch: Any) -> None:
         return len(events) * 1_000_000
 
     monkeypatch.setattr("tools.AB_Tests.run_offline_benchmark.time.perf_counter_ns", clock)
-    result = measure_e2e(SimpleNamespace(beam_search_v1=run), [1, 2], SimpleNamespace(max_tokens=5))
+    result = measure_e2e(SimpleNamespace(beam_search=run), [1, 2], SimpleNamespace(max_tokens=5))
     assert events == ["clock", "v1", "decode", "decode", "clock"]
     assert result == {"e2e_ms": 4.0, "returned_beams": 2, "aggregate_output_tokens": 10}
 
@@ -187,7 +187,7 @@ def test_benchmark_keeps_artifact_until_engine_shutdown(monkeypatch: Any) -> Non
     from argparse import Namespace
     from pathlib import Path
 
-    import examples.offline_inference.beam_search.offline_beam_search_v1 as example
+    import examples.offline_inference.beam_search.offline_beam_search as example
     from tools.AB_Tests.run_offline_benchmark import create_v1_llm
     from vllm_gr.entrypoints import gr
 
@@ -231,7 +231,7 @@ def test_benchmark_keeps_artifact_until_engine_shutdown(monkeypatch: Any) -> Non
 def test_onerec_benchmark_closes_engine_before_deleting_artifact(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_stage: str | None
 ) -> None:
-    import examples.offline_inference.beam_search.offline_beam_search_v1 as example
+    import examples.offline_inference.beam_search.offline_beam_search as example
     from benchmarks.open_one_rec.one_rec_v1_benchmark import run_v1_benchmark
     from vllm_gr.entrypoints import gr
 
@@ -273,7 +273,7 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
         def reset_prefix_cache(self) -> bool:
             return True
 
-        def beam_search_v1(self, prompts: Any, params: Any, *, output_mode: str) -> list[Any]:
+        def beam_search(self, prompts: Any, params: Any, *, output_mode: str) -> list[Any]:
             assert output_mode == "full"
             assert artifacts[0].is_file()
             events.append("inference")
@@ -314,6 +314,46 @@ def test_onerec_benchmark_closes_engine_before_deleting_artifact(
         assert events == [*expected, "shutdown"]
     assert len(artifacts) == 1
     assert not artifacts[0].parent.exists()
+
+
+def test_benchmark_resolves_beam_api_across_rename() -> None:
+    import benchmarks.beam_search.v1_performance_gate as performance
+    import benchmarks.open_one_rec.one_rec_v1_benchmark as onerec
+    import tools.AB_Tests.run_offline_benchmark as offline
+
+    calls: list[str] = []
+
+    def retired(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("retired")
+
+    def v1(*args: Any, **kwargs: Any) -> str:
+        calls.append("v1")
+        return "v1"
+
+    def renamed(*args: Any, **kwargs: Any) -> str:
+        calls.append("renamed")
+        return "renamed"
+
+    # The pre-rename base exposes both names and must prefer beam_search_v1.
+    base = SimpleNamespace(beam_search_v1=v1, beam_search=retired)
+    head = SimpleNamespace(beam_search=renamed)
+    for resolve in (
+        offline.resolve_beam_search,
+        performance.resolve_beam_search,
+        onerec._resolve_beam_search,
+    ):
+        assert resolve(base)("prompt", "params") == "v1"
+        assert resolve(head)("prompt", "params") == "renamed"
+    assert calls == ["v1", "renamed"] * 3
+
+
+def test_benchmark_loads_the_artifact_builder_present_in_checkout() -> None:
+    import benchmarks.open_one_rec.one_rec_v1_benchmark as onerec
+    import examples.offline_inference.beam_search.offline_beam_search as example
+    import tools.AB_Tests.run_offline_benchmark as offline
+
+    assert offline.load_build_artifact() is example.build_artifact
+    assert onerec._load_build_artifact() is example.build_artifact
 
 
 pytestmark = pytest.mark.cpu_test

@@ -10,10 +10,10 @@ cd "${REPO_ROOT}"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-Usage: benchmarks/qwen/run_beam_search_v1_benchmark.sh [extra Python arguments]
+Usage: benchmarks/qwen/run_beam_search_benchmark.sh [extra Python arguments]
 
 Create/reuse an isolated environment and benchmark offline
-GRLLM.beam_search_v1. This entry point depends only on the vllm-gr checkout.
+GRLLM.beam_search. This entry point depends only on the vllm-gr checkout.
 
 Required environment:
   MODEL=/absolute/path/to/model
@@ -50,7 +50,7 @@ Common environment overrides:
   TIMELINE_RECORD_SHAPES=0
   TIMELINE_WITH_STACK=0
   TIMELINE_WITH_MEMORY=0
-  OUT_DIR=repo/results/beam_search_v1
+  OUT_DIR=repo/results/beam_search
 
 Extra arguments are forwarded to benchmark_v1.py.
 EOF
@@ -79,7 +79,7 @@ fi
 VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv}"
 BOOTSTRAP_PYTHON="${BOOTSTRAP_PYTHON:-python3.11}"
 INSTALL_MODE="${INSTALL_MODE:-auto}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/results/beam_search_v1}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/results/beam_search}"
 CONTEXT_LEN="${CONTEXT_LEN:-5000}"
 BEAM_STEPS="${BEAM_STEPS:-${DECODE_STEPS:-3}}"
 BEAM_WIDTH="${BEAM_WIDTH:-256}"
@@ -259,7 +259,7 @@ else
   echo "[2/3] Reuse workload: ${WORKLOAD_JSONL}"
 fi
 
-echo "[3/3] Run offline GRLLM.beam_search_v1 benchmark: ${OUTPUT_JSON}"
+echo "[3/3] Run offline GRLLM.beam_search benchmark: ${OUTPUT_JSON}"
 "${VENV_PYTHON}" benchmarks/qwen/benchmark_v1.py "${ARGS[@]}" "$@"
 
 echo "Done."

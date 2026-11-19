@@ -18,6 +18,35 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 
+def resolve_beam_search(llm: Any) -> Any:
+    """Select the public Beam method exposed by the loaded runtime.
+
+    ``ab_runner.sh`` executes this driver against the merge-base and the head.
+    The merge-base exposes ``beam_search_v1`` while ``beam_search`` is a retired
+    stub; the head exposes only ``beam_search``.
+    """
+    method = getattr(llm, "beam_search_v1", None)
+    return method if method is not None else llm.beam_search
+
+
+def load_build_artifact() -> Any:
+    """Load ``build_artifact`` from the example module present in the checkout."""
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    for module_name in (
+        "examples.offline_inference.beam_search.offline_beam_search",
+        "examples.offline_inference.beam_search.offline_beam_search_v1",
+    ):
+        try:
+            spec = find_spec(module_name)
+        except ModuleNotFoundError:
+            spec = None
+        if spec is not None:
+            return import_module(module_name).build_artifact
+    raise ImportError("no offline beam-search example module provides build_artifact")
+
+
 def distribution_ms(values: list[float]) -> dict[str, float | str]:
     """Summarize millisecond samples using the same percentiles as the dashboard."""
     if not values:
@@ -47,11 +76,11 @@ def distribution_ms(values: list[float]) -> dict[str, float | str]:
 def measure_e2e(llm: Any, prompt_token_ids: list[int], params: Any) -> dict[str, Any]:
     """Measure the production trend with no internal monkeypatches or profiler.
 
-    Time one ``beam_search_v1`` call through public output decoding. V1 owns
+    Time one ``beam_search`` call through public output decoding. V1 owns
     Prefill/Decode inside EngineCore, so this frontend reports E2E only.
     """
     started = time.perf_counter_ns()
-    outputs = llm.beam_search_v1(
+    outputs = resolve_beam_search(llm)(
         [{"prompt_token_ids": prompt_token_ids}], params, concurrency_limit=1, output_mode="full"
     )
     for output in outputs:
@@ -71,11 +100,9 @@ def measure_e2e(llm: Any, prompt_token_ids: list[int], params: Any) -> dict[str,
 @contextmanager
 def create_v1_llm(args: argparse.Namespace, max_tokens: int) -> Iterator[Any]:
     """Keep the canonical artifact alive until all workers have shut down."""
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
-        build_artifact,
-    )
     from vllm_gr.entrypoints.gr import GRLLM
 
+    build_artifact = load_build_artifact()
     steps = max_tokens - 2
     if steps not in (1, 2, 3):
         raise ValueError("Beam V1 requires 3/4/5 public output tokens including SID boundaries")
@@ -180,7 +207,7 @@ def main() -> int:
     if len(requests) < sample_size:
         raise RuntimeError(f"requested {sample_size} samples, dataset returned {len(requests)}")
 
-    # Pre-encode prompts outside the timed region so GRLLM.beam_search_v1's
+    # Pre-encode prompts outside the timed region so GRLLM.beam_search's
     # _preprocess_cmpl does not re-encode inside the perf_counter window.
     prompt_token_ids_list = [
         tokenizer.encode(request.prompt, add_special_tokens=False) for request in requests
@@ -227,7 +254,7 @@ def main() -> int:
     raw = {
         "schema_version": "vllm-gr.offline.raw.v2",
         "execution_mode": "offline",
-        "api": "GRLLM.beam_search_v1",
+        "api": "GRLLM.beam_search",
         "measurement_mode": "beam-search-v1-e2e",
         "instrumentation": {
             "canonical": "top-level perf_counter_ns only; no profiler or internal monkeypatch",
@@ -277,7 +304,7 @@ def main() -> int:
         },
         "phase_definition": {
             "version": "vllm-gr-beam-v1-e2e-v1",
-            "e2e": "GRLLM.beam_search_v1 call through all public beam text materialization",
+            "e2e": "GRLLM.beam_search call through all public beam text materialization",
             "cache_protocol": "paired cold miss followed by identical warm hit",
             "internal_stages": "not measured by this frontend E2E benchmark",
         },

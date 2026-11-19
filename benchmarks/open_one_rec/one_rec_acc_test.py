@@ -116,7 +116,7 @@ def run_offline_v1_inference(
         remaining = min(batch_size, len(prompts) - offset)
         size = 4 if remaining >= 4 else 2 if remaining >= 2 else 1
         batch = prompts[offset : offset + size]
-        raw_outputs = llm.beam_search_v1(
+        raw_outputs = llm.beam_search(
             [{"prompt": prompt} for prompt in batch], params, output_mode="compact"
         )
         batch_ids = sample_ids[offset : offset + size]

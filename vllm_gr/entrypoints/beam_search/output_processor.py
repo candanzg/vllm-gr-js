@@ -10,12 +10,12 @@ from typing import Any, NoReturn
 
 from vllm.inputs import tokens_input
 
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchEngineError
+from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
-from vllm_gr.entrypoints.beam_search_v1.token_utils import boundary_token_id
+from vllm_gr.entrypoints.beam_search.token_utils import boundary_token_id
 from vllm_gr.tokenizer_fast import fast_batch_decode, fast_decode
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchFailure,
@@ -153,7 +153,7 @@ class BeamSearchOutputProcessor:
         original_prompt_token_ids: tuple[tuple[int, ...], ...] | None = None,
     ) -> None:
         if tokenizer is None:
-            raise ValueError("beam_search_v1 output conversion requires a tokenizer")
+            raise ValueError("beam_search output conversion requires a tokenizer")
         self.tokenizer = tokenizer
         # Prepared IDs describe the accepted request, even if caller params
         # change while it runs. Direct output-converter callers still resolve.

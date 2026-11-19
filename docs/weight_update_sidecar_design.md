@@ -144,7 +144,7 @@ Old tables remain for `gr.trie_retention_seconds` (default 60 seconds), then
 are released on a subsequent wrapper API call. There is no timer thread or
 per-request version pinning/reference counting. Lookups default to the latest
 version; this does not promise one fixed Trie version for a whole request.
-Online Trie reload currently supports the CUDA asynchronous `beam_search_v1`
+Online Trie reload currently supports the CUDA asynchronous `beam_search`
 path, preserving Trie count and vocabulary projection.
 
 ## Shared update lifecycle

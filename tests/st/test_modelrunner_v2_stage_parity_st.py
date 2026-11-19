@@ -159,7 +159,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
         _inputs,
         _params,
     )
-    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+    from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
     from vllm_gr.entrypoints.gr import GRLLM
 
     model, tokenizer, config, source, newline, legal = _inputs(work_dir)
@@ -182,7 +182,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
             if index in (0, 3):
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            public = llm.beam_search_v1(
+            public = llm.beam_search(
                 [{"prompt_token_ids": ids}], _params(steps), output_mode="full"
             )[0]
             snapshot = llm.collective_rpc("onerec_v2_parity_snapshot", timeout=30)[0]
@@ -243,7 +243,7 @@ def _run_arm(work_dir: Path, arm: str) -> None:
                     with pytest.raises(
                         BeamSearchRequestError, match="must equal constraint_table_v1 depth"
                     ):
-                        llm.beam_search_v1(
+                        llm.beam_search(
                             [{"prompt_token_ids": ids}], _params(invalid_steps), output_mode="full"
                         )
                     assert not llm.llm_engine.has_unfinished_requests()

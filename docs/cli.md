@@ -174,7 +174,7 @@ options and the OneRec additions together.
 | Argument | Value / action | Default / required | Meaning |
 | --- | --- | --- | --- |
 | `--task-types` | Comma-separated string | ad,product,label_cond,video,interactive,label_pred | Select OneRec tasks, for example `video,ad`. |
-| `--beam-search-v1` | action=store_true | optional | Select Beam benchmarking (all GR Beam benchmarks use V1) |
+| `--beam-search` | action=store_true | optional | Select Beam benchmarking (all GR Beam benchmarks use V1) |
 | `--constraint-triples` | value | optional | Canonical three-step constraint JSON for V1 |
 | `--warmup-requests` | type=int | 10 | Warmup requests excluded from V1 latency statistics |
 | `--custom-input-len` | type=int | None | Target prompt token length; prompts are trimmed or repeated to match. |

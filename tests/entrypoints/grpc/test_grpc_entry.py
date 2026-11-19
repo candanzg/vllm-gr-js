@@ -178,7 +178,7 @@ def test_full_request_to_numpy_batch(binary: bool) -> None:
 def test_constrained_length_is_checked_before_grpc_token_decoding(
     binary: bool, backend: str, table_format: str, trie_id: int
 ) -> None:
-    from tests.entrypoints.beam_search_v1.test_beam_search_v1_input_processor import (
+    from tests.entrypoints.beam_search.test_beam_search_input_processor import (
         _canonical_gr_config,
     )
 
@@ -236,7 +236,7 @@ def test_npu_trie_selector_matches_http_validation(trie_id: int) -> None:
 @pytest.mark.parametrize("override_schedule", [False, True])  # type: ignore[misc]
 @pytest.mark.parametrize("override_result", [False, True])  # type: ignore[misc]
 def test_grpc_beam_deployment_defaults(override_schedule: bool, override_result: bool) -> None:
-    from tests.entrypoints.beam_search_v1.test_beam_search_v1_input_processor import (
+    from tests.entrypoints.beam_search.test_beam_search_input_processor import (
         _canonical_gr_config,
     )
 
@@ -1190,7 +1190,7 @@ def test_upstream_startup_keeps_health_reflection_stats_and_cleanup_order(
     from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
     from vllm.entrypoints.launchers import grpc_server as upstream
 
-    from vllm_gr.entrypoints.beam_search_v1.client import _ASYNC_CLEANUP_TASKS
+    from vllm_gr.entrypoints.beam_search.client import _ASYNC_CLEANUP_TASKS
     from vllm_gr.entrypoints.grpc.serve import patch_grpc_server
 
     async def run() -> None:

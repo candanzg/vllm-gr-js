@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Benchmark the offline ``GRLLM.beam_search_v1`` API.
+"""Benchmark the offline ``GRLLM.beam_search`` API.
 
 The benchmark is self-contained within the vllm-gr repository. It consumes a
 JSONL workload produced by ``benchmarks/qwen/make_workload.py``, builds a
@@ -353,13 +353,13 @@ def _normalize_output(
     outputs = list(output_rows)
     if len(outputs) != 1:
         raise RuntimeError(
-            f"beam_search_v1 returned {len(outputs)} request outputs; expected exactly 1"
+            f"beam_search returned {len(outputs)} request outputs; expected exactly 1"
         )
     prompt_ids = [int(token) for token in row["input_ids"]]
     sequences = list(getattr(outputs[0], "sequences", ()))
     if len(sequences) != expected_beam_width:
         raise RuntimeError(
-            f"beam_search_v1 returned {len(sequences)} beams; expected {expected_beam_width}"
+            f"beam_search returned {len(sequences)} beams; expected {expected_beam_width}"
         )
     beams = []
     for rank, sequence in enumerate(sequences):
@@ -398,7 +398,7 @@ def _run_once(
     for row in workload:
         request_started = time.perf_counter()
         # Beam Search V1 currently accepts exactly one prompt per offline call.
-        outputs = llm.beam_search_v1(
+        outputs = llm.beam_search(
             [{"prompt_token_ids": row["input_ids"]}],
             params,
             use_tqdm=False,
@@ -645,7 +645,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[2]
     return {
         "framework": "vllm-gr",
-        "api": "GRLLM.beam_search_v1",
+        "api": "GRLLM.beam_search",
         "execution_mode": "offline_sequential_single_prompt",
         "model": args.model,
         "vllm_gr_repo": str(repo_root),

@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from examples.offline_inference.beam_search import offline_beam_search_v1 as example
+from examples.offline_inference.beam_search import offline_beam_search as example
 
 
 def _cli_args(tmp_path: Path) -> list[str]:
@@ -146,7 +146,7 @@ def test_dynamic_beam_example_wires_graphs_and_benchmark(
 
     llm = SimpleNamespace(
         get_tokenizer=lambda: SimpleNamespace(encode=encode, convert_ids_to_tokens=lambda ids: ids),
-        beam_search_v1=beam_search,
+        beam_search=beam_search,
         collective_rpc=lambda name: [stats],
     )
 
@@ -252,7 +252,7 @@ def test_npu_graph_example_requires_replay_only_for_decode(
     stats = {"captured_shapes": [[2, 128]] if captured else [], "full_dispatches": dispatches}
     llm = SimpleNamespace(
         get_tokenizer=lambda: SimpleNamespace(convert_ids_to_tokens=lambda ids: ids),
-        beam_search_v1=lambda prompts, params, *, output_mode: outputs,
+        beam_search=lambda prompts, params, *, output_mode: outputs,
         collective_rpc=lambda name: [stats],
     )
     modules: dict[str, dict[str, Any]] = {
@@ -340,7 +340,7 @@ def test_quickstart_submits_prompt_at_natural_length(
         return [SimpleNamespace(sequences=[])]
 
     tokenizer = SimpleNamespace(encode=encode)
-    llm = SimpleNamespace(get_tokenizer=lambda: tokenizer, beam_search_v1=beam_search)
+    llm = SimpleNamespace(get_tokenizer=lambda: tokenizer, beam_search=beam_search)
     modules: dict[str, dict[str, Any]] = {
         "transformers": {
             "AutoTokenizer": SimpleNamespace(from_pretrained=lambda *a, **k: tokenizer)

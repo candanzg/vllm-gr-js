@@ -14,7 +14,7 @@ from vllm_gr.config.models import (
     configured_candidate_width,
     configured_constraint_mode,
 )
-from vllm_gr.v1.engine.beam_search_v1 import GRDeviceRequestError
+from vllm_gr.v1.engine.beam_search import GRDeviceRequestError
 
 if TYPE_CHECKING:
     from vllm_gr.config import GRConfig
@@ -35,12 +35,10 @@ def _validate_extended_unconstrained_kv_capacity(config: Any, capacity: int) -> 
         head_size = model.get_head_size()
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(
-            "NPU unconstrained beam_search_v1 above three tokens requires model KV-head geometry"
+            "NPU unconstrained beam_search above three tokens requires model KV-head geometry"
         ) from exc
     if type(heads) is not int or heads < 1 or type(head_size) is not int or head_size < 1:
-        raise ValueError(
-            "NPU unconstrained beam_search_v1 requires positive integer KV-head geometry"
-        )
+        raise ValueError("NPU unconstrained beam_search requires positive integer KV-head geometry")
     # SelectUnsharedKV divides its 95 KiB region by head size when tiling,
     # but copies the full configured suffix for every selected head. FP16
     # and BF16 both occupy two bytes. Check pool capacity even for shorter
@@ -49,7 +47,7 @@ def _validate_extended_unconstrained_kv_capacity(config: Any, capacity: int) -> 
     copy_bytes = min(heads, tile_heads) * capacity * head_size * 2
     if tile_heads == 0 or copy_bytes > _NPU_KV_REORDER_BUFFER_BYTES:
         raise ValueError(
-            "NPU unconstrained beam_search_v1 configured KV suffix exceeds "
+            "NPU unconstrained beam_search configured KV suffix exceeds "
             "the SelectUnsharedKV 95 KiB buffer; reduce beam.max_decode_steps "
             "or use a model with fewer KV heads or a smaller head size"
         )
@@ -59,8 +57,7 @@ def validate_npu_unconstrained_runner(config: Any) -> None:
     """Check the catalog-free NPU adapter before model or request allocation."""
     if getattr(config, "use_v2_model_runner", False):
         raise ValueError(
-            "NPU unconstrained beam_search_v1 requires ModelRunner V1; "
-            "set VLLM_USE_V2_MODEL_RUNNER=0"
+            "NPU unconstrained beam_search requires ModelRunner V1; set VLLM_USE_V2_MODEL_RUNNER=0"
         )
 
 
@@ -85,7 +82,7 @@ def validate_npu_device_config(
             and request.beam_params.max_tokens > NPU_UNCONSTRAINED_MAX_GENERATED_TOKENS
         ):
             raise ValueError(
-                "NPU unconstrained beam_search_v1 supports "
+                "NPU unconstrained beam_search supports "
                 f"1..{NPU_UNCONSTRAINED_MAX_GENERATED_TOKENS} generated tokens"
             )
         if gr_config.beam_max_decode_steps > 3:
@@ -96,7 +93,7 @@ def validate_npu_device_config(
         # explicit request overrides below.
         configured_k = configured_candidate_width(gr_config) if parent_widths is None else None
         candidate_width_error = (
-            "NPU unconstrained beam_search_v1 requires candidate_width "
+            "NPU unconstrained beam_search requires candidate_width "
             "to match each stage's beam width"
         )
         if configured_k is not None and configured_k != gr_config.beam_max_width:
@@ -112,7 +109,7 @@ def validate_npu_device_config(
                     device_temperature = math.inf
                 if not math.isfinite(device_temperature) or device_temperature == 0.0:
                     raise GRDeviceRequestError(
-                        "NPU unconstrained beam_search_v1 requires positive temperature "
+                        "NPU unconstrained beam_search requires positive temperature "
                         "to be representable as a finite nonzero float32 value"
                     )
             for candidate_width in (configured_k, request.beam_params.candidate_width):

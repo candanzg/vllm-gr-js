@@ -19,7 +19,7 @@ from vllm_gr.config import (
     gr_config_to_mapping,
     write_canonical_gr_config,
 )
-from vllm_gr.v1.engine.beam_search_v1 import validate_gr_device_config
+from vllm_gr.v1.engine.beam_search import validate_gr_device_config
 
 _V1_REQUIRED = "NPU unconstrained.*ModelRunner V1.*VLLM_USE_V2_MODEL_RUNNER=0"
 
@@ -99,7 +99,7 @@ def test_npu_v2_rejected_during_engine_config_before_runtime_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, encoding: str
 ) -> None:
     from vllm_gr.engine import arg_utils_gr
-    from vllm_gr.v1.engine import beam_search_v1
+    from vllm_gr.v1.engine import beam_search
 
     config = _host("npu", True)
     options = {
@@ -120,7 +120,7 @@ def test_npu_v2_rejected_during_engine_config_before_runtime_hooks(
     monkeypatch.setattr(arg_utils_gr, "_is_cuda_platform", lambda: False)
     runtime_validation = Mock(side_effect=AssertionError("runtime initialization reached"))
     canonical_write = Mock(side_effect=AssertionError("worker configuration published"))
-    monkeypatch.setattr(beam_search_v1, "validate_gr_execution_config", runtime_validation)
+    monkeypatch.setattr(beam_search, "validate_gr_execution_config", runtime_validation)
     monkeypatch.setattr(arg_utils_gr, "write_canonical_gr_config", canonical_write)
 
     with pytest.raises(ValueError, match=_V1_REQUIRED):
@@ -204,7 +204,7 @@ def test_npu_v2_request_rejected_before_native_preprocessing(mode: str) -> None:
 def test_native_npu_admission_rejects_candidate_width_before_preprocessing(
     mode: str, candidate_width: int, dynamic_beam_widths: tuple[int, ...] | None
 ) -> None:
-    from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+    from vllm_gr.v1.engine.beam_search import validate_gr_request
     from vllm_gr.v1.engine.core import _admit_gr_session
 
     config = _host("npu", False)

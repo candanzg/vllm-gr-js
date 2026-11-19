@@ -35,7 +35,7 @@ def beam_search_dispatch(
     """Route upstream OpenAI Beam calls exclusively to GR V1.
 
     Chat/Completion still call ``self.beam_search``; that upstream name is
-    only an adapter to ``beam_search_v1``, never a separate token loop.
+    only an adapter to ``beam_search``, never a separate token loop.
     ``prompt`` may be a sequence for one fixed V1 batch.
     """
     # Capture at generator creation, not iteration: upstream may consume the
@@ -44,11 +44,11 @@ def beam_search_dispatch(
     if trie_ids is None and selectors is not None:
         trie_ids = [next(selectors)]
     from vllm_gr.config.execution import require_beam_config
-    from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
+    from vllm_gr.entrypoints.openai.serving_engine import beam_search
 
     require_beam_config(getattr(self.engine_client, "vllm_config", None))
     trie_kwargs = {} if trie_ids is None else {"trie_ids": trie_ids}
-    return beam_search_v1(
+    return beam_search(
         self,
         prompt=prompt,
         request_id=request_id,
@@ -64,10 +64,8 @@ def patch_beam_search():
     from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 
     from vllm_gr.entrypoints.openai.completion_batch_patch import patch_completion_batch
-    from vllm_gr.entrypoints.openai.serving_engine import beam_search_v1
 
     GenerateBaseServing.beam_search = beam_search_dispatch
-    GenerateBaseServing.beam_search_v1 = beam_search_v1
     patch_admission_rejection_reporting()
     patch_completion_batch()
 

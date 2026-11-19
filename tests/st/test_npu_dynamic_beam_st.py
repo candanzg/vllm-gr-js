@@ -154,7 +154,7 @@ def _run_case(
     before = llm.collective_rpc("get_gr_beam_graph_runtime_stats")[0]
     llm.collective_rpc("dynamic_beam_trace_start")
     try:
-        outputs: list[Any] = llm.beam_search_v1(
+        outputs: list[Any] = llm.beam_search(
             [
                 tokens_input(prompt, cache_salt=f"{schedule}-{result_width}-{row}")
                 for row, prompt in enumerate(prompts)

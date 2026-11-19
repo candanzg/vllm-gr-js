@@ -34,7 +34,7 @@ from vllm_gr.v1.core.sched.session import (
     GRSessionStatus,
     GRStageCompletion,
 )
-from vllm_gr.v1.engine.beam_search_v1 import (
+from vllm_gr.v1.engine.beam_search import (
     validate_gr_device_config,
     validate_gr_execution_config,
     validate_gr_request,
@@ -268,7 +268,7 @@ def _install_gr_prompt_cache_guard(scheduler: Any) -> None:
 def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionState:
     """Validate admission without mutating session, owner or capacity state."""
     if not scheduler.scheduler_config.async_scheduling:
-        raise RuntimeError("beam_search_v1 requires vLLM async_scheduling")
+        raise RuntimeError("beam_search requires vLLM async_scheduling")
     try:
         config = getattr(scheduler, "vllm_config", None)
         validate_gr_request(
@@ -417,7 +417,7 @@ def attach_gr_stage_metadata(
     prefill_states = tuple(item["is_prefill_chunk"] for item in progress)
     if any(prefill_states):
         raise RuntimeError(
-            "beam_search_v1 cannot schedule partial Prefill or recompute: "
+            "beam_search cannot schedule partial Prefill or recompute: "
             f"session_id={session.session_id!r}, progress={progress!r}"
         )
     dispatch_id = session._next_dispatch_id

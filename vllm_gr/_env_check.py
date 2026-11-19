@@ -41,7 +41,7 @@ def configure_model_runner_default() -> None:
 
     An explicit ``VLLM_USE_V2_MODEL_RUNNER=1`` (or any truthy spelling) is
     preserved as an opt-in experimental path: the V2 runner is
-    beam_search_v1-only (persistent GR stage path).  The
+    beam_search-only (``execution_mode=v1`` persistent GR stage path).  The
     LEGACY ``beam_data`` frame stack is not supported under V2 and fails fast.
     """
     value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
@@ -60,7 +60,7 @@ def configure_model_runner_default() -> None:
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         logger.warning(
             "VLLM_USE_V2_MODEL_RUNNER=%s is an experimental vllm-gr path; "
-            "the V2 runner is beam_search_v1-only (legacy beam_data frames "
+            "the V2 runner is beam_search-only (legacy beam_data frames "
             "fail fast).",
             value,
         )

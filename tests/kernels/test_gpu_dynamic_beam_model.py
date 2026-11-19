@@ -141,7 +141,7 @@ def test_tiny_model_dynamic_decode(tmp_path):
                     ignore_eos=True,
                     temperature=0.0,
                 )
-                outputs = llm.beam_search_v1(prompts, params, output_mode="full")
+                outputs = llm.beam_search(prompts, params, output_mode="full")
                 runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
                 graph = runner._beam_decode_graph
                 expected_shapes = {(batch, width) for width in widths[:-1]}
@@ -153,7 +153,7 @@ def test_tiny_model_dynamic_decode(tmp_path):
                     for shape, entries in graph._registries.items()
                     if entries
                 }
-                repeated = llm.beam_search_v1(prompts, params, output_mode="full")
+                repeated = llm.beam_search(prompts, params, output_mode="full")
                 assert captures == {
                     shape: id(next(iter(entries.values())).cudagraph)
                     for shape, entries in graph._registries.items()

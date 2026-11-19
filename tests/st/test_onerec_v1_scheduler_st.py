@@ -539,14 +539,14 @@ def _run_onerec_v1_scheduler(work_dir: Path) -> None:
         llm.collective_rpc("onerec_v1_st_observe")
         for steps in (1, 2):
             with pytest.raises(ValueError, match="must equal constraint_table_v1 depth"):
-                llm.beam_search_v1([{"prompt_token_ids": source}], _params(steps))
+                llm.beam_search([{"prompt_token_ids": source}], _params(steps))
         assert not llm.collective_rpc("onerec_v1_st_events")[0]
         state_address = None
         for length, steps, cold in _CASES:
             if cold:
                 assert llm.reset_prefix_cache()
             ids = (newline * length + source)[-(length - 1) :]
-            public = llm.beam_search_v1(
+            public = llm.beam_search(
                 [{"prompt_token_ids": ids}], _params(steps), output_mode="full"
             )[0]
             snapshot = llm.collective_rpc("onerec_v1_st_snapshot")[0]
@@ -614,7 +614,7 @@ async def _run_online(work_dir: Path) -> None:
         await engine.collective_rpc("onerec_v1_st_observe")
         for steps in (1, 2):
             with pytest.raises(ValueError, match="must equal constraint_table_v1 depth"):
-                async for _ in serving.beam_search_v1(
+                async for _ in serving.beam_search(
                     tokens_input(source), "invalid-length", _params(steps)
                 ):
                     pytest.fail("invalid constrained length reached generation")
@@ -629,9 +629,7 @@ async def _run_online(work_dir: Path) -> None:
             ids = (newline * length + source)[-(length - 1) :]
             outputs = [
                 out
-                async for out in serving.beam_search_v1(
-                    tokens_input(ids), request_id, _params(steps)
-                )
+                async for out in serving.beam_search(tokens_input(ids), request_id, _params(steps))
             ]
             assert len(outputs) == 1 and outputs[0].finished
             output = outputs[0]
@@ -657,7 +655,7 @@ async def _run_online(work_dir: Path) -> None:
             if waiting:
                 await engine.pause_generation(mode="keep", clear_cache=False)
             before = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
-            stream = serving.beam_search_v1(tokens_input(newline * 1023), "cancelled", _params(3))
+            stream = serving.beam_search(tokens_input(newline * 1023), "cancelled", _params(3))
             task = asyncio.create_task(anext(stream))
             try:
                 deadline = time.monotonic() + 30
@@ -814,7 +812,7 @@ def _run_completion_reference(work_dir: Path) -> None:
         for count in sizes:
             assert llm.reset_prefix_cache()
             before = len(llm.collective_rpc("onerec_v1_st_events")[0])
-            outputs = llm.beam_search_v1(
+            outputs = llm.beam_search(
                 [{"prompt_token_ids": p} for p in prompts[:count]],
                 _params(3),
                 output_mode="full",
@@ -996,7 +994,7 @@ async def _run_online_completion_batch(work_dir: Path) -> None:
                 before_direct = len((await engine.collective_rpc("onerec_v1_st_events"))[0])
                 direct = [
                     output
-                    async for output in serving.beam_search_v1(
+                    async for output in serving.beam_search(
                         [tokens_input(p) for p in prompts[:count]], "direct-reference", _params(3)
                     )
                 ]

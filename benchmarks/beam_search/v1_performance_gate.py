@@ -50,6 +50,17 @@ def distribution(values: list[float]) -> dict[str, float]:
     }
 
 
+def resolve_beam_search(llm: Any) -> Any:
+    """Select the public Beam method exposed by the loaded runtime.
+
+    This driver runs against both the pre-rename and the renamed checkout.
+    Pre-rename runtimes expose ``beam_search_v1`` while ``beam_search`` is a
+    retired stub; the renamed runtime exposes only ``beam_search``.
+    """
+    method = getattr(llm, "beam_search_v1", None)
+    return method if method is not None else llm.beam_search
+
+
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -196,9 +207,10 @@ def _measure_offline_batch(
     import torch
 
     start = time.perf_counter_ns()
-    outputs = llm.beam_search_v1(prompts, params, use_tqdm=False)
+    # Pin compact on both revisions: the base defaults to compact and the head
+    # defaults to full, whose lazy text materialization would add PR-side work.
+    outputs = resolve_beam_search(llm)(prompts, params, use_tqdm=False, output_mode="compact")
     # Consume identical generated IDs, scores and decoded text on both revisions.
-    # The base runtime returns full outputs; the candidate defaults to compact.
     # Do not import candidate-only output classes in this shared A/B driver.
     consumed = []
     for request_index, output in enumerate(outputs):
@@ -491,9 +503,7 @@ def main() -> None:
         raise ValueError("empty benchmark prompt")
     result: dict[str, Any] = {
         "mode": args.mode,
-        "api": (
-            "GRLLM.beam_search_v1" if args.mode == "offline" else "OpenAI HTTP V1 beam dispatch"
-        ),
+        "api": ("GRLLM.beam_search" if args.mode == "offline" else "OpenAI HTTP V1 beam dispatch"),
         "cases": [],
         "complete": False,
     }

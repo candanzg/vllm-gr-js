@@ -8,7 +8,7 @@ from msgspec.structs import asdict
 from vllm.sampling_params import BeamSearchParams as NativeBeamSearchParams
 
 from vllm_gr.config import GRConfig
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
 from vllm_gr.sampling_params import BeamSearchParams
 
 

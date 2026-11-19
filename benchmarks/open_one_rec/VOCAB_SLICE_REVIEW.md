@@ -136,7 +136,7 @@ done
 
 Remove --strict-bf16 for default-precision cases. The strict flag affects only
 the isolated validation worker; it is not a production option. This manual
-integration harness reuses OneRecDataset and calls beam_search_v1 directly,
+integration harness reuses OneRecDataset and calls beam_search directly,
 adding worker events, memory snapshots and raw parent/token/score capture.
 For the regular CLI, see the [OneRec benchmark guide](V1_BENCHMARK.md).
 

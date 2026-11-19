@@ -464,7 +464,7 @@ def patched_add_cli_args(parser):
     """Patch add_cli_args to include onerec arguments."""
     original_add_cli_args(parser)
     parser.add_argument(
-        "--beam-search-v1",
+        "--beam-search",
         action="store_true",
         help="Select Beam benchmarking (all GR Beam benchmarks use V1)",
     )
@@ -558,7 +558,7 @@ def patched_main(args):
     """Patch main to handle beam search and fix tokenizer initialization."""
     # Check if this is an offline beam search benchmark
     is_beam_search = (
-        getattr(args, "beam_search_v1", False)
+        getattr(args, "beam_search", False)
         or USE_BEAM_SEARCH
         or (hasattr(args, "n") and args.n and args.n > 1)
     )

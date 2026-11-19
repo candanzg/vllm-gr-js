@@ -92,13 +92,13 @@ patches:
     validator_or_test:
       - vllm_gr.patch._validate_openai_beam_search_patch
       - vllm_gr.patch._validate_chat_sampling_patch
-      - tests/entrypoints/beam_search_v1/test_beam_search_v1_online_entry.py
+      - tests/entrypoints/beam_search/test_beam_search_online_entry.py
       - tests/st/test_onerec_v1_scheduler_st.py::test_onerec_v1_completion_batch_online
       - tests/entrypoints/openai/test_beam_search_dispatch.py
     process_roles: [api_server]
-    target: GenerateBaseServing.beam_search/beam_search_v1 and ChatCompletionRequest/CompletionRequest.to_beam_search_params
+    target: GenerateBaseServing.beam_search and ChatCompletionRequest/CompletionRequest.to_beam_search_params
     risk: high
-    contract: beam_search adapts upstream callers exclusively to beam_search_v1
+    contract: beam_search adapts upstream callers exclusively to the GR implementation
     removal_condition: upstream exposes grouped-Beam serving and sampling extension points
 
   - id: GR-PATCH-005
@@ -127,7 +127,7 @@ patches:
       - vllm_gr.patch._validate_batch_and_fork_patch
       - tests/v1/beam/test_beam_request_unit.py
       - tests/v1/engine/test_gr_admission_queue.py
-      - tests/entrypoints/beam_search_v1/test_beam_search_v1_online_entry.py
+      - tests/entrypoints/beam_search/test_beam_search_online_entry.py
       - tests/v1/engine/test_beam_admission_rejection_reporting.py
     process_roles: [api_server]
     target: EngineCore clients and AsyncLLM

@@ -36,7 +36,7 @@ The legacy `--triples` command still writes six-table v1 artifacts.
 ## Requests
 
 ```python
-outputs = llm.beam_search_v1(
+outputs = llm.beam_search(
     prompts=[prompt_a, prompt_b],
     params=BeamSearchParams(beam_width=64, max_tokens=3, ignore_eos=True),
     trie_ids=[0, 1],

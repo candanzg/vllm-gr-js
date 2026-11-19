@@ -30,7 +30,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --num-prompts 100 \
   --output-json results/throughput.json \
   --constraint-triples "$ONEREC_TRIPLES" \
-  --output-len 5 --beam-search-v1 \
+  --output-len 5 --beam-search \
   --n 128
 ```
 
@@ -99,7 +99,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 | Argument               | Type | Default | Description                          |
 | ---------------------- | ---- | ------- | ------------------------------------ |
-| `--beam-search-v1`     | flag | `False` | Select the offline V1 Beam benchmark |
+| `--beam-search`        | flag | `False` | Select the offline V1 Beam benchmark |
 | `--constraint-triples` | path | -       | Required for offline Beam V1         |
 | `--use-beam-search`    | flag | `False` | Enable beam search during generation |
 | `--n`                  | int  | -       | Number of beams for beam search      |
@@ -133,7 +133,7 @@ setting below. Use your actual dataset directory and constraint JSON path.
 NPY_DISABLE_CPU_FEATURES=AVX512F,AVX512CD,AVX512_KNL,AVX512_KNM,AVX512_SKX,AVX512_CLX,AVX512_CNL,AVX512_ICL \
   python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --model "$ONEREC_MODEL" --dataset-name onerec --dataset-path ./data \
-  --task-types video --num-prompts 100 --beam-search-v1 --n 128 \
+  --task-types video --num-prompts 100 --beam-search --n 128 \
   --output-len 5 --constraint-triples "$ONEREC_TRIPLES" \
   --output-json results/throughput-no-avx512.json
 ```

@@ -36,7 +36,7 @@ def _dispatch(
 ) -> list[tuple[str, dict[str, Any]]]:
     calls: list[tuple[str, dict[str, Any]]] = []
     serving_engine = ModuleType("vllm_gr.entrypoints.openai.serving_engine")
-    setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
+    setattr(serving_engine, "beam_search", _recorder("v1", calls))
     monkeypatch.setitem(sys.modules, serving_engine.__name__, serving_engine)
     config = None if additional is None else SimpleNamespace(additional_config=additional)
     serving = SimpleNamespace(engine_client=SimpleNamespace(vllm_config=config))
@@ -131,7 +131,7 @@ def test_completion_fallback_binds_ids_before_iteration(monkeypatch: Any) -> Non
     from vllm_gr.entrypoints.openai.beam_search_patch import _COMPLETION_TRIE_IDS
 
     calls: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(serving_engine, "beam_search_v1", _recorder("v1", calls))
+    monkeypatch.setattr(serving_engine, "beam_search", _recorder("v1", calls))
     serving = SimpleNamespace(
         engine_client=SimpleNamespace(
             vllm_config=SimpleNamespace(
@@ -206,28 +206,16 @@ def test_patch_is_idempotent_and_keeps_native_mixin(monkeypatch: Any) -> None:
     from vllm.entrypoints.generate.base.serving import GenerateBaseServing
     from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 
-    from vllm_gr.entrypoints.openai import serving_engine
     from vllm_gr.patch import _validate_openai_beam_search_patch
 
     native = BeamSearchOnlineMixin.beam_search
     patch_beam_search()
     patch_beam_search()
     assert GenerateBaseServing.beam_search is beam_search_dispatch
-    assert GenerateBaseServing.beam_search_v1 is serving_engine.beam_search_v1
     assert BeamSearchOnlineMixin.beam_search is native
     assert _validate_openai_beam_search_patch() is None
     with pytest.raises(ValueError, match="gr.beam_width"):
         _dispatch(None, monkeypatch)
-
-
-def test_offline_old_name_cannot_fall_back_to_upstream() -> None:
-    from vllm_gr.entrypoints.gr import GRLLM
-
-    # No engine/tokenizer is needed to reject an old caller, including legacy
-    # kwargs which must not be silently translated into a V1 request.
-    llm = object.__new__(GRLLM)
-    with pytest.raises(NotImplementedError, match=r"removed.*beam_search_v1"):
-        llm.beam_search([], object(), output_mode="compact")
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

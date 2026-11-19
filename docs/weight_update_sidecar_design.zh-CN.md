@@ -126,7 +126,7 @@ reload 创建新的 backend，成功后将默认访问切换到最新表；准�
 到期后在下一次 wrapper API 调用时释放。
 没有计时线程，也不按请求固定版本或做引用计数。
 访问默认指向最新版本，因此不保证一个请求全过程使用同一个 Trie 版本。
-当前在线 Trie reload 支持 CUDA 异步 `beam_search_v1` 路径，Trie 数量和词表投影保持不变。
+当前在线 Trie reload 支持 CUDA 异步 `beam_search` 路径，Trie 数量和词表投影保持不变。
 
 ## 统一更新生命周期
 

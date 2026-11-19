@@ -210,7 +210,7 @@ def _run_case(
         f"prompt_lengths={[len(prompt) for prompt in prompts]}; cache_salts={cache_salts}",
         flush=True,
     )
-    outputs = llm.beam_search_v1(request_prompts, params, output_mode="full")
+    outputs = llm.beam_search(request_prompts, params, output_mode="full")
     _assert_public_outputs(tokenizer, prompts, outputs, legal, steps)
     assert not llm.llm_engine.has_unfinished_requests()
     assert llm.reset_prefix_cache(), "NPU session retained scheduler resources"
@@ -362,7 +362,7 @@ def _assert_batch_equal(reference: list[Any], candidate: list[Any], label: str) 
 
 
 def _run_npu_e2e(work_dir: Path, *, graph: bool = False) -> None:
-    from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
+    from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
     from vllm_gr.entrypoints.gr import GRLLM
 
     exact_prefill = graph and not _padded_prefill_requested(os.environ)

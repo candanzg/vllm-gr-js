@@ -13,7 +13,7 @@ import pytest
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCore
 
-from tests.entrypoints.beam_search_v1.test_beam_search_v1_input_processor import (
+from tests.entrypoints.beam_search.test_beam_search_input_processor import (
     _canonical_gr_config,
     _make_engine,
 )
@@ -27,9 +27,9 @@ from tests.v1.engine.test_gr_admission_queue import (
 )
 from tests.v1.engine.test_gr_admission_queue import core as _core_fixture
 from tests.v1.engine.test_gr_admission_queue import scheduler as _scheduler_fixture
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchRequestError
-from vllm_gr.entrypoints.beam_search_v1.input_processor import BeamSearchInputProcessor
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchRequestError
+from vllm_gr.entrypoints.beam_search.input_processor import BeamSearchInputProcessor
+from vllm_gr.entrypoints.beam_search.protocol import (
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
 )
@@ -38,7 +38,7 @@ from vllm_gr.v1.beam.batch_contracts import BeamBatchItem, GRAdmissionError
 from vllm_gr.v1.core.sched.gr_async_scheduler import (
     _prepare_gr_session,
 )
-from vllm_gr.v1.engine.beam_search_v1 import validate_gr_request
+from vllm_gr.v1.engine.beam_search import validate_gr_request
 from vllm_gr.v1.engine.core import _handle_submit_gr_session
 
 core = _core_fixture

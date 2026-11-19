@@ -14,16 +14,16 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from vllm.exceptions import VLLMValidationError
 
-from vllm_gr.entrypoints.beam_search_v1 import (
-    run_beam_search_v1,
-    run_beam_search_v1_async,
+from vllm_gr.entrypoints.beam_search import (
+    run_beam_search,
+    run_beam_search_async,
 )
-from vllm_gr.entrypoints.beam_search_v1.client import (
+from vllm_gr.entrypoints.beam_search.client import (
     AsyncBeamSearchClient,
     BeamSearchClient,
 )
-from vllm_gr.entrypoints.beam_search_v1.exceptions import BeamSearchEngineError
-from vllm_gr.entrypoints.beam_search_v1.protocol import (
+from vllm_gr.entrypoints.beam_search.exceptions import BeamSearchEngineError
+from vllm_gr.entrypoints.beam_search.protocol import (
     BeamSearchSession,
     OfflineBeamSearchRequest,
     OnlineBeamSearchRequest,
@@ -258,7 +258,7 @@ def test_close_retries_after_entrypoint_and_client_exit(
         backend.allow_submit.set()
         client = Client(SimpleNamespace(engine_client=backend))
         with pytest.raises(RuntimeError):
-            await run_beam_search_v1_async(
+            await run_beam_search_async(
                 client, OnlineBeamSearchRequest(([1, 2],), "request-1", object())
             )
         del client
@@ -333,7 +333,7 @@ def test_sync_entrypoint_retries_cleanup_before_exiting(operation: str) -> None:
         release_gr_session=lambda session_id: cleanup("release", session_id),
     )
     with pytest.raises(RuntimeError):
-        run_beam_search_v1(
+        run_beam_search(
             Client(SimpleNamespace(llm_engine=engine)), OfflineBeamSearchRequest([[1, 2]], object())
         )
     assert not active
@@ -583,7 +583,7 @@ def test_inproc_step_failure_reaches_the_caller_with_its_cause() -> None:
     frontend = BeamSearchClient(SimpleNamespace(llm_engine=engine))
     frontend.prepare_request = lambda call: make_batch_request()
     with pytest.raises(EngineDeadError) as raised:
-        run_beam_search_v1(frontend, OfflineBeamSearchRequest([[1, 2]], object()))
+        run_beam_search(frontend, OfflineBeamSearchRequest([[1, 2]], object()))
 
     assert raised.value.__cause__ is oom
     assert calls == {"steps": 1, "retired_checks": 0}
@@ -594,7 +594,7 @@ def test_engine_dead_propagates_and_ends_async_cleanup(operation: str) -> None:
     from vllm.v1.engine.exceptions import EngineDeadError
 
     from tests.helpers.beam_requests import make_batch_request
-    from vllm_gr.entrypoints.beam_search_v1.client import _ASYNC_CLEANUP_TASKS
+    from vllm_gr.entrypoints.beam_search.client import _ASYNC_CLEANUP_TASKS
 
     async def run() -> None:
         calls = []
@@ -627,7 +627,7 @@ def test_engine_dead_propagates_and_ends_async_cleanup(operation: str) -> None:
 
 
 def test_engine_only_client_reuses_session_methods() -> None:
-    from vllm_gr.entrypoints.beam_search_v1.client import AsyncBeamSearchClient
+    from vllm_gr.entrypoints.beam_search.client import AsyncBeamSearchClient
     from vllm_gr.v1.beam.batch_contracts import BeamBatchResult
 
     async def run() -> None:

@@ -170,7 +170,7 @@ from contextlib import redirect_stdout
 model, triples, artifact_path, backend, width = sys.argv[1:]
 artifact = Path(artifact_path)
 with redirect_stdout(sys.stderr):
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import build_artifact
+    from examples.offline_inference.beam_search.offline_beam_search import build_artifact
 
     digest, tokenizer_digest = build_artifact(Path(model), Path(triples), artifact)
 print(json.dumps({

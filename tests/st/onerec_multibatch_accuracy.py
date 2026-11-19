@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Real video accuracy for beam_search_v1, using the system benchmark evaluator.
+"""Real video accuracy for beam_search, using the system benchmark evaluator.
 
 Run as a module in a fresh process. The runner flag selects ModelRunner;
 both runners use the same public Beam V1 protocol and CUDA constraint table.
@@ -50,7 +50,7 @@ def run(args: argparse.Namespace) -> int:
         TASK_REGISTRY,
         DataLoaderWrapper,
     )
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
+    from examples.offline_inference.beam_search.offline_beam_search import (
         build_artifact,
         load_triples,
     )
@@ -293,7 +293,7 @@ def run(args: argparse.Namespace) -> int:
             persist()
             for offset in range(0, len(samples), b):
                 tick = time.perf_counter()
-                outputs = llm.beam_search_v1(
+                outputs = llm.beam_search(
                     [{"prompt": s["prompt"]} for s in samples[offset : offset + b]],
                     params,
                     use_tqdm=False,

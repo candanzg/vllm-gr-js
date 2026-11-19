@@ -60,9 +60,9 @@ def validate_gr_execution_runtime(config: Any) -> None:
     if not config.scheduler_config.async_scheduling:
         raise ValueError("Asynchronous scheduling requires async_scheduling=True")
     if getattr(config.scheduler_config, "enable_chunked_prefill", False):
-        raise ValueError("beam_search_v1 requires enable_chunked_prefill=False")
+        raise ValueError("beam_search requires enable_chunked_prefill=False")
     if getattr(config.scheduler_config, "long_prefill_token_threshold", 0):
-        raise ValueError("beam_search_v1 does not support partial Prefill scheduling")
+        raise ValueError("beam_search does not support partial Prefill scheduling")
     parallel = getattr(config, "parallel_config", None)
     for name in (
         "tensor_parallel_size",
@@ -125,7 +125,7 @@ def validate_gr_device_config(config: Any, request: BeamBatchRequest | None = No
             or request.output_options.num_return_sequences != request.beam_params.beam_width
         )
     ):
-        raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search_v1")
+        raise ValueError("dynamic beam widths and result widths require CUDA or NPU beam_search")
 
 
 def _reject_candidate_width_below_dynamic_schedule(

@@ -13,13 +13,42 @@ from pathlib import Path
 from tools.AB_Tests.run_offline_benchmark import distribution_ms
 
 
+def _resolve_beam_search(llm):
+    """Select the public Beam method exposed by the loaded runtime.
+
+    The documented A/B workflow runs this harness against both the pre-rename
+    and the renamed checkout. Pre-rename runtimes expose ``beam_search_v1``
+    while ``beam_search`` is a retired stub; the renamed runtime exposes only
+    ``beam_search``.
+    """
+    method = getattr(llm, "beam_search_v1", None)
+    return method if method is not None else llm.beam_search
+
+
+def _load_build_artifact():
+    """Load ``build_artifact`` from the example module present in the checkout."""
+    from importlib import import_module
+    from importlib.util import find_spec
+
+    for module_name in (
+        "examples.offline_inference.beam_search.offline_beam_search",
+        "examples.offline_inference.beam_search.offline_beam_search_v1",
+    ):
+        try:
+            spec = find_spec(module_name)
+        except ModuleNotFoundError:
+            spec = None
+        if spec is not None:
+            return import_module(module_name).build_artifact
+    raise ImportError("no offline beam-search example module provides build_artifact")
+
+
 def run_v1_benchmark(args, tokenizer, requests):
     import vllm_gr
-    from examples.offline_inference.beam_search.offline_beam_search_v1 import (
-        build_artifact,
-    )
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
+
+    build_artifact = _load_build_artifact()
 
     if args.num_prompts < 1 or args.warmup_requests < 0 or args.n < 1:
         raise ValueError("invalid request, warmup or beam count")
@@ -93,7 +122,9 @@ def run_v1_benchmark(args, tokenizer, requests):
                 if not llm.reset_prefix_cache():
                     raise RuntimeError(f"prefix cache reset failed before request {index}")
                 start = time.perf_counter_ns()
-                outputs = llm.beam_search_v1([{"prompt": prompts[row]}], params, output_mode="full")
+                outputs = _resolve_beam_search(llm)(
+                    [{"prompt": prompts[row]}], params, output_mode="full"
+                )
                 # V1 materializes tokens/text lazily: force every beam before stopping the timer.
                 for output in outputs:
                     for sequence in output.sequences:
@@ -120,7 +151,7 @@ def run_v1_benchmark(args, tokenizer, requests):
     latencies = [sample["e2e_ms"] for sample in samples]
     repo = Path(vllm_gr.__file__).resolve().parents[1]
     result = {
-        "api": "GRLLM.beam_search_v1",
+        "api": "GRLLM.beam_search",
         "commit": subprocess.check_output(
             ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
         ).strip(),
