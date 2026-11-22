@@ -15,7 +15,7 @@ in place of `engine.yaml`. On Ascend, select
     ```bash
     vllm serve /models/OneRec --gr \
       --config engine.yaml \
-      --host 0.0.0.0 --port 8000 \
+      --host 127.0.0.1 --port 8000 \
       --trust-remote-code \
       --max-model-len 8192 \
       --max-num-batched-tokens 16384 \
@@ -29,6 +29,11 @@ in place of `engine.yaml`. On Ascend, select
     ```bash
     vllm serve /models/OneRec --gr --config engine.yaml --grpc --port 8000
     ```
+
+The examples bind `127.0.0.1`. The server has no built-in authentication and
+must not be exposed on an untrusted network; see the
+[security policy](../../SECURITY.md). To accept remote connections, set
+`--host` to a reachable address only behind your own access control.
 
 ## Arguments
 
