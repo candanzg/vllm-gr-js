@@ -47,6 +47,8 @@ Local files adapted from vLLM, with the upstream path at the revision above:
     vllm/v1/attention/backends/flash_attn.py
   vllm_gr/v1/engine/core.py
     vllm/v1/engine/core.py
+  vllm_gr/v1/engine/core_socket.py
+    vllm/v1/engine/core.py
 
 The following are adapted from earlier vLLM revisions, at the same upstream
 path, and are not present at the revision above:
@@ -275,5 +277,8 @@ test/python_test/ and their copyright statement:
     test_select_unshared_kv.py, test_onerec_final_beam_select.py,
     test_beam_search_group.py, test_rec_constrained_topk.py
     (Copyright 2025 and 2026 The xLLM Authors. All Rights Reserved.)
+  tools/npu/xattention_out/xattention_out.cpp
+    RegisterOps.cpp  (Copyright 2025 The xLLM Authors. All Rights Reserved.)
+    This file adds an output-buffer binding; it does not replace the kernel.
 
 This NOTICE is informational and does not modify any applicable license.
