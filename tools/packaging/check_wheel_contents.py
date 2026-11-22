@@ -26,6 +26,42 @@ def package_files(wheel: Path) -> set[str]:
         }
 
 
+def base_requires_dist(wheel: Path) -> set[str]:
+    """Normalized base (non-extra) Requires-Dist entries of a wheel."""
+    from packaging.requirements import Requirement
+
+    with ZipFile(wheel) as archive:
+        (metadata,) = (n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
+        text = archive.read(metadata).decode()
+    requires = set()
+    for line in text.splitlines():
+        if not line.startswith("Requires-Dist: "):
+            continue
+        requirement = Requirement(line[len("Requires-Dist: ") :])
+        if requirement.marker is None or not str(requirement.marker).count("extra"):
+            requires.add(str(requirement))
+    return requires
+
+
+def expected_requirements(root: Path, device: str) -> set[str]:
+    """Normalized requirements declared by requirements/<device>.txt (with -r)."""
+    from packaging.requirements import Requirement
+
+    def read(path: Path) -> list[str]:
+        items: list[str] = []
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-r "):
+                items.extend(read(path.parent / line[3:].strip()))
+            else:
+                items.append(str(Requirement(line)))
+        return items
+
+    return set(read(root / "requirements" / f"{device}.txt"))
+
+
 def main() -> None:
     if os.environ.get("VLLM_GR_TARGET_DEVICE") not in {"cpu", "cuda", "npu"}:
         raise SystemExit("Set VLLM_GR_TARGET_DEVICE to cpu, cuda or npu for both builds.")
@@ -81,7 +117,26 @@ def main() -> None:
             relative = PROTO_DIR / proto
             if (installed / relative).read_bytes() != (export / relative).read_bytes():
                 raise SystemExit(f"Installed protocol file differs from the source: {relative}")
-    print(f"Verified {len(from_sdist)} package files and installed gRPC protocols in {wheel.name}")
+
+    device = os.environ["VLLM_GR_TARGET_DEVICE"]
+    actual = base_requires_dist(wheel)
+    expected = expected_requirements(ROOT, device)
+    if not actual:
+        raise SystemExit(
+            f"Wheel {wheel.name} declares no base dependencies; "
+            f"requirements/{device}.txt was not applied."
+        )
+    if actual != expected:
+        raise SystemExit(
+            "Wheel base Requires-Dist does not match "
+            f"requirements/{device}.txt\n"
+            f"Only in wheel: {sorted(actual - expected)}\n"
+            f"Only in requirements: {sorted(expected - actual)}"
+        )
+    print(
+        f"Verified {len(from_sdist)} package files, {len(actual)} base dependencies "
+        f"and installed gRPC protocols in {wheel.name}"
+    )
 
 
 if __name__ == "__main__":

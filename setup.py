@@ -177,8 +177,10 @@ def load_requirements(file_path: Path) -> list[str]:
     requirements: list[str] = []
 
     if not file_path.exists():
-        logger.warning("Requirements file not found: %s", file_path)
-        return requirements
+        # A missing requirements file must fail the build, not silently yield
+        # empty dependencies: an sdist built without requirements/ would
+        # otherwise produce a wheel whose base Requires-Dist is empty.
+        raise FileNotFoundError(f"Required dependency file is missing: {file_path}")
 
     with open(file_path) as f:
         for line in f:
@@ -206,9 +208,11 @@ def get_install_requires() -> list[str]:
     requirements = load_requirements(requirements_file)
 
     if not requirements:
-        logger.warning("No requirements loaded for device '%s'", device)
-    else:
-        logger.info("Loaded %d requirements for %s", len(requirements), device)
+        raise ValueError(
+            f"No requirements loaded for device '{device}' from {requirements_file}; "
+            "the base distribution would declare no dependencies."
+        )
+    logger.info("Loaded %d requirements for %s", len(requirements), device)
 
     return requirements
 

@@ -478,4 +478,25 @@ def test_warn_deprecated_extra_install_emits_warning() -> None:
         sys.argv = original_argv
 
 
+def test_load_requirements_missing_file_raises(tmp_path: Path) -> None:
+    gr_setup = _load_setup_module()
+    with pytest.raises(FileNotFoundError):
+        gr_setup.load_requirements(tmp_path / "does_not_exist.txt")
+
+
+def test_get_install_requires_empty_file_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gr_setup = _load_setup_module()
+    (tmp_path / "requirements").mkdir()
+    (tmp_path / "requirements" / "cpu.txt").write_text("# only a comment\n")
+    monkeypatch.setattr(gr_setup, "_cached_device", None)
+    monkeypatch.setattr(gr_setup, "detect_target_device", lambda: "cpu")
+    monkeypatch.setattr(gr_setup, "warn_deprecated_extra_install", lambda: None)
+    # get_install_requires resolves requirements/ from the module file location.
+    monkeypatch.setattr(gr_setup, "__file__", str(tmp_path / "setup.py"), raising=False)
+    with pytest.raises(ValueError):
+        gr_setup.get_install_requires()
+
+
 pytestmark = pytest.mark.cpu_test
