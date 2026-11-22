@@ -54,9 +54,11 @@ python -c 'import vllm_gr; print(vllm_gr.__file__)'
 
 ## Validation and reporting
 
-`pre-commit run --all-files` includes the full pytest suite with `--run-slow`.
-Use explicit hook IDs for documentation changes. `tools/run_test.sh` selects an
-accelerator and may build NPU operators; check its documented prerequisites.
+`pre-commit run --all-files` runs the lint and header hooks. The full pytest
+suite (`run-tests`) is a manual-stage hook and needs an accelerator; run it with
+`pre-commit run run-tests --hook-stage manual` or `tools/run_test.sh`, which
+selects an accelerator and may build NPU operators; check its documented
+prerequisites.
 
 Host-oriented tests can still require Torch and vLLM through
 `tests/conftest.py`. A CPU wheel or reference implementation does not establish

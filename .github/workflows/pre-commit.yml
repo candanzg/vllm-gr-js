@@ -447,6 +447,16 @@ jobs:
           --color=always
           --all-files
 
+      # run-tests and the extra mypy versions are manual-stage hooks, so the
+      # pre-commit-stage run above skips them. Invoke the suite explicitly on
+      # the accelerator; VLLM_GR_TEST_LEVEL selects the per-PR level.
+      - name: Run test suite
+        run: >-
+          pre-commit run run-tests
+          --all-files
+          --hook-stage manual
+          --color=always
+
       - name: Run L2 resource probe if isolated
         run: bash tools/ci/run_resource_level.sh
 

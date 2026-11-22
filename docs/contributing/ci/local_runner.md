@@ -75,7 +75,9 @@ masks with the available devices and skip devices whose telemetry is missing
 or invalid. CUDA locks verify the physical device UUID. Ascend locks use
 sleep processes as advisory markers.
 
-By default the test hook runs the full pytest suite with `--run-slow`. Set
+The test hook (`run-tests`) runs only at the manual stage; invoke it with
+`pre-commit run run-tests --hook-stage manual`. By default it runs the full
+pytest suite with `--run-slow`. Set
 `VLLM_GR_TEST_LEVEL=pr` to select L1 and L2. For a CUDA level run, set
 `VLLM_GR_TARGET_DEVICE=cuda` to select CPU and CUDA tests within those levels.
 The Ascend runner sets its target automatically. See

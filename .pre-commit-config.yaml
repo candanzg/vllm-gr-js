@@ -203,3 +203,7 @@ repos:
       language: system
       pass_filenames: false
       verbose: true
+      # Manual-only: the suite needs an accelerator, so a plain `git commit`
+      # must not trigger it. CI and local runs invoke it with
+      # `pre-commit run run-tests --hook-stage manual`.
+      stages: [manual]

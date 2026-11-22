@@ -26,12 +26,13 @@ The regex import, CUDA API, ShellCheck, and Excalidraw PNG hooks honor the
 selected file list. To check tracked shell scripts directly, run
 `bash tools/pre_commit/shellcheck.sh` from the repository root.
 
-!!! warning "Select a named hook for targeted checks"
+!!! note "The test suite is a manual-stage hook"
 
-    `pre-commit run --files` can trigger `run-tests` if you omit the hook ID.
-    The test hook receives no filenames and runs the full pytest suite by
-    default, including slow tests. See [test levels](ci/test_levels.md) and
-    [running tests locally](ci/local_runner.md) to select runtime tests.
+    `run-tests` runs only at the manual stage, so a plain `git commit` and
+    `pre-commit run --files` do not trigger it. Run the full pytest suite
+    explicitly with `pre-commit run run-tests --hook-stage manual`. It receives
+    no filenames and needs an accelerator. See [test levels](ci/test_levels.md)
+    and [running tests locally](ci/local_runner.md) to select runtime tests.
 
 If a hook changes a file, review the diff and rerun that hook.
 
