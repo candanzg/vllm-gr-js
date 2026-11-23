@@ -233,6 +233,7 @@ def test_v1_startup_heap_keeps_dynamic_cycles_collectible_and_releases_owners() 
             def __init__(self):
                 self.peer = self
 
+        gc.set_threshold(700, 10, 10)
         threshold, enabled = gc.get_threshold(), gc.isenabled()
         for _ in range(2):
             startup = Node()
@@ -240,6 +241,7 @@ def test_v1_startup_heap_keeps_dynamic_cycles_collectible_and_releases_owners() 
             acquire_frontend_startup_heap()
             acquire_frontend_startup_heap()
             assert gc.get_freeze_count() > 0
+            assert gc.get_threshold() == (50000, 50000, 50000)
             del startup
             transient = Node()
             transient_ref = weakref.ref(transient)
@@ -250,12 +252,102 @@ def test_v1_startup_heap_keeps_dynamic_cycles_collectible_and_releases_owners() 
             release_frontend_startup_heap()
             gc.collect()
             assert startup_ref() is not None
+            assert gc.get_threshold() == (50000, 50000, 50000)
             release_frontend_startup_heap()
             assert gc.get_freeze_count() == 0
+            assert gc.get_threshold() == threshold
             gc.collect()
             assert startup_ref() is None
 
         assert gc.get_threshold() == threshold and gc.isenabled() == enabled
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("before", "during"),
+    [
+        ((700, 10, 10), (50000, 50000, 50000)),
+        # threshold0=0 disables automatic collection; the caller keeps that.
+        ((0, 10, 10), (0, 10, 10)),
+        # Larger caller thresholds are kept, smaller ones are raised.
+        ((200000, 10, 300000), (200000, 50000, 300000)),
+    ],
+)  # type: ignore[misc]
+def test_v1_startup_heap_never_lowers_or_reenables_caller_gc_thresholds(
+    before: tuple[int, int, int], during: tuple[int, int, int]
+) -> None:
+    script = textwrap.dedent(
+        f"""
+        import gc
+        from vllm_gr.entrypoints.common.lifecycle import (
+            acquire_frontend_startup_heap, release_frontend_startup_heap,
+        )
+
+        gc.set_threshold(*{before!r})
+        acquire_frontend_startup_heap()
+        acquire_frontend_startup_heap()
+        assert gc.get_threshold() == {during!r}, gc.get_threshold()
+        release_frontend_startup_heap()
+        assert gc.get_threshold() == {during!r}, gc.get_threshold()
+        release_frontend_startup_heap()
+        assert gc.get_threshold() == {before!r}, gc.get_threshold()
+        assert gc.get_freeze_count() == 0
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("before", "changed", "after"),
+    [
+        # The lease raised the thresholds; the application then disabled
+        # automatic collection. The last close must not turn it back on.
+        ((700, 10, 10), (0, 10, 10), (0, 10, 10)),
+        # The application chose its own values while the lease was held.
+        ((700, 10, 10), (30000, 5, 5), (30000, 5, 5)),
+        # The application set exactly what the lease had written: unchanged
+        # from the lease's point of view, so the saved thresholds come back.
+        ((700, 10, 10), (50000, 50000, 50000), (700, 10, 10)),
+        # The lease wrote nothing (threshold0=0), so there is nothing to undo.
+        ((0, 10, 10), (123, 4, 5), (123, 4, 5)),
+        # Larger caller thresholds were kept; a change is kept as well.
+        ((200000, 10, 300000), (0, 0, 0), (0, 0, 0)),
+    ],
+)  # type: ignore[misc]
+def test_v1_startup_heap_keeps_thresholds_the_application_changes_during_the_lease(
+    before: tuple[int, int, int],
+    changed: tuple[int, int, int],
+    after: tuple[int, int, int],
+) -> None:
+    script = textwrap.dedent(
+        f"""
+        import gc
+        from vllm_gr.entrypoints.common.lifecycle import (
+            acquire_frontend_startup_heap, release_frontend_startup_heap,
+        )
+
+        gc.set_threshold(*{before!r})
+        acquire_frontend_startup_heap()
+        acquire_frontend_startup_heap()
+        gc.set_threshold(*{changed!r})
+        release_frontend_startup_heap()
+        assert gc.get_threshold() == {changed!r}, gc.get_threshold()
+        release_frontend_startup_heap()
+        assert gc.get_threshold() == {after!r}, gc.get_threshold()
+        assert gc.get_freeze_count() == 0
+
+        # A later lease starts from the thresholds in effect at that moment.
+        acquire_frontend_startup_heap()
+        release_frontend_startup_heap()
+        assert gc.get_threshold() == {after!r}, gc.get_threshold()
         """
     )
     result = subprocess.run(

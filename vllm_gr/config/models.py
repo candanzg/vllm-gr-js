@@ -119,8 +119,10 @@ class DeploymentOptions:
                 raise ValueError(f"gr.{key} requires a positive integer")
         if any(v > 8 for v in self.beam_batch_sizes):
             raise ValueError("GR beam batch sizes must be in 1..8")
-        if self.topk_keep > 256 or self.topk_select not in ("i32", "i64"):
-            raise ValueError("gr.topk_keep must be in 1..256 and topk_select must be i32 or i64")
+        if self.topk_keep > 256 or self.topk_select not in ("i32", "i64", "flash"):
+            raise ValueError(
+                "gr.topk_keep must be in 1..256 and topk_select must be i32, i64 or flash"
+            )
         for key in ("prefill_graph_enabled", "npu_stage_lm_head", "prefix_calibration"):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f"gr.{key} requires a boolean")

@@ -563,6 +563,7 @@ class GPUBeamStageRunner:
         rows = batch_size * beam.state.beam_width
         host = getattr(worker, "vllm_config", None)
         self.gr_settings = deployment_for(host)
+        self._unit_temperature = True
         self.explicit_fa_version = configured_fa_version(host)
         settings = self.gr_settings
         slice_request = 0
@@ -892,6 +893,9 @@ class GPUBeamStageRunner:
     ) -> Any:
         previous_kind = self.previous.kind if self.previous is not None else None
         execution = self.admit(scheduler_output)
+        self._unit_temperature = all(
+            entry.metadata.beam_params.temperature in (0, 1) for entry in execution.entries
+        )
         worker = self.worker
         worker._current_scheduler_output = scheduler_output
         worker._current_beam_data = {}
@@ -1004,6 +1008,7 @@ class GPUBeamStageRunner:
                             device=device,
                             keep_limit=self.gr_settings.topk_keep,
                             select=self.gr_settings.topk_select,
+                            flash_logits=self.beam.workspace.flash_logits,
                         )
                     if sliced:
                         self._select_from_hidden_slices(
@@ -1024,6 +1029,7 @@ class GPUBeamStageRunner:
                             candidates[1],
                             candidates[2],
                             self.counts[:rows],
+                            unit_temperature=self._unit_temperature,
                         )
                 candidate_batch = BeamCandidateBatch(layout, *candidates)
                 if self.dynamic is not None:

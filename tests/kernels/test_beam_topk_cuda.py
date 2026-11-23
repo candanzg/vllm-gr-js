@@ -20,8 +20,11 @@ from vllm_gr.ops.cuda.unconstrained_topk import (
 from vllm_gr.ops.cuda.unconstrained_topk_mcap import (
     LOCAL_KEEP_MAX,
     LOCAL_TILE_SIZE,
+    MCarryTopKScratch,
+    allocate_flash_logits,
     allocate_mcap_topk_scratch,
     finish,
+    flash_logits_rows,
     local_slice,
     mcap_topk_tiling,
     merge_chunk_width,
@@ -665,3 +668,406 @@ def test_hierarchical_top1_ties_and_invalid_candidates(mask_invalid_indices: boo
 
     assert flat[:, 0].tolist() == [1, -1 if mask_invalid_indices else 0, 383, 0]
     assert scores[:, 0].tolist() == [0.0, -float("inf"), 0.0, -float("inf")]
+
+
+def _flash_supported() -> bool:
+    from vllm_gr.ops.cuda.unconstrained_topk_mcap import _flash_topk_kernel
+
+    return _flash_topk_kernel(torch.accelerator.current_device_index()) is not None
+
+
+_SelectOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _select_out(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    *,
+    unit_temperature: bool,
+) -> _SelectOut:
+    rows = logits.shape[0]
+    out = (
+        torch.empty((rows, top_k), dtype=torch.int32, device=logits.device),
+        torch.empty((rows, top_k), dtype=torch.float32, device=logits.device),
+        torch.empty((rows, top_k), dtype=torch.bool, device=logits.device),
+        torch.empty((rows,), dtype=torch.int32, device=logits.device),
+    )
+    unconstrained_topk_mcap_out(
+        logits, temperatures, top_k, scratch, *out, unit_temperature=unit_temperature
+    )
+    return out
+
+
+def _assert_same_selection(got: _SelectOut, want: _SelectOut) -> None:
+    assert torch.equal(got[0], want[0])
+    torch.testing.assert_close(got[1], want[1], rtol=1e-5, atol=1e-5)
+    assert torch.equal(got[2], want[2])
+    assert torch.equal(got[3], want[3])
+
+
+def _flash_parity_logits() -> torch.Tensor:
+    rows, vocab_size = 6, 2048
+    generator = torch.Generator().manual_seed(20261122)
+    logits = torch.randn((rows, vocab_size), generator=generator).to(torch.bfloat16)
+    logits[0, :1024].zero_()
+    logits[1, 0] = float("inf")
+    logits[1, 1] = float("nan")
+    logits[2].fill_(-float("inf"))
+    # Signed zeros are equal scores: the smaller token ID must win.
+    logits[3].fill_(-1.0)
+    logits[3, 0] = -0.0
+    logits[3, 1] = 0.0
+    logits[4].fill_(-1.0)
+    logits[4, 5] = 0.0
+    logits[4, 6] = -0.0
+    logits[4, 7] = -0.0
+    return logits.cuda()
+
+
+def _flash_backend(backend: str, monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, ...]]:
+    """Select the Top-K behind ``select="flash"`` and return its recorded call shapes.
+
+    ``flashinfer`` uses the installed library, so devices without FilteredTopK
+    (for example L20) take the i64 fallback. ``reference_topk`` substitutes a
+    stable ``torch.sort`` with the same smaller-index tie-break, so the whole
+    Flash pipeline runs on every device. FlashInfer's own kernel is not
+    exercised by that variant.
+    """
+
+    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+
+    calls: list[tuple[int, ...]] = []
+    if backend == "reference_topk":
+
+        def top_k(values: torch.Tensor, k: int, **_: object) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append(tuple(values.shape))
+            ordered, order = torch.sort(values.float(), dim=1, descending=True, stable=True)
+            return ordered[:, :k].to(values.dtype), order[:, :k]
+
+        monkeypatch.setattr(mcap, "_flash_topk_kernel", lambda device_index: (top_k, 1))
+    return calls
+
+
+def _expect_flash(backend: str) -> bool:
+    return backend == "reference_topk" or _flash_supported()
+
+
+_FLASH_BACKENDS = pytest.mark.parametrize("backend", ["flashinfer", "reference_topk"])
+
+
+@_FLASH_BACKENDS  # type: ignore[misc]
+@pytest.mark.parametrize("top_k", [1, 7])  # type: ignore[misc]
+def test_flash_topk_matches_i64_with_ties_signed_zero_and_nonfinite(
+    backend: str, top_k: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _flash_backend(backend, monkeypatch)
+    logits = _flash_parity_logits()
+    rows, vocab_size = logits.shape
+    temperatures = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    shared = allocate_flash_logits(rows, vocab_size, logits.dtype, logits.device)
+    assert (shared is not None) == _expect_flash(backend)
+    if shared is not None:
+        shared.fill_(float("nan"))
+    reference = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device, select="i64")
+    flash = allocate_mcap_topk_scratch(
+        rows, vocab_size, top_k, logits.device, select="flash", flash_logits=shared
+    )
+    want = _select_out(logits, temperatures, top_k, reference, unit_temperature=True)
+    got = _select_out(logits, temperatures, top_k, flash, unit_temperature=True)
+
+    _assert_same_selection(got, want)
+    assert want[0][3, 0].item() == 0
+    assert want[0][4, 0].item() == 5
+    if shared is not None:
+        # The sanitized copy replaces the NaN fill only when Flash executed.
+        assert not torch.isnan(shared[:rows]).any()
+    if backend == "reference_topk":
+        assert calls == [(rows, vocab_size)]
+
+
+@_FLASH_BACKENDS  # type: ignore[misc]
+def test_flash_topk_checks_temperature_on_every_call_with_reused_scratch(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BF16 cannot hold 1.40625 / 0.7 and 1.4140625 / 0.7 apart; a stale
+    # unit-temperature decision would store both as 2.015625 and pick token 0.
+    calls = _flash_backend(backend, monkeypatch)
+    logits = torch.full((2, 2048), -10.0, dtype=torch.bfloat16, device="cuda")
+    logits[:, 0] = 1.40625
+    logits[:, 1] = 1.4140625
+    rows, vocab_size = logits.shape
+    shared = allocate_flash_logits(rows, vocab_size, logits.dtype, logits.device)
+    flash = allocate_mcap_topk_scratch(
+        rows, vocab_size, 1, logits.device, select="flash", flash_logits=shared
+    )
+    reference = allocate_mcap_topk_scratch(rows, vocab_size, 1, logits.device, select="i64")
+    for temperature, unit in ((1.0, True), (0.7, False), (1.0, True)):
+        temperatures = torch.full((rows,), temperature, dtype=torch.float32, device="cuda")
+        got = _select_out(logits, temperatures, 1, flash, unit_temperature=unit)
+        want = _select_out(logits, temperatures, 1, reference, unit_temperature=unit)
+        _assert_same_selection(got, want)
+        assert got[0][:, 0].tolist() == [1, 1]
+    if backend == "reference_topk":
+        assert calls == [(rows, vocab_size)] * 2
+
+
+@_FLASH_BACKENDS  # type: ignore[misc]
+def test_flash_topk_writes_padded_output_rows(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FlashInfer returns compact rows, but the ``out`` API accepts rows with
+    # trailing padding. K=7 with a row stride of 8 must keep every row aligned
+    # and leave the padding column untouched.
+    _flash_backend(backend, monkeypatch)
+    logits = _flash_parity_logits()
+    rows, vocab_size = logits.shape
+    top_k, stride = 7, 8
+    temperatures = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    shared = allocate_flash_logits(rows, vocab_size, logits.dtype, logits.device)
+    flash = allocate_mcap_topk_scratch(
+        rows, vocab_size, top_k, logits.device, select="flash", flash_logits=shared
+    )
+    reference = allocate_mcap_topk_scratch(rows, vocab_size, top_k, logits.device, select="i64")
+    want = _select_out(logits, temperatures, top_k, reference, unit_temperature=True)
+
+    ids = torch.full((rows, stride), -77, dtype=torch.int32, device="cuda")
+    logprobs = torch.full((rows, stride), -123.0, dtype=torch.float32, device="cuda")
+    valid = torch.ones((rows, stride), dtype=torch.bool, device="cuda")
+    counts = torch.empty((rows,), dtype=torch.int32, device="cuda")
+    unconstrained_topk_mcap_out(
+        logits,
+        temperatures,
+        top_k,
+        flash,
+        ids[:, :top_k],
+        logprobs[:, :top_k],
+        valid[:, :top_k],
+        counts,
+        unit_temperature=True,
+    )
+
+    expected_ids = torch.full_like(ids, -77)
+    expected_ids[:, :top_k] = want[0]
+    expected_valid = torch.ones_like(valid)
+    expected_valid[:, :top_k] = want[2]
+    assert torch.equal(ids, expected_ids)
+    assert torch.equal(valid, expected_valid)
+    assert torch.equal(counts, want[3])
+    torch.testing.assert_close(logprobs[:, :top_k], want[1], rtol=1e-5, atol=1e-5)
+    assert (logprobs[:, top_k] == -123.0).all()
+
+
+@_FLASH_BACKENDS  # type: ignore[misc]
+def test_flash_topk_serves_wide_beam_multi_request_prefill(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Width and candidate count 512 with two requests: Prefill selects 2 rows,
+    # which Flash serves, while Decode (1024 rows) cannot use it.
+    calls = _flash_backend(backend, monkeypatch)
+    top_k, prefill_rows, vocab_size = 512, 2, 4096
+    generator = torch.Generator().manual_seed(512)
+    logits = torch.randn((prefill_rows, vocab_size), generator=generator)
+    logits = logits.to(torch.bfloat16).cuda()
+    temperatures = torch.ones(prefill_rows, dtype=torch.float32, device="cuda")
+    reserved = flash_logits_rows(512, 2)
+    assert reserved == prefill_rows
+    shared = allocate_flash_logits(reserved, vocab_size, logits.dtype, logits.device)
+    assert (shared is not None) == _expect_flash(backend)
+    flash = allocate_mcap_topk_scratch(
+        prefill_rows, vocab_size, top_k, logits.device, select="flash", flash_logits=shared
+    )
+    reference = allocate_mcap_topk_scratch(
+        prefill_rows, vocab_size, top_k, logits.device, select="i64"
+    )
+    got = _select_out(logits, temperatures, top_k, flash, unit_temperature=True)
+    want = _select_out(logits, temperatures, top_k, reference, unit_temperature=True)
+
+    _assert_same_selection(got, want)
+    if backend == "reference_topk":
+        assert calls == [(prefill_rows, vocab_size)]
+    # A Decode-sized call does not fit the Prefill reservation and uses i64.
+    calls.clear()
+    wide = torch.randn((1024, vocab_size), generator=generator).to(torch.bfloat16).cuda()
+    flash_wide = allocate_mcap_topk_scratch(
+        1024, vocab_size, top_k, logits.device, select="flash", flash_logits=shared
+    )
+    _select_out(wide, torch.ones(1024, device="cuda"), top_k, flash_wide, unit_temperature=True)
+    assert calls == []
+
+
+def test_flash_logits_are_shared_and_sized_for_eligible_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # W=64: batches of 1, 2 and 4 use 64, 128 and 256 rows and share one
+    # 256-row buffer; B=8 would need 512 rows, beyond FLASH_MAX_ROWS.
+    assert flash_logits_rows(64, 8) == 256
+    assert flash_logits_rows(64, 2) == 128
+    assert flash_logits_rows(32, 8) == 256
+    assert flash_logits_rows(4, 8) == 32
+    assert flash_logits_rows(0, 8) == 0
+    assert flash_logits_rows(64, 0) == 0
+    # From width 257 no Decode batch fits in FLASH_MAX_ROWS, but Prefill selects
+    # one row per request and still qualifies: B=2 at width 512 is 2 rows.
+    assert flash_logits_rows(257, 8) == 8
+    assert flash_logits_rows(512, 2) == 2
+    assert flash_logits_rows(1024, 8) == 8
+    assert flash_logits_rows(1024, 1) == 1
+
+    calls = _flash_backend("reference_topk", monkeypatch)
+    vocab_size = 2048
+    logits = _flash_parity_logits()
+    rows = logits.shape[0]
+    shared = allocate_flash_logits(2 * rows, vocab_size, logits.dtype, logits.device)
+    assert shared is not None and tuple(shared.shape) == (2 * rows, vocab_size)
+    temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
+    # Two adapters of different row counts reuse the same buffer.
+    for batch_rows in (rows, rows // 2):
+        scratch = allocate_mcap_topk_scratch(
+            batch_rows, vocab_size, 7, logits.device, select="flash", flash_logits=shared
+        )
+        _select_out(
+            logits[:batch_rows], temperatures[:batch_rows], 7, scratch, unit_temperature=True
+        )
+    assert calls == [(rows, vocab_size), (rows // 2, vocab_size)]
+
+    # Rows beyond the reserved capacity, or a mismatched vocabulary or dtype,
+    # use i64 instead of allocating in the request path.
+    calls.clear()
+    small = allocate_flash_logits(rows - 1, vocab_size, logits.dtype, logits.device)
+    mismatched = allocate_flash_logits(rows, vocab_size // 2, logits.dtype, logits.device)
+    for buffer in (small, mismatched):
+        scratch = allocate_mcap_topk_scratch(
+            rows, vocab_size, 7, logits.device, select="flash", flash_logits=buffer
+        )
+        reference = allocate_mcap_topk_scratch(rows, vocab_size, 7, logits.device, select="i64")
+        got = _select_out(logits, temperatures, 7, scratch, unit_temperature=True)
+        want = _select_out(logits, temperatures, 7, reference, unit_temperature=True)
+        _assert_same_selection(got, want)
+    assert calls == []
+
+    # Nothing is reserved for a scratch that is not ``flash``.
+    plain = allocate_mcap_topk_scratch(
+        rows, vocab_size, 7, logits.device, select="i64", flash_logits=shared
+    )
+    assert plain.flash_logits is None
+
+
+def _forbid_flashinfer(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make any FlashInfer capability query or Top-K call fail the test.
+
+    The probe stands in for FlashInfer's JIT module build, which can take
+    minutes on a cold cache and is unavailable with FLASHINFER_DISABLE_JIT=1.
+    """
+
+    import flashinfer
+    import flashinfer.topk as flashinfer_topk
+
+    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+
+    calls: list[str] = []
+
+    def forbidden(name: str):  # type: ignore[no-untyped-def]
+        def probe(*args: object, **kwargs: object) -> None:
+            calls.append(name)
+            raise AssertionError(f"FlashInfer {name} must not be reached")
+
+        return probe
+
+    monkeypatch.setattr(flashinfer_topk, "can_implement_filtered_topk", forbidden("capability"))
+    monkeypatch.setattr(flashinfer, "top_k", forbidden("top_k"))
+    mcap._flash_topk_kernel.cache_clear()
+    monkeypatch.setattr(mcap.torch.cuda, "get_device_name", lambda index=None: "Test GPU")
+    return calls
+
+
+def test_flash_topk_excludes_devices_below_filtered_topk_shared_memory_before_jit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+
+    calls = _forbid_flashinfer(monkeypatch)
+    monkeypatch.setattr(mcap, "_shared_memory_per_sm", lambda index: 100 * 1024)
+    try:
+        assert mcap._flash_topk_kernel(0) is None
+        logits = _flash_parity_logits()
+        rows, vocab_size = logits.shape
+        assert allocate_flash_logits(rows, vocab_size, logits.dtype, logits.device) is None
+    finally:
+        mcap._flash_topk_kernel.cache_clear()
+    assert calls == []
+
+
+def test_flash_topk_queries_flashinfer_only_on_devices_with_enough_shared_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+
+    calls = _forbid_flashinfer(monkeypatch)
+    monkeypatch.setattr(mcap, "_shared_memory_per_sm", lambda index: 228 * 1024)
+    try:
+        # A device that passes the property check reaches FlashInfer's own
+        # query; its failure still ends in the i64 fallback, not an exception.
+        assert mcap._flash_topk_kernel(0) is None
+    finally:
+        mcap._flash_topk_kernel.cache_clear()
+    assert calls == ["capability"]
+
+
+def test_flash_topk_falls_back_to_i64_without_touching_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_gr.ops.cuda.unconstrained_topk_mcap as mcap
+
+    calls = _forbid_flashinfer(monkeypatch)
+    monkeypatch.setattr(mcap, "_shared_memory_per_sm", lambda index: 100 * 1024)
+    logits = _flash_parity_logits()
+    rows, vocab_size = logits.shape
+    temperatures = torch.ones(rows, dtype=torch.float32, device="cuda")
+    # A buffer that was reserved anyway is left untouched.
+    shared = torch.full((rows, vocab_size), float("nan"), dtype=logits.dtype, device="cuda")
+    flash = allocate_mcap_topk_scratch(
+        rows, vocab_size, 7, logits.device, select="flash", flash_logits=shared
+    )
+    reference = allocate_mcap_topk_scratch(rows, vocab_size, 7, logits.device, select="i64")
+    try:
+        got = _select_out(logits, temperatures, 7, flash, unit_temperature=True)
+    finally:
+        mcap._flash_topk_kernel.cache_clear()
+    want = _select_out(logits, temperatures, 7, reference, unit_temperature=True)
+    _assert_same_selection(got, want)
+    assert torch.isnan(shared).all()
+    assert calls == []
+
+
+def test_flash_stats_kernel_stores_one_zero_and_sanitizes_nonfinite() -> None:
+    # Runs on every CUDA device, including those without FilteredTopK.
+    from vllm_gr.ops.cuda.unconstrained_topk_mcap import _flash_stats_kernel
+
+    logits = _flash_parity_logits()
+    rows, vocab_size = logits.shape
+    temperatures = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    scratch = allocate_mcap_topk_scratch(rows, vocab_size, 7, logits.device, select="flash")
+    sanitized = torch.empty_like(logits)
+    tiles = -(-vocab_size // LOCAL_TILE_SIZE)
+    _flash_stats_kernel[(rows, tiles)](
+        logits,
+        temperatures,
+        sanitized,
+        scratch.partial_max,
+        scratch.partial_sum,
+        vocab_size,
+        logits.stride(0),
+        sanitized.stride(0),
+        temperatures.numel(),
+        tiles,
+        BLOCK=LOCAL_TILE_SIZE,
+        num_warps=4,
+    )
+    zeros = sanitized == 0
+    assert zeros[3, :2].all() and zeros[4, 5:8].all()
+    assert not torch.signbit(sanitized[zeros]).any()
+    assert sanitized[1, 0].item() == -float("inf") and sanitized[1, 1].item() == -float("inf")
+    finite = torch.isfinite(logits)
+    assert torch.equal(sanitized[finite], logits[finite])

@@ -88,6 +88,12 @@ class BeamPostprocessWorkspace:
     state_scratch: BeamStateScratch | None = None
     execution_owner: Any = None
 
+    # Optional FlashInfer Top-K input shared by every batch adapter of this
+    # worker. It is allocated with the workspace, during model load, so KV-cache
+    # sizing already counts it. None when ``gr.topk_select`` is not ``flash``,
+    # the device cannot run it, or no batch geometry qualifies.
+    flash_logits: torch.Tensor | None = None
+
     @classmethod
     def allocate(
         cls,
@@ -98,6 +104,8 @@ class BeamPostprocessWorkspace:
         max_decode_steps: int,
         device: torch.device | str,
         logits_dtype: torch.dtype,
+        flash_logits_rows: int = 0,
+        flash_logits_vocab_size: int = 0,
     ) -> BeamPostprocessWorkspace:
         """Allocate every tensor once; callers retain the returned object."""
 
@@ -110,6 +118,13 @@ class BeamPostprocessWorkspace:
         from vllm_gr.ops.cuda.beam_selection import allocate_beam_selection_scratch
 
         key = BeamPostprocessWorkspaceKey(beam_width, top_k, logits_dtype)
+        flash_logits = None
+        if flash_logits_rows > 0 and flash_logits_vocab_size > 0:
+            from vllm_gr.ops.cuda.unconstrained_topk_mcap import allocate_flash_logits
+
+            flash_logits = allocate_flash_logits(
+                flash_logits_rows, flash_logits_vocab_size, logits_dtype, resolved_device
+            )
         candidate_shape = (max_batch, beam_width, top_k)
         beam_shape = (max_batch, beam_width)
         sequence_shape = (max_batch, beam_width, max_decode_steps)
@@ -145,11 +160,12 @@ class BeamPostprocessWorkspace:
             selected_flat_indices=device_empty(beam_shape, torch.int32),
             next_sequence=device_empty(sequence_shape, torch.int32),
             selection_scratch=selection_scratch,
+            flash_logits=flash_logits,
         )
 
     def device_tensors(self) -> tuple[torch.Tensor, ...]:
         scratch = self.selection_scratch
-        tensors = (
+        tensors: tuple[torch.Tensor, ...] = (
             self.topk_token_ids,
             self.topk_scores,
             self.topk_valid_mask,
@@ -168,6 +184,8 @@ class BeamPostprocessWorkspace:
         )
         if self.state_scratch is not None:
             tensors += self.state_scratch.device_tensors()
+        if self.flash_logits is not None:
+            tensors += (self.flash_logits,)
         return tensors
 
     @property
@@ -206,6 +224,11 @@ class BeamPostprocessWorkspacePool:
         return sum(workspace.device_memory_bytes for workspace in self._buckets.values())
 
 
+def flash_bytes(workspace: Any) -> int:
+    logits = getattr(workspace, "flash_logits", None)
+    return 0 if logits is None else logits.numel() * logits.element_size()
+
+
 def initialize_beam_postprocess_workspaces(
     runner,
     *,
@@ -222,6 +245,8 @@ def initialize_beam_postprocess_workspaces(
         return None
 
     from vllm_gr.config import resolve_candidate_width
+    from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
+    from vllm_gr.ops.cuda.unconstrained_topk_mcap import flash_logits_rows
     from vllm_gr.v1.worker.gr_context import (
         _get_gr_config,
     )
@@ -248,6 +273,19 @@ def initialize_beam_postprocess_workspaces(
             f"CUDA Beam postprocess workspace requires model_config.dtype, got {dtype!r}"
         )
 
+    # Flash Top-K serves only the unconstrained selector. Reserve its input here,
+    # once per worker, rather than lazily in the first request.
+    # A forced positive head_slice slices every stage, so Flash never runs.
+    flash_rows = flash_vocab_size = 0
+    deployment = gr_cfg.deployment
+    if (
+        deployment.topk_select == "flash"
+        and configured_constraint_mode(gr_cfg) is ConstraintMode.NONE
+        and not (isinstance(deployment.head_slice, int) and deployment.head_slice > 0)
+    ):
+        flash_rows = flash_logits_rows(int(width), resolved_max_batch)
+        flash_vocab_size = int(runner.model_config.get_vocab_size()) if flash_rows else 0
+
     key = BeamPostprocessWorkspaceKey(int(width), int(candidate_width), dtype)
     existing = getattr(runner, "_beam_postprocess_workspaces", None)
     if existing is not None:
@@ -268,18 +306,21 @@ def initialize_beam_postprocess_workspaces(
         max_decode_steps=int(gr_cfg.beam_max_decode_steps),
         device=device,
         logits_dtype=dtype,
+        flash_logits_rows=flash_rows,
+        flash_logits_vocab_size=flash_vocab_size,
     )
     pool = BeamPostprocessWorkspacePool()
     pool.add(workspace)
     runner._beam_postprocess_workspaces = pool
     logger.info(
         "vllm-gr: prewarmed CUDA Beam postprocess workspace "
-        "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d)",
+        "(batch=%d, width=%d, top_k=%d, dtype=%s, device_bytes=%d, flash_logits_bytes=%d)",
         resolved_max_batch,
         width,
         candidate_width,
         dtype,
         workspace.device_memory_bytes,
+        flash_bytes(workspace),
     )
     return pool
 

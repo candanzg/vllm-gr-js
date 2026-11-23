@@ -13,13 +13,15 @@ its flagged tiles.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import functools
+from dataclasses import dataclass, field
 
 import torch
 import triton
 import triton.language as tl
 
 from vllm_gr.config.models import DEFAULT_DEPLOYMENT
+from vllm_gr.logger import init_logger
 from vllm_gr.ops.cuda.topk_sort_key import pack_score_index, unpack_score
 
 # Triton JIT functions intentionally use its untyped DSL values.
@@ -38,6 +40,17 @@ LOCAL_KEEP_MAX = DEFAULT_DEPLOYMENT.topk_keep
 MERGE_CHUNK = 1024
 
 _MAX_I64 = tl.constexpr(0x7FFFFFFFFFFFFFFF)
+
+# FlashInfer Top-K is used only for calls with at most this many rows; larger
+# batches keep the i64 pipeline.
+FLASH_MAX_ROWS = 256
+# FlashInfer's index tie-break runs only in FilteredTopK, which caps K.
+FLASH_MAX_TOP_K = 2048
+# FilteredTopK needs 128 KiB of dynamic shared memory per SM
+# (FILTERED_TOPK_SMEM_DYNAMIC in FlashInfer's topk.cuh).
+FLASH_MIN_SHARED_MEMORY_PER_SM = 128 * 1024
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +71,10 @@ class MCarryTopKScratch:
     keep: int
     keep_limit: int = LOCAL_KEEP_MAX
     select: str = DEFAULT_DEPLOYMENT.topk_select
+    # Sanitized-logits input for ``select="flash"``. The worker owns it and
+    # shares it across every scratch, so it is reserved before KV-cache sizing
+    # (see ``allocate_flash_logits``). None disables Flash for this scratch.
+    flash_logits: torch.Tensor | None = field(default=None, compare=False)
 
 
 @triton.jit
@@ -691,6 +708,7 @@ def allocate_mcap_topk_scratch(
     *,
     keep_limit: int = LOCAL_KEEP_MAX,
     select: str = DEFAULT_DEPLOYMENT.topk_select,
+    flash_logits: torch.Tensor | None = None,
 ) -> MCarryTopKScratch:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -716,7 +734,285 @@ def allocate_mcap_topk_scratch(
         keep=keep,
         keep_limit=keep_limit,
         select=select,
+        flash_logits=flash_logits if select == "flash" else None,
     )
+
+
+def _shared_memory_per_sm(device_index: int) -> int | None:
+    """Return the device's shared memory per SM in bytes, or None if unknown."""
+
+    try:
+        value = int(torch.cuda.get_device_properties(device_index).shared_memory_per_multiprocessor)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+@functools.cache
+def _flash_topk_kernel(device_index: int):
+    """Return FlashInfer ``(top_k, TopKTieBreak)`` if usable on this device, else None.
+
+    Index tie-breaking requires FilteredTopK, which needs 128 KiB of shared
+    memory per SM. Devices below that (for example L20) fail at launch, so the
+    capability is checked once per device and unsupported devices use i64.
+    The device property is read first: FlashInfer's own capability query builds
+    and loads its JIT module before it looks at shared memory, which can take
+    minutes on a cold cache and is wasted on a device that cannot run Flash.
+    """
+
+    shared_memory = _shared_memory_per_sm(device_index)
+    if shared_memory is not None and shared_memory < FLASH_MIN_SHARED_MEMORY_PER_SM:
+        logger.warning(
+            "gr.topk_select=flash: %s has %d KiB shared memory per SM, below the %d KiB "
+            "FlashInfer FilteredTopK needs; using i64",
+            torch.cuda.get_device_name(device_index),
+            shared_memory // 1024,
+            FLASH_MIN_SHARED_MEMORY_PER_SM // 1024,
+        )
+        return None
+    try:
+        from flashinfer import TopKTieBreak
+        from flashinfer import top_k as flash_top_k
+        from flashinfer.topk import can_implement_filtered_topk
+
+        with torch.accelerator.device_index(device_index):
+            supported = bool(can_implement_filtered_topk())
+    except Exception as exc:  # missing package, API drift or JIT build failure
+        logger.warning(
+            "gr.topk_select=flash: FlashInfer Top-K is unavailable (%s: %s); using i64",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if not supported:
+        logger.warning(
+            "gr.topk_select=flash: %s lacks the shared memory required by FlashInfer "
+            "FilteredTopK; using i64",
+            torch.cuda.get_device_name(device_index),
+        )
+        return None
+    return flash_top_k, TopKTieBreak.SMALL
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.accelerator.current_device_index()
+
+
+def flash_logits_rows(beam_width: int, max_batch: int) -> int:
+    """Rows of shared Flash input needed by every stage that can use Flash.
+
+    Prefill selects one row per request, so a batch of B requests uses B rows.
+    Decode selects ``B * beam_width`` rows. Each stage is Flash-eligible up to
+    FLASH_MAX_ROWS rows, so the buffer covers the larger of the two row counts
+    of the largest eligible batch. Prefill alone qualifies for wide beams, where
+    no Decode batch fits (for example width 512 with two requests).
+    """
+
+    if beam_width <= 0 or max_batch <= 0:
+        return 0
+    prefill = min(FLASH_MAX_ROWS, max_batch)
+    decode = min(FLASH_MAX_ROWS // beam_width, max_batch) * beam_width
+    return max(prefill, decode)
+
+
+def allocate_flash_logits(
+    rows: int, vocab_size: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor | None:
+    """Allocate the worker-shared Flash input, or None when Flash cannot run here.
+
+    Call this while the worker loads the model and count the result as model
+    memory, so KV-cache sizing already sees it. Nothing is allocated for a
+    device without FilteredTopK support or a batch geometry that never
+    qualifies; those calls use the i64 pipeline.
+    """
+
+    if rows <= 0 or _flash_topk_kernel(_device_index(device)) is None:
+        return None
+    return torch.empty((rows, vocab_size), dtype=dtype, device=device)
+
+
+@functools.cache
+def _warn_unusable_flash_logits(shape: tuple[int, ...], dtype: torch.dtype) -> None:
+    logger.warning(
+        "gr.topk_select=flash: reserved logits buffer %s %s does not match the logits; using i64",
+        shape,
+        dtype,
+    )
+
+
+@triton.jit
+def _flash_stats_kernel(
+    logits,
+    temperatures,
+    sanitized,
+    partial_max,
+    partial_sum,
+    vocab_size,
+    logits_stride,
+    sanitized_stride,
+    temperature_count,
+    partial_stride,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    flat = tile * BLOCK + offsets
+    valid = flat < vocab_size
+    values = tl.load(logits + row * logits_stride + flat, mask=valid, other=-float("inf"))
+    values = values.to(tl.float32)
+    temperature_index = tl.where(temperature_count == 1, 0, row)
+    temperature = tl.load(temperatures + temperature_index)
+    temperature = tl.where(temperature == 0.0, 1.0, temperature)
+    values = values / temperature
+    values = tl.where((values > -float("inf")) & (values < float("inf")), values, -float("inf"))
+    # pack_score_index treats -0.0 and +0.0 as equal (smaller token ID wins);
+    # FlashInfer's radix keys order +0.0 above -0.0, so store a single zero.
+    values = tl.where(values == 0.0, 0.0, values)
+    tl.store(sanitized + row * sanitized_stride + flat, values, mask=valid)
+    tile_max = tl.max(values, axis=0)
+    tile_sum = tl.sum(tl.exp(values - tl.where(tile_max == -float("inf"), 0.0, tile_max)), axis=0)
+    tl.store(partial_max + row * partial_stride + tile, tile_max)
+    tl.store(partial_sum + row * partial_stride + tile, tile_sum)
+
+
+@triton.jit
+def _flash_finalize_kernel(
+    values,
+    indices,
+    partial_max,
+    partial_sum,
+    output_ids,
+    output_logprobs,
+    output_valid,
+    output_counts,
+    partial_stride,
+    value_stride,
+    index_stride,
+    token_stride,
+    logprob_stride,
+    valid_stride,
+    top_k,
+    tile_count,
+    SCAN_BLOCK: tl.constexpr,
+    OUTPUT_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile_offsets = tl.arange(0, SCAN_BLOCK)
+    tile_valid = tile_offsets < tile_count
+    tile_maxes = tl.load(
+        partial_max + row * partial_stride + tile_offsets,
+        mask=tile_valid,
+        other=-float("inf"),
+    )
+    tile_sums = tl.load(
+        partial_sum + row * partial_stride + tile_offsets,
+        mask=tile_valid,
+        other=0.0,
+    )
+    global_max = tl.max(tile_maxes, axis=0)
+    has_mass = global_max != -float("inf")
+    safe_max = tl.where(has_mass, global_max, 0.0)
+    denominator = safe_max + tl.log(tl.sum(tile_sums * tl.exp(tile_maxes - safe_max), axis=0))
+
+    ranks = tl.arange(0, OUTPUT_BLOCK)
+    selected = ranks < top_k
+    # FlashInfer returns compact rows, but the outputs may carry row padding, so
+    # every tensor is addressed with its own row stride.
+    scores = tl.load(values + row * value_stride + ranks, mask=selected, other=-float("inf")).to(
+        tl.float32
+    )
+    tokens = tl.load(indices + row * index_stride + ranks, mask=selected, other=-1).to(tl.int32)
+    valid = selected & has_mass & (scores > -float("inf")) & (scores < float("inf"))
+    tl.store(output_ids + row * token_stride + ranks, tokens, mask=selected)
+    tl.store(
+        output_logprobs + row * logprob_stride + ranks,
+        tl.where(valid, scores - denominator, -float("inf")),
+        mask=selected,
+    )
+    tl.store(output_valid + row * valid_stride + ranks, valid, mask=selected)
+    tl.store(output_counts + row, tl.sum(valid.to(tl.int32), axis=0))
+
+
+def _flash_topk_out(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    scratch: MCarryTopKScratch,
+    out_token_ids: torch.Tensor,
+    out_logprobs: torch.Tensor,
+    out_valid_mask: torch.Tensor,
+    out_valid_counts: torch.Tensor,
+    unit_temperature: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    rows, vocab_size = int(logits.shape[0]), int(logits.shape[1])
+    shared = scratch.flash_logits
+    if (
+        shared is None
+        or not unit_temperature
+        or (rows == 1 and top_k < 1024)
+        or vocab_size < top_k
+        or top_k > FLASH_MAX_TOP_K
+        or rows > shared.shape[0]
+    ):
+        return None
+    if (
+        shared.shape[1] != vocab_size
+        or shared.dtype != logits.dtype
+        or shared.device != logits.device
+    ):
+        _warn_unusable_flash_logits(tuple(shared.shape), shared.dtype)
+        return None
+    flash = _flash_topk_kernel(_device_index(logits.device))
+    if flash is None:
+        return None
+    flash_top_k, tie_break = flash
+
+    sanitized = shared[:rows]
+    tiles = -(-vocab_size // LOCAL_TILE_SIZE)
+    _flash_stats_kernel[(rows, tiles)](
+        logits,
+        temperatures,
+        sanitized,
+        scratch.partial_max,
+        scratch.partial_sum,
+        vocab_size,
+        logits.stride(0),
+        sanitized.stride(0),
+        temperatures.numel(),
+        tiles,
+        BLOCK=LOCAL_TILE_SIZE,
+        num_warps=4,
+    )
+    values, indices = flash_top_k(
+        sanitized,
+        top_k,
+        sorted=True,
+        deterministic=True,
+        tie_break=tie_break,
+    )
+    _flash_finalize_kernel[(rows,)](
+        values,
+        indices,
+        scratch.partial_max,
+        scratch.partial_sum,
+        out_token_ids,
+        out_logprobs,
+        out_valid_mask,
+        out_valid_counts,
+        tiles,
+        values.stride(0),
+        indices.stride(0),
+        out_token_ids.stride(0),
+        out_logprobs.stride(0),
+        out_valid_mask.stride(0),
+        top_k,
+        tiles,
+        SCAN_BLOCK=triton.next_power_of_2(tiles),
+        OUTPUT_BLOCK=triton.next_power_of_2(top_k),
+        num_warps=4,
+    )
+    return out_token_ids, out_logprobs, out_valid_mask, out_valid_counts
 
 
 def unconstrained_topk_mcap_out(
@@ -728,8 +1024,15 @@ def unconstrained_topk_mcap_out(
     out_logprobs: torch.Tensor,
     out_valid_mask: torch.Tensor,
     out_valid_counts: torch.Tensor,
+    *,
+    unit_temperature: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Write full-vocabulary Top-K/logprobs with one logits scan."""
+    """Write full-vocabulary Top-K/logprobs with one logits scan.
+
+    ``unit_temperature`` must describe this call: every temperature is 0 or 1.
+    Only then can ``select="flash"`` store unscaled logits in the input dtype
+    without rounding; otherwise the call uses the i64 pipeline.
+    """
 
     if (
         logits.ndim != 2
@@ -771,6 +1074,21 @@ def unconstrained_topk_mcap_out(
         or tuple(out_valid_counts.shape) != (rows,)
     ):
         raise ValueError("out_valid_counts must be a CUDA int32 tensor")
+
+    if scratch.select == "flash":
+        flash_result = _flash_topk_out(
+            logits,
+            temperatures,
+            top_k,
+            scratch,
+            out_token_ids,
+            out_logprobs,
+            out_valid_mask,
+            out_valid_counts,
+            unit_temperature,
+        )
+        if flash_result is not None:
+            return flash_result
 
     _launch_local_slice(
         rows,
@@ -1154,8 +1472,10 @@ def repair_emit(
 
 __all__ = [
     "MCarryTopKScratch",
+    "allocate_flash_logits",
     "allocate_mcap_topk_scratch",
     "finish",
+    "flash_logits_rows",
     "local_slice",
     "mcap_topk_tiling",
     "merge_chunk_width",

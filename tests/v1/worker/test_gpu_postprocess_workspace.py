@@ -136,6 +136,8 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
         max_decode_steps=3,
         device=runner.device,
         logits_dtype=torch.float16,
+        flash_logits_rows=0,
+        flash_logits_vocab_size=0,
     )
     runner._beam_context = SimpleNamespace(max_batch=capacity)
     assert workspace_support.initialize_beam_postprocess_workspaces(runner) is pool
@@ -145,6 +147,132 @@ def test_postprocess_workspace_initializer_matches_v1_capacity_and_reuses_storag
     with pytest.raises(RuntimeError, match="geometry changed"):
         workspace_support.initialize_beam_postprocess_workspaces(runner)
     assert allocate.call_count == 1
+
+
+def _flash_runner(*, constrained: bool = False, beam_width: int = 64, **deployment: Any) -> Any:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.config.models import (
+        ConstraintConfig,
+        ConstraintMode,
+        DeploymentOptions,
+    )
+
+    config = GRConfig(
+        beam_worker_decision=True,
+        beam_max_width=beam_width,
+        beam_max_decode_steps=3,
+        constraint=ConstraintConfig(mode=ConstraintMode.NONE),
+        deployment=DeploymentOptions(**{"topk_select": "flash", **deployment}),
+    )
+    if constrained:
+        # Table mode needs a full artifact spec; only the mode matters here.
+        object.__setattr__(config, "constraint", SimpleNamespace(mode=ConstraintMode.TABLE))
+    return SimpleNamespace(
+        device=torch.device("cuda"),
+        model_config=SimpleNamespace(dtype=torch.bfloat16, get_vocab_size=lambda: 176256),
+        _vllm_gr_config=config,
+    )
+
+
+@pytest.mark.parametrize(
+    ("deployment", "rows"),
+    [
+        ({}, 256),
+        ({"topk_select": "i64"}, 0),
+        ({"head_slice": 16384}, 0),
+        ({"head_slice": 0}, 256),
+    ],
+)  # type: ignore[misc]
+def test_workspace_reserves_shared_flash_logits_before_kv_cache_sizing(
+    monkeypatch: pytest.MonkeyPatch, deployment: dict[str, Any], rows: int
+) -> None:
+    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+        BeamPostprocessWorkspace,
+    )
+
+    seen: dict[str, Any] = {}
+
+    def allocate(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        buffer = torch.empty((kwargs["flash_logits_rows"], 4), dtype=torch.bfloat16)
+        return SimpleNamespace(
+            key=workspace_support.BeamPostprocessWorkspaceKey(64, 64, torch.bfloat16),
+            max_batch=kwargs["max_batch"],
+            max_decode_steps=3,
+            device_memory_bytes=buffer.numel() * buffer.element_size(),
+            flash_logits=buffer if kwargs["flash_logits_rows"] else None,
+        )
+
+    monkeypatch.setattr(BeamPostprocessWorkspace, "allocate", allocate)
+    runner = _flash_runner(**deployment)
+    runner.model_memory_usage = 0
+    wrapped = workspace_support.make_load_model_with_beam_postprocess_workspace(
+        lambda self: setattr(self, "model_memory_usage", 1000)
+    )
+    wrapped(runner)
+
+    # Eight prompts at width 64 would need 512 rows, so the buffer covers the
+    # largest eligible batch (four prompts, 256 rows) and is sized from the
+    # model vocabulary, not from the first request.
+    assert seen["flash_logits_rows"] == rows
+    assert seen["flash_logits_vocab_size"] == (176256 if rows else 0)
+    assert runner.model_memory_usage == 1000 + rows * 4 * 2
+
+
+@pytest.mark.parametrize(
+    ("beam_width", "rows"),
+    [
+        # Decode of four requests (4 x 64 rows) already covers Prefill.
+        (64, 256),
+        # No Decode batch fits in 256 rows from width 257 on, but Prefill
+        # still selects one row per request, so eight requests need 8 rows.
+        (512, 8),
+        (1024, 8),
+    ],
+)  # type: ignore[misc]
+def test_workspace_reserves_flash_logits_for_multi_request_prefill(
+    monkeypatch: pytest.MonkeyPatch, beam_width: int, rows: int
+) -> None:
+    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+        BeamPostprocessWorkspace,
+    )
+
+    allocate = Mock(
+        return_value=SimpleNamespace(
+            key=workspace_support.BeamPostprocessWorkspaceKey(
+                beam_width, beam_width, torch.bfloat16
+            ),
+            max_batch=8,
+            max_decode_steps=3,
+            device_memory_bytes=0,
+        )
+    )
+    monkeypatch.setattr(BeamPostprocessWorkspace, "allocate", allocate)
+    workspace_support.initialize_beam_postprocess_workspaces(_flash_runner(beam_width=beam_width))
+
+    assert allocate.call_args.kwargs["flash_logits_rows"] == rows
+    assert allocate.call_args.kwargs["flash_logits_vocab_size"] == 176256
+
+
+def test_workspace_does_not_reserve_flash_logits_for_constrained_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
+        BeamPostprocessWorkspace,
+    )
+
+    allocate = Mock(
+        return_value=SimpleNamespace(
+            key=workspace_support.BeamPostprocessWorkspaceKey(64, 64, torch.bfloat16),
+            max_batch=8,
+            max_decode_steps=3,
+            device_memory_bytes=0,
+        )
+    )
+    monkeypatch.setattr(BeamPostprocessWorkspace, "allocate", allocate)
+    runner = _flash_runner(constrained=True)
+    workspace_support.initialize_beam_postprocess_workspaces(runner)
+    assert allocate.call_args.kwargs["flash_logits_rows"] == 0
 
 
 @pytest.mark.l1  # type: ignore[misc]

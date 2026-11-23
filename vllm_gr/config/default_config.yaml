@@ -87,6 +87,9 @@ gr:
   topk_keep: 8                             # Local candidates per vocabulary block in CUDA unconstrained Top-K; 1..256.
                                            # Smaller values reduce merging; exact repair preserves the requested result count.
   topk_select: i64                         # i64: full 64-bit sort keys; i32: short-key preselection with exact boundary repair.
+                                           # flash: opt-in FlashInfer Top-K for unit-temperature calls with at most 256 rows.
+                                           # Unconstrained CUDA only. Reserves a worker-shared logits buffer at model load,
+                                           # and falls back to i64 without FlashInfer or FilteredTopK support (e.g. L20).
   prefix_policy: "off"                      # auto: select shared-prefix segments using calibration and shape; off: disable.
   prefix_min_chain_us: 150.0                 # Minimum predicted unsplit prefix latency for segmentation, in microseconds.
   prefix_calibration: true                 # Reuse calibration cache or measure and save on a miss; false: skip calibration.

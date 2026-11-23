@@ -57,17 +57,38 @@ _frontend_inflight_cond = threading.Condition()
 # post-request freeze: startup work must finish before requests are admitted.
 _startup_gc_lock = threading.RLock()
 _startup_gc_users = 0
+# Thresholds in effect before the first lease, and the ones the lease wrote.
+# The last release restores the former only while the latter are still in
+# effect; an application that changed them meanwhile keeps its new policy.
+_startup_gc_threshold: tuple[int, ...] | None = None
+_startup_gc_written: tuple[int, ...] | None = None
+
+
+def _serving_gc_threshold(current: tuple[int, ...]) -> tuple[int, ...]:
+    """Raise each generation threshold to the serving value, never lowering it.
+
+    A first threshold of 0 means the caller disabled automatic collection, so
+    the whole policy stays untouched. Larger caller thresholds are kept.
+    """
+
+    if current[0] == 0:
+        return current
+    return tuple(max(value, _SERVING_GC_THRESHOLD) for value in current)
 
 
 def acquire_frontend_startup_heap() -> None:
-    """Freeze static objects before serving, retaining normal automatic GC.
+    """Freeze static objects and raise GC thresholds for offline serving.
 
     Construct engines during application startup. GC freeze/unfreeze affects
     the entire process, just as in native EngineCore/server startup. A lease
     avoids thawing another live GRLLM's heap. Later engines do not freeze
-    serving objects; the last close ends this process's offline serving phase.
+    serving objects; the last close ends this process's offline serving phase
+    and restores the caller's thresholds. Thresholds only move up to the serving
+    value: a caller that disabled automatic GC (threshold0=0) or chose larger
+    thresholds keeps them. If the application changes the thresholds while the
+    lease is held, the last close leaves its choice alone.
     """
-    global _startup_gc_users
+    global _startup_gc_threshold, _startup_gc_users, _startup_gc_written
     with _startup_gc_lock:
         if _startup_gc_users == 0:
             from vllm.utils.gc_utils import freeze_gc_heap
@@ -75,18 +96,35 @@ def acquire_frontend_startup_heap() -> None:
             # CPython itself can already have a small permanent generation;
             # get_freeze_count() cannot tell whether model startup is covered.
             freeze_gc_heap()
+            _startup_gc_threshold = gc.get_threshold()
+            raised = _serving_gc_threshold(_startup_gc_threshold)
+            if raised != _startup_gc_threshold:
+                gc.set_threshold(*raised)
+                _startup_gc_written = gc.get_threshold()
+            else:
+                _startup_gc_written = None
         _startup_gc_users += 1
 
 
 def release_frontend_startup_heap() -> None:
-    """Restore collection of startup cycles when the last offline owner closes."""
-    global _startup_gc_users
+    """Restore startup-cycle collection and thresholds when the last owner closes."""
+    global _startup_gc_threshold, _startup_gc_users, _startup_gc_written
     with _startup_gc_lock:
         if _startup_gc_users <= 0:
             raise RuntimeError("frontend startup heap has no active owner")
         _startup_gc_users -= 1
         if _startup_gc_users == 0:
             gc.unfreeze()
+            # Restore only what this lease changed, and only if nobody else has
+            # changed it since. A lease that wrote nothing has nothing to undo.
+            if (
+                _startup_gc_threshold is not None
+                and _startup_gc_written is not None
+                and gc.get_threshold() == _startup_gc_written
+            ):
+                gc.set_threshold(*_startup_gc_threshold)
+            _startup_gc_threshold = None
+            _startup_gc_written = None
 
 
 def _enter_frontend_request() -> None:
