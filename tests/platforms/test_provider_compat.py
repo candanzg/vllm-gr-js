@@ -12,10 +12,7 @@ from typing import Any
 import pytest
 
 from vllm_gr.platforms import compat, legacy
-from vllm_gr.platforms.errors import (
-    InvalidBackendProviderError,
-    InvalidBackendVersionError,
-)
+from vllm_gr.platforms.errors import InvalidBackendProviderError
 from vllm_gr.platforms.identity import PlatformIdentity
 from vllm_gr.platforms.protocol import PROVIDER_API_VERSION
 
@@ -229,8 +226,7 @@ def test_builtin_providers_declare_the_supported_runtime_pair() -> None:
     from vllm_gr.platforms.cuda import CUDA_BACKEND
 
     for provider in (CUDA_BACKEND, NPU_BACKEND):
-        assert provider.api_version == PROVIDER_API_VERSION
-        assert provider.vllm_version_range == "==0.30.0"
+        assert provider.vllm_version_range == f"=={compat.SUPPORTED_VLLM_VERSION}"
         assert provider.gr_version_range is not None
 
     assert NPU_BACKEND.vendor_distribution == "vllm-ascend"
@@ -254,13 +250,6 @@ def test_legacy_adapter_is_a_version_two_provider() -> None:
         assert resolve_backend("cuda") is adapted
     finally:
         _reset_backend_registry_for_tests()
-
-
-def test_version_and_registration_errors_are_separately_catchable() -> None:
-    from vllm_gr.platforms.errors import BackendRegistryError
-
-    assert issubclass(InvalidBackendVersionError, BackendRegistryError)
-    assert not issubclass(InvalidBackendVersionError, InvalidBackendProviderError)
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

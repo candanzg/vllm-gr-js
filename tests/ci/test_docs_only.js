@@ -4,7 +4,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const {classify} = require('../tools/ci/docs_only');
+const {classify} = require('../../tools/ci/docs_only');
 
 const head = 'a'.repeat(40);
 const base = 'b'.repeat(40);

@@ -14,6 +14,7 @@ from vllm_gr.platforms.errors import (
     AmbiguousBackendError,
     BackendAlreadyActiveError,
     BackendNotActiveError,
+    BackendRegistryError,
     DuplicateBackendRegistrationError,
     IncompatibleBackendError,
     InvalidBackendProviderError,
@@ -221,45 +222,20 @@ def test_provider_class_and_missing_methods_are_rejected() -> None:
         register_backend(IncompleteProvider())
 
 
-def test_provider_missing_only_constrained_topk_execution_is_rejected() -> None:
-    """A provider that has every required method but the new one must be refused.
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "missing", ["matches", "create_constrained_topk_execution"]
+)
+def test_provider_missing_a_single_required_method_is_rejected(
+    missing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Registration must report every missing member, not fail later at the call site."""
+    provider = FakeProvider()
+    monkeypatch.setattr(FakeProvider, missing, None)
 
-    Registration-time validation must not let such a provider through and fail
-    later with an ``AttributeError`` at the call site.
-    """
-
-    class IncompleteProvider:
-        backend_id = "incomplete"
-        api_version = PROVIDER_API_VERSION
-        device_type = "incomplete"
-
-        def matches(self, identity: PlatformIdentity) -> bool:
-            return False
-
-        def check_environment(self) -> dict[str, str]:
-            return {}
-
-        def apply_runtime_patches(self, *, force: bool = False) -> int:
-            del force
-            return 0
-
-        def get_model_runner_hooks(self) -> Any:
-            return object()
-
-        def get_attention_execution(self) -> Any:
-            return object()
-
-    # Deliberately a structurally-invalid provider: typing it as Any keeps
-    # strict mypy from rejecting the call site (the point is that the runtime
-    # validation — not the type system — must refuse it).
-    provider: Any = IncompleteProvider()
-
-    with pytest.raises(
-        InvalidBackendProviderError, match="create_constrained_topk_execution"
-    ) as exc_info:
+    with pytest.raises(InvalidBackendProviderError) as exc_info:
         register_backend(provider)
 
-    assert "missing=('create_constrained_topk_execution',)" in str(exc_info.value)
+    assert f"missing=('{missing}',)" in str(exc_info.value)
 
 
 def test_invalid_v2_range_declarations_fail_at_registration() -> None:
@@ -286,6 +262,11 @@ def test_unsupported_api_versions_are_rejected(api_version: object) -> None:
     message = str(exc_info.value)
     assert f"found={api_version!r}" in message
     assert "backend_id=fake" in message
+    # Callers catch an unsupported provider API version separately from an
+    # invalid provider declaration, so neither error may subclass the other.
+    assert isinstance(exc_info.value, BackendRegistryError)
+    assert not isinstance(exc_info.value, InvalidBackendProviderError)
+    assert not issubclass(InvalidBackendProviderError, InvalidBackendVersionError)
 
 
 def test_select_requires_exactly_one_match() -> None:
@@ -324,7 +305,7 @@ def test_explicit_selection_resolves_ambiguity_and_must_be_compatible() -> None:
     assert "requested_origin='manual [backend_id=one]'" in str(exc_info.value)
 
 
-def test_explicit_selection_cannot_bypass_duplicate_ids() -> None:
+def test_failed_duplicate_registration_keeps_the_original_selectable() -> None:
     register_backend(FakeProvider(), source="first-package")
 
     with pytest.raises(DuplicateBackendRegistrationError):

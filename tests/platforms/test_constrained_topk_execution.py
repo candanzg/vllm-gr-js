@@ -10,23 +10,17 @@ from vllm_gr.platforms.ascend import provider as npu
 from vllm_gr.platforms.cuda import provider as cuda
 
 
-def test_npu_provider_creates_adapter() -> None:
-    """NPU provider must create a concrete NPUConstrainedTopKExecution."""
-    from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
-
-    execution = npu.NPU_BACKEND.create_constrained_topk_execution()
-
-    assert isinstance(execution, NPUConstrainedTopKExecution)
-
-
 def test_npu_provider_passes_device() -> None:
-    """The requested device must be forwarded to the adapter."""
+    """The device is optional and, when given, forwarded to the adapter."""
     from vllm_gr.constraints.execution import NPUConstrainedTopKExecution
 
-    execution = npu.NPU_BACKEND.create_constrained_topk_execution(device="cpu")
+    default_execution = npu.NPU_BACKEND.create_constrained_topk_execution()
+    explicit_execution = npu.NPU_BACKEND.create_constrained_topk_execution(device="cpu")
 
-    assert isinstance(execution, NPUConstrainedTopKExecution)
-    assert execution._device == "cpu"  # noqa: SLF001
+    assert isinstance(default_execution, NPUConstrainedTopKExecution)
+    assert default_execution._device is None  # noqa: SLF001
+    assert isinstance(explicit_execution, NPUConstrainedTopKExecution)
+    assert explicit_execution._device == "cpu"  # noqa: SLF001
 
 
 def test_npu_provider_creates_independent_instances() -> None:

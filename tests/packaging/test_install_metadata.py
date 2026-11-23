@@ -25,6 +25,18 @@ from tests.helpers.paths import REPO_ROOT
 from tools.ci.resolve_runtime import check_versions, package_version
 
 COMMON_FILE = REPO_ROOT / "requirements" / "common.txt"
+#: Release tag created by the ``package_source`` fixture and reused in expectations.
+FIXTURE_RELEASE = "0.30.1"
+
+
+def _requirement_line(device: str, name: str) -> str:
+    """Return the requirement line a device file declares for one distribution."""
+    path: Path = REPO_ROOT / "requirements" / f"{device}.txt"
+    for line in path.read_text(encoding="utf-8").splitlines():
+        value = line.split("#", 1)[0].strip()
+        if value and not value.startswith("-") and Requirement(value).name == name:
+            return value
+    raise AssertionError(f"{path} does not declare {name!r}")
 
 
 class _SetupModule(Protocol):
@@ -67,7 +79,6 @@ def _load_setup_module() -> _SetupModule:
                 "regex",
                 "safetensors>=0.6.2",
                 "PyYAML>=6.0",
-                "vllm==0.30.0",
             },
             {"msgspec", "regex", "safetensors", "pyyaml", "vllm"},
             set(),
@@ -101,17 +112,17 @@ def test_get_install_requires_by_device(
     assert expected_subset.issubset(requirements)
     assert expected_packages.issubset(package_names)
     assert package_names.isdisjoint(excluded_packages)
+    if "vllm" in expected_packages:
+        assert f"vllm=={gr_setup.VLLM_GR_BASE_VERSION}" in requirements
 
 
 def test_common_requirements_exclude_vllm_and_dev_tools() -> None:
-    content = COMMON_FILE.read_text()
-    lines = {
-        line.strip()
-        for line in content.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+    names = {
+        Requirement(line.split("#", 1)[0].strip()).name.lower().replace("_", "-")
+        for line in COMMON_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith(("#", "-"))
     }
-    assert "pytest" not in lines
-    assert "ruff" not in lines
+    assert names.isdisjoint({"vllm", "pytest", "ruff"})
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -130,8 +141,26 @@ def version_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _SetupMod
     return module
 
 
+def _git_env() -> dict[str, str]:
+    """Isolate fixture repositories from developer and runner Git configuration."""
+    return {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+
+
 def _git(root: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        env=_git_env(),
+    )
+
+
+def _git_output(root: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True, env=_git_env())
 
 
 def _init_git(root: Path) -> None:
@@ -147,7 +176,8 @@ def _assert_version(module: _SetupModule, expected: str) -> None:
     assert module.get_vllm_gr_version() == expected
     generated = runpy.run_path(str(module.ROOT_DIR / "vllm_gr" / "_version.py"))
     assert generated["__version__"] == expected
-    assert generated["__version_tuple__"][:2] == (0, 30)
+    release = Version(expected)
+    assert generated["__version_tuple__"][:2] == (release.major, release.minor)
     resolved = package_version(module.ROOT_DIR, module.VLLM_GR_BASE_VERSION)
     assert check_versions({"vllm-gr": resolved}, {"vllm-gr": expected}) == []
     assert dict(os.environ) == before
@@ -173,9 +203,7 @@ def test_git_version_source(version_source: _SetupModule, release_tag: str | Non
     versions = []
     for step in (1, 2):
         _git(root, "commit", "--allow-empty", "-qm", f"Development commit {step}")
-        node = subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"], text=True
-        ).strip()
+        node = _git_output(root, "rev-parse", "--short=12", "HEAD").strip()
         distance = step if release_tag else step + 1
         expected = f"{next_release}.dev{distance}+g{node}.npu"
         _assert_version(version_source, expected)
@@ -235,22 +263,23 @@ def test_failed_version_write_restores_override(
     monkeypatch.setenv("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_GR", "0.30.0")
     (version_source.ROOT_DIR / "vllm_gr" / "_version.py").mkdir()
     before = dict(os.environ)
-    with pytest.raises(IsADirectoryError):
+    with pytest.raises(OSError):
         version_source.get_vllm_gr_version()
     assert dict(os.environ) == before
 
 
 @pytest.mark.parametrize("source_version", ["0.30.1", "0.30.1+cpu", "0.30.1+npu"])  # type: ignore[misc]
-@pytest.mark.parametrize("device", ["cuda", "npu", "cpu"])  # type: ignore[misc]
-def test_sdist_version_by_device(
-    version_source: _SetupModule, source_version: str, device: str
+def test_sdist_version_is_authoritative_across_devices(
+    version_source: _SetupModule, source_version: str
 ) -> None:
-    # Metadata from an unpacked sdist is authoritative without a Git checkout.
+    # Metadata from an unpacked sdist is authoritative without a Git checkout,
+    # and no target device re-suffixes it.
     (version_source.ROOT_DIR / "PKG-INFO").write_text(
         f"Metadata-Version: 2.1\nName: vllm-gr\nVersion: {source_version}\n"
     )
-    version_source._cached_device = device
-    _assert_version(version_source, source_version)
+    for device in ("cuda", "npu", "cpu"):
+        version_source._cached_device = device
+        _assert_version(version_source, source_version)
 
 
 @pytest.fixture  # type: ignore[misc]
@@ -275,7 +304,7 @@ def package_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _init_git(source)
     _git(source, "add", ".")
     _git(source, "commit", "-qm", "Package source")
-    _git(source, "tag", "v0.30.1")
+    _git(source, "tag", f"v{FIXTURE_RELEASE}")
     for name in (
         "VLLM_GR_VERSION_OVERRIDE",
         "SETUPTOOLS_SCM_PRETEND_VERSION",
@@ -320,7 +349,7 @@ def test_sdist_wheel_metadata(
     extracted = next(unpacked.iterdir())
     assert (extracted / "requirements" / f"{device}.txt").is_file()
     monkeypatch.setenv("VLLM_GR_TARGET_DEVICE", device)
-    expected = "0.30.1" + ("" if source_device == "cuda" else f"+{source_device}")
+    expected = FIXTURE_RELEASE + ("" if source_device == "cuda" else f"+{source_device}")
     # Resolve by name/version from an sdist, so pip checks filename vs prepared
     # metadata before building. Direct backend calls miss this contract.
     wheel_dir = tmp_path / "wheels"
@@ -358,7 +387,7 @@ def test_sdist_wheel_metadata(
     assert generated["__version__"] == expected
     requirements = [Requirement(value) for value in metadata.get_all("Requires-Dist", [])]
     runtime = [str(req) for req in requirements if req.name == "vllm" and req.marker is None]
-    assert runtime == (["vllm==0.30.0"] if device == "cuda" else [])
+    assert runtime == ([_requirement_line("cuda", "vllm")] if device == "cuda" else [])
     assert not any(req.name == "black" for req in requirements)
 
 
@@ -369,6 +398,7 @@ def test_tagged_editable_install_runtime_verify(
     import packaging
 
     monkeypatch.setenv("VLLM_GR_TARGET_DEVICE", "cuda")
+    vllm_version = next(iter(Requirement(_requirement_line("cuda", "vllm")).specifier)).version
     environment = tmp_path / "venv"
     venv.EnvBuilder(with_pip=False).create(environment)
     python = environment / "bin/python"
@@ -402,10 +432,10 @@ def test_tagged_editable_install_runtime_verify(
     assert result.returncode == 0, result.stdout + result.stderr
     # Only the accelerator runtime is synthetic. GR metadata and imports come
     # from the actual editable wheel installed above, as in CI's worktree flow.
-    runtime_metadata = site_packages / "vllm-0.30.0.dist-info"
+    runtime_metadata = site_packages / f"vllm-{vllm_version}.dist-info"
     runtime_metadata.mkdir()
     (runtime_metadata / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: vllm\nVersion: 0.30.0\n"
+        f"Metadata-Version: 2.1\nName: vllm\nVersion: {vllm_version}\n"
     )
     probe = r"""
 import importlib.util
@@ -420,16 +450,16 @@ loader = importlib.util.spec_from_file_location("runtime", sys.argv[2])
 runtime = importlib.util.module_from_spec(loader)
 loader.loader.exec_module(runtime)
 spec = runtime.resolve(source, "cuda")
-assert spec["expected"] == {"vllm": "0.30.0", "vllm-gr": "0.30.1"}
+assert spec["expected"] == {"vllm": sys.argv[3], "vllm-gr": sys.argv[4]}
 import vllm_gr
 assert Path(vllm_gr.__file__).resolve() == source / "vllm_gr/__init__.py"
-assert runtime.metadata.version("vllm-gr") == vllm_gr.__version__ == "0.30.1"
+assert runtime.metadata.version("vllm-gr") == vllm_gr.__version__ == sys.argv[4]
 prefix = Path(sys.prefix).resolve()
 modules = {
     name: SimpleNamespace(__file__=str(prefix / name / "__init__.py"))
     for name in ("vllm", "torch", "triton")
 }
-modules["vllm"].__version__ = "0.30.0"
+modules["vllm"].__version__ = sys.argv[3]
 modules["torch"].version = SimpleNamespace(cuda="13.0")
 modules["vllm.platforms"] = SimpleNamespace(current_platform=SimpleNamespace(device_type="cuda"))
 original_import = runtime.importlib.import_module
@@ -441,7 +471,7 @@ with patch.object(runtime.importlib, "import_module", side_effect=import_module)
     report = runtime.verify(source, spec, prefix)
     assert report["ok"], report["errors"]
     # The installed artifact and imported module must also agree on local data.
-    vllm_gr.__version__ = "0.30.1+wrong"
+    vllm_gr.__version__ = sys.argv[4] + "+wrong"
     report = runtime.verify(source, spec, prefix)
     assert not report["ok"]
     assert any("module/distribution version mismatch" in error for error in report["errors"])
@@ -455,6 +485,8 @@ print(json.dumps({"expected": spec["expected"], "verified": True}))
             probe,
             str(package_source),
             str(REPO_ROOT / "tools/ci/resolve_runtime.py"),
+            vllm_version,
+            FIXTURE_RELEASE,
         ],
         cwd=tmp_path,
         capture_output=True,

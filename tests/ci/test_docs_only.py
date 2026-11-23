@@ -16,7 +16,7 @@ def test_docs_only_classifier() -> None:
         pytest.skip("Node.js is required for the documentation classifier tests")
     assert node is not None
     root = REPO_ROOT
-    subprocess.run([node, "--test", "tests/test_docs_only.js"], cwd=root, check=True)
+    subprocess.run([node, "--test", "tests/ci/test_docs_only.js"], cwd=root, check=True)
 
 
 pytestmark = pytest.mark.cpu_test

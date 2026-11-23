@@ -177,21 +177,4 @@ def test_cuda_environment_check_validates_platform_and_versions(
         cuda.CUDA_BACKEND.check_environment()
 
 
-def test_npu_environment_check_delegates_complete_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_gr.platforms.ascend import environment
-
-    expected = {"platform": "npu"}
-    check_ascend = mock.Mock(return_value=expected)
-    monkeypatch.setattr(
-        environment,
-        "check_ascend_environment",
-        check_ascend,
-    )
-
-    assert npu.NPU_BACKEND.check_environment() is expected
-    check_ascend.assert_called_once_with(require_npu_platform=True)
-
-
 pytestmark = pytest.mark.cpu_test

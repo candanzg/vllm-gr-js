@@ -22,7 +22,7 @@ patches:
     installer: vllm_gr.plugin.register
     activation: vLLM loads the vllm.general_plugins entry point and the selected provider passes environment checks
     validator_or_test:
-      - tests/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
+      - tests/patch/test_patch_initialization.py::test_plugin_exposes_simple_per_patch_status
       - tests/platforms/test_runtime_wiring.py
       - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
     process_roles: [main, engine_core, worker]
@@ -73,7 +73,7 @@ patches:
     activation: the required frontend patch plan detects the method is not installed
     validator_or_test:
       - vllm_gr.v1.engine.logprobs_patch.validate_flat_logprobs_patch
-      - tests/test_patch_initialization.py::test_flat_logprobs_patch_preserves_offsets_and_optional_columns
+      - tests/patch/test_patch_initialization.py::test_flat_logprobs_patch_preserves_offsets_and_optional_columns
     process_roles: [offline_frontend, api_server]
     target: vllm.logprobs.FlatLogprobs.append_fast
     risk: medium
@@ -180,7 +180,7 @@ patches:
     validator_or_test:
       - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
       - tests/v1/engine/test_gr_async_scheduler.py
-      - tests/test_patch_initialization.py::test_scheduler_plan_repairs_partial_install
+      - tests/patch/test_patch_initialization.py::test_scheduler_plan_repairs_partial_install
     process_roles: [engine_core]
     target: Scheduler.schedule and Scheduler.update_from_output in vllm.v1.core.sched.scheduler
     risk: critical
@@ -196,8 +196,8 @@ patches:
     validator_or_test:
       - vllm_gr.v1.core.kv_cache_utils.validate_kv_hash_memo_patch
       - tests/v1/core/test_gr_plain_hash_chain.py
-      - tests/test_patch_initialization.py::test_kv_hash_memo_patch_equivalence_and_hits
-      - tests/test_patch_initialization.py::test_kv_hash_memo_plan_repairs_partial_install
+      - tests/patch/test_patch_initialization.py::test_kv_hash_memo_patch_equivalence_and_hits
+      - tests/patch/test_patch_initialization.py::test_kv_hash_memo_plan_repairs_partial_install
     process_roles: [engine_core]
     target: vllm.v1.core.kv_cache_utils.hash_block_tokens and get_request_block_hasher, plus vllm.v1.engine.core.get_request_block_hasher
     risk: high
@@ -314,7 +314,7 @@ patches:
       - tests/ops/test_sliced_logits.py
       - tests/platforms/test_import_isolation.py::test_cuda_plugin_initialization_does_not_import_ascend
       - tests/sidecar/test_worker_update.py::test_sliced_cache_survives_native_layerwise_reload
-      - tests/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
+      - tests/patch/test_patch_initialization.py::test_optional_patch_count_tracks_actual_installation
     process_roles: [worker]
     target: LogitsProcessor._get_logits, Sampler.gather_logprobs, V2 compute_topk_scores, and quant_method.process_weights_after_loading for dense ParallelLMHead weights and tied owners
     risk: medium
@@ -328,8 +328,8 @@ patches:
     installer: vllm_gr.platforms.ascend.spawn_patch.apply_npu_spawn_patch
     activation: the selected NPU provider installs or repairs spawn protection before importing the native worker
     validator_or_test:
-      - tests/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
-      - tests/test_patch_initialization.py::test_npu_spawn_patch_forces_spawn_only_when_npu_initialized
+      - tests/patch/test_patch_initialization.py::test_npu_spawn_patch_wraps_upstream_force_spawn_and_both_bindings
+      - tests/patch/test_patch_initialization.py::test_npu_spawn_patch_forces_spawn_only_when_npu_initialized
     process_roles: [main, engine_core]
     target: vllm.utils.system_utils._maybe_force_spawn
     risk: medium
@@ -375,8 +375,8 @@ patches:
     installer: vllm_gr.config.pangu_patch.apply_pangu_tied_embeddings_patch
     activation: runtime initialization; wrapper preserves ties only for PanguEmbeddedForCausalLM with tie_word_embeddings enabled
     validator_or_test:
-      - tests/test_pangu_compat.py
-      - tests/test_patch_initialization.py::test_runtime_patch_order_preserves_ascend_initialization
+      - tests/config/test_pangu_compat.py
+      - tests/patch/test_patch_initialization.py::test_runtime_patch_order_preserves_ascend_initialization
     process_roles: [main, engine_core, worker]
     target: vllm.config.ModelConfig.maybe_untie_word_embeddings
     risk: high

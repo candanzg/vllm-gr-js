@@ -15,6 +15,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.helpers.optional_npu import (
+    XATTENTION_OUT_REQUIRED_ENV,
+    skip_or_fail_unavailable,
+)
 from tests.helpers.paths import REPO_ROOT
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
@@ -313,19 +317,10 @@ def test_missing_addon_backend_keeps_original_leading_output_copy(monkeypatch: A
 
 
 @pytest.mark.parametrize("required", [False, True])
-def test_native_test_missing_prerequisite_is_optional_or_required(
-    required: bool, monkeypatch: Any
-) -> None:
-    path = ROOT / "tests/kernels/test_x_attention_out_npu.py"
-    nodes: list[ast.stmt] = [
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.FunctionDef) and node.name == "_unavailable"
-    ]
-    assert len(nodes) == 1
-    namespace = {"os": __import__("os"), "pytest": pytest}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
-    monkeypatch.setenv("VLLM_GR_TEST_XATTENTION_OUT_REQUIRED", "1" if required else "0")
+def test_missing_optional_binding_is_required_or_optional(required: bool, monkeypatch: Any) -> None:
+    monkeypatch.setenv(XATTENTION_OUT_REQUIRED_ENV, "1" if required else "0")
     expected = pytest.fail.Exception if required else pytest.skip.Exception
     with pytest.raises(expected, match="missing optional binding"):
-        namespace["_unavailable"]("missing optional binding")
+        skip_or_fail_unavailable(
+            "missing optional binding", required_env=XATTENTION_OUT_REQUIRED_ENV
+        )

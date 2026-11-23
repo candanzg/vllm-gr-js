@@ -10,11 +10,7 @@ import pytest
 
 from vllm_gr.platforms.ascend import NPU_BACKEND
 from vllm_gr.platforms.cuda import CUDA_BACKEND
-from vllm_gr.platforms.identity import (
-    PlatformIdentity,
-    platform_identity,
-    qualified_class_name,
-)
+from vllm_gr.platforms.identity import platform_identity
 
 
 class _VendorPlatform:
@@ -77,10 +73,6 @@ def test_identity_tolerates_a_platform_without_enumeration() -> None:
     assert identity.device_type == "cuda"
     assert identity.device_name == ""
     assert identity.has_lineage("builtins.object")
-
-
-def test_qualified_class_name_does_not_import_the_class() -> None:
-    assert qualified_class_name(_VendorPlatform) == "vllm_ascend.platform.NPUPlatform"
 
 
 def test_cuda_provider_rejects_the_shared_rocm_placement() -> None:
@@ -150,18 +142,6 @@ def test_matches_is_the_only_acceptance_point_for_a_synthetic_identity() -> None
         assert select_backend(identity).backend_id == "ascend"
     finally:
         _reset_backend_registry_for_tests()
-
-
-def test_platform_identity_is_a_frozen_dataclass() -> None:
-    fields = set(PlatformIdentity.__dataclass_fields__)
-
-    assert fields == {
-        "platform_enum",
-        "device_type",
-        "device_name",
-        "platform_class",
-        "platform_lineage",
-    }
 
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]

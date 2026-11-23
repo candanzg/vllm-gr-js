@@ -9,19 +9,21 @@ runtime or binding prerequisites then fail rather than skip this module.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
 import torch
 
+from tests.helpers.optional_npu import (
+    XATTENTION_OUT_REQUIRED_ENV,
+    skip_or_fail_unavailable,
+)
+
 pytestmark = [pytest.mark.npu_test, pytest.mark.l2]
 
 
 def _unavailable(reason: str) -> None:
-    if os.environ.get("VLLM_GR_TEST_XATTENTION_OUT_REQUIRED") == "1":
-        pytest.fail(reason, pytrace=False)
-    pytest.skip(reason, allow_module_level=True)
+    skip_or_fail_unavailable(reason, required_env=XATTENTION_OUT_REQUIRED_ENV)
 
 
 try:

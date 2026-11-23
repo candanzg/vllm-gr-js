@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 
 from argparse import Namespace
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 from unittest import mock
@@ -95,48 +95,36 @@ def test_environment_rejects_unknown_platform_without_cuda_fallback(backend_regi
     check_versions.assert_not_called()
 
 
-def test_supported_vllm_version() -> None:
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    ("versions", "check", "expected"),
+    [
+        (
+            {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2+npu"},
+            lambda: require_runtime_version("vllm-ascend", "0.30.0rc2"),
+            "0.30.0rc2+npu",
+        ),
+        ({"vllm": "0.30.0+cu130"}, check_vllm_runtime, {"vllm": "0.30.0+cu130"}),
+    ],
+    ids=["vendor-local-suffix", "core-local-suffix"],
+)
+def test_supported_runtime_version_keeps_the_local_suffix(
+    versions: dict[str, str], check: Callable[[], object], expected: object
+) -> None:
     with mock.patch(
         "vllm_gr.platforms.compat.metadata.version",
-        side_effect=lambda name: {"vllm": "0.30.0", "vllm-ascend": "0.30.0rc2+npu"}[name],
+        side_effect=lambda name: versions[name],
     ):
-        assert require_runtime_version("vllm-ascend", "0.30.0rc2") == "0.30.0rc2+npu"
-
-
-def test_supported_vllm_local_version() -> None:
-    with mock.patch(
-        "vllm_gr.platforms.compat.metadata.version",
-        return_value="0.30.0+cu130",
-    ):
-        assert check_vllm_runtime() == {"vllm": "0.30.0+cu130"}
+        assert check() == expected
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_rejects_shortened_public_runtime_version() -> None:
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "installed", ["0.29.0", "0.30.0rc2", "0.30+vendor"], ids=["older", "rc", "shortened"]
+)
+def test_rejects_unsupported_vllm_versions(installed: str) -> None:
     with (
-        mock.patch("vllm_gr.platforms.compat.metadata.version", return_value="0.30+vendor"),
-        pytest.raises(RuntimeError, match=r"found 0\.30\+vendor, required 0\.30\.0"),
-    ):
-        check_vllm_runtime()
-
-
-def test_rejects_release_candidate_vllm_version() -> None:
-    with (
-        mock.patch(
-            "vllm_gr.platforms.compat.metadata.version",
-            return_value="0.30.0rc2",
-        ),
-        pytest.raises(RuntimeError, match="required 0.30.0"),
-    ):
-        check_vllm_runtime()
-
-
-def test_rejects_old_vllm_version() -> None:
-    with (
-        mock.patch(
-            "vllm_gr.platforms.compat.metadata.version",
-            return_value="0.29.0",
-        ),
+        mock.patch("vllm_gr.platforms.compat.metadata.version", return_value=installed),
         pytest.raises(RuntimeError, match="required 0.30.0"),
     ):
         check_vllm_runtime()

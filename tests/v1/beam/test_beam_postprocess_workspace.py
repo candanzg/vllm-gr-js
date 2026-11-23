@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.beam_postprocess_workspace_utils import (
+from tests.helpers.beam_postprocess_workspace_utils import (
     active_beams,
     candidate_rows,
     result_count,

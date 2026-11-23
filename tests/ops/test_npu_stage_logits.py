@@ -388,10 +388,17 @@ def test_install_rejects_unsupported_configs_without_changing_processor(
         ctx.processors.clear()
     elif case == "multiple_processors":
         ctx.processors.append(_make_logits_processor(384))
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("An unsupported runner must not allocate compact projection weights")
+
+    monkeypatch.setattr("vllm_gr.v1.worker.npu.stage_projection.NPUStageProjection", forbidden)
     assert install_npu_stage_projection(ctx.runner, ctx.backend) is None
     assert ctx.processor._get_logits == original
     assert "_get_logits" not in vars(ctx.processor)
     assert ctx.processor._gr_vocab_slice == (17, 12)
+    if case not in ("no_stage_vocab", "no_reduction"):
+        assert not can_install_npu_stage_projection(ctx.runner)
 
 
 @pytest.mark.parametrize("previous_instance_method", [False, True])
@@ -473,45 +480,6 @@ def test_automatic_stage_projection_can_be_explicitly_disabled(
         assert "_get_logits" not in vars(ctx.processor)
     else:
         owner.close()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "tensor_parallel",
-        "pipeline_parallel",
-        "lora",
-        "speculative",
-        "quantized",
-        "multiple_processors",
-    ],
-)
-def test_ineligible_runner_is_rejected_before_projection_allocation(
-    context: Any, monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
-    ctx = context
-    if case == "tensor_parallel":
-        ctx.runner.vllm_config.parallel_config.tensor_parallel_size = 2
-    elif case == "pipeline_parallel":
-        ctx.runner.vllm_config.parallel_config.pipeline_parallel_size = 2
-    elif case == "lora":
-        ctx.runner.lora_config = SimpleNamespace()
-        ctx.runner.vllm_config.lora_config = ctx.runner.lora_config
-    elif case == "speculative":
-        ctx.runner.vllm_config.speculative_config = SimpleNamespace()
-    elif case == "quantized":
-        ctx.head.quant_method = SimpleNamespace()
-    else:
-        ctx.processors.append(_make_logits_processor(384))
-
-    def forbidden(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("An unsupported runner must not allocate compact projection weights")
-
-    monkeypatch.setattr("vllm_gr.v1.worker.npu.stage_projection.NPUStageProjection", forbidden)
-    original = ctx.processor._get_logits
-    assert not can_install_npu_stage_projection(ctx.runner)
-    assert install_npu_stage_projection(ctx.runner, ctx.backend) is None
-    assert ctx.processor._get_logits == original
 
 
 def _projection_addresses(owner: NPUStageProjection) -> tuple[Any, ...]:
